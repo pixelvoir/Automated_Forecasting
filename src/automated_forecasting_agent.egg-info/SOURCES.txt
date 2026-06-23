@@ -1,0 +1,11 @@
+README.md
+pyproject.toml
+src/automated_forecasting/__init__.py
+src/automated_forecasting/cli.py
+src/automated_forecasting/pipeline.py
+src/automated_forecasting_agent.egg-info/PKG-INFO
+src/automated_forecasting_agent.egg-info/SOURCES.txt
+src/automated_forecasting_agent.egg-info/dependency_links.txt
+src/automated_forecasting_agent.egg-info/entry_points.txt
+src/automated_forecasting_agent.egg-info/requires.txt
+src/automated_forecasting_agent.egg-info/top_level.txt

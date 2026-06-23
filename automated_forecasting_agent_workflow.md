@@ -4,6 +4,15 @@
 
 Build an automated forecasting agent that takes a dataset in CSV form, performs preprocessing and exploratory analysis, selects a small number of suitable forecasting models, tunes them within a bounded compute budget, generates forecasts for the requested horizon, and returns the final prediction output as a CSV file.
 
+## Privacy-first constraint
+
+The agent must operate under a privacy-first rule:
+
+- Raw customer data must never be sent to an external LLM or third-party service.
+- Any optional language-model component may only receive sanitized metadata, schema summaries, and non-sensitive diagnostics.
+- If privacy cannot be guaranteed, the agent must fall back to a fully local, deterministic workflow with no LLM involvement.
+- The forecasting models themselves should run inside the controlled environment where the data already lives.
+
 ## Core idea
 
 The agent should behave like a compact decision system:
@@ -111,6 +120,32 @@ A practical selection rule is:
 - Use a deep model such as N-BEATS, N-HiTS, DeepAR, or a transformer only when there is enough data to justify it.
 - Use intermittent-demand methods when the target contains many zeros.
 - Use hierarchical reconciliation only when the data is explicitly hierarchical.
+
+### Step 5a: No-LLM fallback mode
+
+When the system runs in no-LLM mode, all routing decisions must be deterministic and based on local metadata and diagnostics.
+
+The fallback router should use rules such as:
+
+- If the series is short, stable, and seasonal, prefer ETS or SARIMA/SARIMAX.
+- If the dataset has useful exogenous features and enough rows, prefer gradient boosting.
+- If there are many related series and sufficient history, consider a global forecasting model.
+- If the target is sparse or intermittent, prefer intermittent-demand methods.
+- If the data is ambiguous or weakly structured, keep the shortlist small and include a baseline such as seasonal naive.
+
+The no-LLM path should still perform:
+
+- schema detection,
+- preprocessing,
+- feature engineering,
+- diagnostics,
+- shortlist generation,
+- time-aware validation,
+- bounded hyperparameter tuning,
+- final forecasting,
+- CSV export.
+
+It should not require any external model to interpret the dataset or choose the final forecasting candidate.
 
 Model choice should depend on:
 
@@ -234,6 +269,12 @@ Before training expensive candidates, the agent should use these low-cost checks
 These checks should decide whether deep learning is even worth trying.
 
 ## Recommended system architecture
+
+### Privacy and orchestration layer
+- Enforces local-only execution rules.
+- Sanitizes any optional metadata before it reaches a language model.
+- Switches between no-LLM mode and optional local assist mode.
+- Blocks external API calls for raw data processing.
 
 ### Orchestration layer
 - Reads the CSV.

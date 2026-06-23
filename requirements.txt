@@ -1,0 +1,7 @@
+numpy>=1.26
+pandas>=2.2
+scikit-learn>=1.4
+statsmodels>=0.14
+lightgbm>=4.5
+xgboost>=2.1
+catboost>=1.2

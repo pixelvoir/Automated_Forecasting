@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "automated-forecasting-agent"
+version = "0.1.0"
+description = "Privacy-first automated forecasting agent with deterministic model selection"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.26",
+    "pandas>=2.2",
+    "scikit-learn>=1.4",
+    "statsmodels>=0.14",
+    "lightgbm>=4.5",
+    "xgboost>=2.1",
+    "catboost>=1.2",
+]
+
+[project.scripts]
+automated-forecasting-agent = "automated_forecasting.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
