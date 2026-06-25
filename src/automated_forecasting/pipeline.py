@@ -1,16 +1,21 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
 from typing import Any, Callable, Iterable
+import warnings
 
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_absolute_error
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
 from statsmodels.tsa.statespace.sarimax import SARIMAX
+from statsmodels.tools.sm_exceptions import ConvergenceWarning
 
 from .calendar_features import CalendarFeatureConfig, build_calendar_features, build_future_calendar_features
 from .diagnostics import RoutingDiagnostics, apply_imputation, compute_routing_diagnostics
@@ -53,6 +58,10 @@ class ForecastRequest:
     calendar_feature_config: CalendarFeatureConfig | None = None
     drift_threshold: float = 0.2
     state_path: Path | None = None
+    backtest_folds: int = 5
+    backtest_fold_size: int | None = None
+    tree_booster: str = "lightgbm"
+    compare_boosters: bool = False
     progress_callback: Callable[[str], None] | None = None
 
 
@@ -71,6 +80,13 @@ class CandidateScore:
     score: float
     metric: float
     residuals: list[float]
+    rolling_metric: float | None = None
+    holdout_metric: float | None = None
+    validation_style: str = "rolling"
+    usable_rows: int | None = None
+    total_rows: int | None = None
+    reliability_note: str | None = None
+    backend: str | None = None
 
 
 DatasetProfile = RoutingDiagnostics
@@ -82,6 +98,9 @@ class ForecastingAgent:
     def run(self, request: ForecastRequest) -> ForecastResult:
         self._current_request = request
         self._calendar_feature_config = request.calendar_feature_config or CalendarFeatureConfig()
+        self._tree_booster_impl = request.tree_booster
+        # Avoid joblib's environment-specific physical-core warning while keeping booster execution single-threaded.
+        os.environ.setdefault("LOKY_MAX_CPU_COUNT", "1")
         frame = request.input_frame.copy() if request.input_frame is not None else pd.read_csv(self._required_csv_path(request))
         profile = self._profile_dataset(frame, request)
         self._progress(request, f"profiled rows={profile.row_count}, series={profile.series_count}, frequency={profile.frequency or 'unknown'}")
@@ -118,7 +137,7 @@ class ForecastingAgent:
     ) -> tuple[pd.DataFrame, str, str]:
         prepared = self._prepare_series_frame(frame, profile, request)
         self._progress(request, "selecting candidate models")
-        scores = self._score_candidates(prepared, profile, self._select_candidates(prepared, profile), request.horizon)
+        scores = self._score_candidates(prepared, profile, self._select_candidates(prepared, profile), request.horizon, request)
         best = self._choose_best(scores)
         drift_note = self._drift_note(request, None, best, scores)
         self._progress(request, f"fitting final model: {best.name}")
@@ -148,7 +167,7 @@ class ForecastingAgent:
             )
             prepared = self._prepare_series_frame(group, group_profile, request)
             self._progress(request, f"selecting models for series {series_index}/{series_total}")
-            scores = self._score_candidates(prepared, group_profile, self._select_candidates(prepared, group_profile), request.horizon)
+            scores = self._score_candidates(prepared, group_profile, self._select_candidates(prepared, group_profile), request.horizon, request)
             best = self._choose_best(scores)
             drift_note = self._drift_note(request, series_value, best, scores)
             self._progress(request, f"fitting final model for series {series_index}/{series_total}: {best.name}")
@@ -186,11 +205,13 @@ class ForecastingAgent:
 
     def _select_candidates(self, frame: pd.DataFrame, profile: DatasetProfile) -> list[str]:
         candidates = ["naive"]
-        if profile.seasonal_period > 1 and len(frame) >= max(2 * profile.seasonal_period, 12):
+        has_seasonality = self._has_measured_seasonality(profile)
+        # The frequency-derived period can be wrong; shortlist explicitly seasonal models only when diagnostics confirm seasonality.
+        if has_seasonality and len(frame) >= max(2 * profile.seasonal_period, 12):
             candidates.append("seasonal_naive")
         if len(frame) >= 12:
             candidates.append("ridge")
-        if profile.seasonal_period > 1 and len(frame) >= max(3 * profile.seasonal_period, 20):
+        if len(frame) >= (max(3 * profile.seasonal_period, 20) if has_seasonality else 20):
             candidates.append("ets")
         if len(frame) >= 24:
             candidates.append("sarimax")
@@ -200,23 +221,51 @@ class ForecastingAgent:
             candidates.extend(self._available_booster_candidates())
         return list(dict.fromkeys(candidates))
 
-    def _score_candidates(self, frame: pd.DataFrame, profile: DatasetProfile, candidates: Iterable[str], horizon: int) -> list[CandidateScore]:
+    def _score_candidates(self, frame: pd.DataFrame, profile: DatasetProfile, candidates: Iterable[str], horizon: int, request: ForecastRequest) -> list[CandidateScore]:
         scores: list[CandidateScore] = []
         candidate_list = list(candidates)
         for index, candidate in enumerate(candidate_list, start=1):
             self._active_progress(f"scoring candidate {index}/{len(candidate_list)}: {candidate}")
             try:
-                metric, residuals = self._backtest_metric(frame, profile, candidate, horizon)
-                score = metric + self._complexity_penalty(candidate) - self._preference_bonus(profile, candidate)
+                metric, residuals, rolling_metric, holdout_metric, validation_style = self._backtest_metric(frame, profile, candidate, horizon, request)
+                penalty = self._complexity_penalty(candidate)
+                bonus = self._preference_bonus(profile, candidate)
+                # Scale tie-breakers by the MAE so preferences still matter when targets are thousands or millions.
+                score = metric * max(0.0, 1.0 + penalty - bonus)
             except Exception:
                 metric = float("inf")
                 score = float("inf")
                 residuals = []
-            scores.append(CandidateScore(candidate, float(score), float(metric), residuals))
+                rolling_metric = None
+                holdout_metric = None
+                validation_style = "failed"
+            usable_rows, total_rows, reliability_note = self._candidate_training_info(frame, profile, candidate)
+            backend = self._candidate_backend(candidate)
+            if usability := self._format_training_info(candidate, usable_rows, total_rows, reliability_note):
+                self._active_progress(usability)
+            scores.append(
+                CandidateScore(
+                    candidate,
+                    float(score),
+                    float(metric),
+                    residuals,
+                    rolling_metric=rolling_metric,
+                    holdout_metric=holdout_metric,
+                    validation_style=validation_style,
+                    usable_rows=usable_rows,
+                    total_rows=total_rows,
+                    reliability_note=reliability_note,
+                    backend=backend,
+                )
+            )
         return scores
 
-    def _backtest_metric(self, frame: pd.DataFrame, profile: DatasetProfile, candidate: str, horizon: int) -> tuple[float, list[float]]:
-        splits = self._rolling_splits(len(frame), horizon)
+    def _backtest_metric(self, frame: pd.DataFrame, profile: DatasetProfile, candidate: str, horizon: int, request: ForecastRequest) -> tuple[float, list[float], float | None, float | None, str]:
+        fold_size = self._candidate_fold_size(frame, profile, candidate, horizon, request.backtest_fold_size)
+        splits = self._rolling_splits(len(frame), horizon, request.backtest_folds, fold_size)
+        if len(splits) < 3:
+            # Thin validation makes model ranking noisy, so surface the lower confidence instead of silently trusting it.
+            self._progress(request, f"warning: only {len(splits)} valid backtest folds available; model selection confidence is low")
         weighted_metrics: list[float] = []
         weights: list[float] = []
         residuals: list[float] = []
@@ -233,11 +282,38 @@ class ForecastingAgent:
             weighted_metrics.append(mean_absolute_error(actual, preds) * fold_weight)
             weights.append(fold_weight)
             residuals.extend((actual - preds).astype(float).tolist())
-        if weighted_metrics:
-            return float(np.sum(weighted_metrics) / np.sum(weights)), residuals
+        rolling_metric = float(np.sum(weighted_metrics) / np.sum(weights)) if weighted_metrics else None
+        holdout_metric, holdout_residuals = self._single_holdout_metric(frame, profile, candidate)
+        if self._is_regressor_candidate(candidate) and holdout_metric is not None:
+            usable_rows, _, _ = self._candidate_training_info(frame, profile, candidate)
+            # Regressors lose rows to lag construction; on small n a single holdout better matches final deployment.
+            if usable_rows is not None and usable_rows < 80:
+                return float(holdout_metric), holdout_residuals, rolling_metric, holdout_metric, "single_holdout"
+        if rolling_metric is not None:
+            return rolling_metric, residuals, rolling_metric, holdout_metric, "rolling"
+        if holdout_metric is not None:
+            return float(holdout_metric), holdout_residuals, rolling_metric, holdout_metric, "single_holdout"
         series = frame[profile.target_column].astype(float).to_numpy()
         fallback = np.abs(np.diff(series)).mean() if len(series) > 1 else float(np.abs(series).mean())
-        return float(fallback), residuals
+        return float(fallback), residuals, None, None, "fallback"
+
+    def _single_holdout_metric(self, frame: pd.DataFrame, profile: DatasetProfile, candidate: str) -> tuple[float | None, list[float]]:
+        if len(frame) < 12:
+            return None, []
+        test_size = max(1, min(len(frame) // 4, max(3, int(round(len(frame) * 0.25)))))
+        train = frame.iloc[:-test_size].copy()
+        test = frame.iloc[-test_size:].copy()
+        if train.empty or test.empty:
+            return None, []
+        try:
+            preds = self._predict_on_holdout(train, test, profile, candidate)
+        except Exception:
+            return None, []
+        actual = test[profile.target_column].astype(float).to_numpy()
+        if len(preds) != len(actual):
+            return None, []
+        residuals = (actual - preds).astype(float).tolist()
+        return float(mean_absolute_error(actual, preds)), residuals
 
     def _predict_on_holdout(self, train: pd.DataFrame, test: pd.DataFrame, profile: DatasetProfile, candidate: str) -> np.ndarray:
         if candidate == "naive":
@@ -245,21 +321,24 @@ class ForecastingAgent:
         if candidate == "seasonal_naive" and profile.seasonal_period > 1 and len(train) >= profile.seasonal_period:
             return np.resize(train[profile.target_column].iloc[-profile.seasonal_period:].to_numpy(dtype=float), len(test))
         if candidate == "ridge":
-            return self._recursive_forecast_with_regressor(train, profile, len(test), Ridge(alpha=1.0))
+            return self._recursive_forecast_with_regressor(train, profile, len(test), self._ridge_model(train, profile))
         if candidate == "boosting":
-            return self._recursive_forecast_with_regressor(train, profile, len(test), HistGradientBoostingRegressor(max_depth=4, learning_rate=0.05, max_iter=200, random_state=42))
+            return self._recursive_forecast_with_regressor(train, profile, len(test), self._sklearn_boosting_model(train, profile))
+        if candidate == "tree_booster":
+            return self._recursive_forecast_with_regressor(train, profile, len(test), self._tree_booster_model(self._tree_booster_impl, train, profile))
         if candidate == "lightgbm" and LGBMRegressor is not None:
-            return self._recursive_forecast_with_regressor(train, profile, len(test), LGBMRegressor(n_estimators=200, learning_rate=0.05, verbose=-1, random_state=42))
+            return self._recursive_forecast_with_regressor(train, profile, len(test), self._tree_booster_model("lightgbm", train, profile))
         if candidate == "xgboost" and XGBRegressor is not None:
-            return self._recursive_forecast_with_regressor(train, profile, len(test), XGBRegressor(n_estimators=250, learning_rate=0.05, max_depth=6, objective="reg:squarederror", verbosity=0, random_state=42))
+            return self._recursive_forecast_with_regressor(train, profile, len(test), self._tree_booster_model("xgboost", train, profile))
         if candidate == "catboost" and CatBoostRegressor is not None:
-            return self._recursive_forecast_with_regressor(train, profile, len(test), CatBoostRegressor(iterations=250, learning_rate=0.05, depth=6, loss_function="RMSE", verbose=False, random_seed=42))
+            return self._recursive_forecast_with_regressor(train, profile, len(test), self._tree_booster_model("catboost", train, profile))
         if candidate == "ets":
+            use_seasonal = self._has_measured_seasonality(profile)
             model = ExponentialSmoothing(
                 train[profile.target_column].astype(float),
                 trend="add" if len(train) >= 8 else None,
-                seasonal="add" if profile.seasonal_period > 1 else None,
-                seasonal_periods=profile.seasonal_period if profile.seasonal_period > 1 else None,
+                seasonal="add" if use_seasonal else None,
+                seasonal_periods=profile.seasonal_period if use_seasonal else None,
                 initialization_method="estimated",
             ).fit(optimized=True)
             return np.asarray(model.forecast(len(test)))
@@ -302,21 +381,24 @@ class ForecastingAgent:
             forecast = np.resize(target.iloc[-profile.seasonal_period:].to_numpy(), horizon)
             return forecast, *self._interval_from_residuals(forecast, target.diff(profile.seasonal_period).dropna(), interval_level)
         if candidate == "ridge":
-            return self._recursive_forecast_with_regressor(frame, profile, horizon, Ridge(alpha=1.0), True, interval_level)
+            return self._recursive_forecast_with_regressor(frame, profile, horizon, self._ridge_model(frame, profile), True, interval_level)
         if candidate == "boosting":
-            return self._recursive_forecast_with_regressor(frame, profile, horizon, HistGradientBoostingRegressor(max_depth=4, learning_rate=0.05, max_iter=250, random_state=42), True, interval_level)
+            return self._recursive_forecast_with_regressor(frame, profile, horizon, self._sklearn_boosting_model(frame, profile, final=True), True, interval_level)
+        if candidate == "tree_booster":
+            return self._recursive_forecast_with_regressor(frame, profile, horizon, self._tree_booster_model(self._tree_booster_impl, frame, profile, final=True), True, interval_level)
         if candidate == "lightgbm" and LGBMRegressor is not None:
-            return self._recursive_forecast_with_regressor(frame, profile, horizon, LGBMRegressor(n_estimators=300, learning_rate=0.05, verbose=-1, random_state=42), True, interval_level)
+            return self._recursive_forecast_with_regressor(frame, profile, horizon, self._tree_booster_model("lightgbm", frame, profile, final=True), True, interval_level)
         if candidate == "xgboost" and XGBRegressor is not None:
-            return self._recursive_forecast_with_regressor(frame, profile, horizon, XGBRegressor(n_estimators=350, learning_rate=0.05, max_depth=6, objective="reg:squarederror", verbosity=0, random_state=42), True, interval_level)
+            return self._recursive_forecast_with_regressor(frame, profile, horizon, self._tree_booster_model("xgboost", frame, profile, final=True), True, interval_level)
         if candidate == "catboost" and CatBoostRegressor is not None:
-            return self._recursive_forecast_with_regressor(frame, profile, horizon, CatBoostRegressor(iterations=350, learning_rate=0.05, depth=6, loss_function="RMSE", verbose=False, random_seed=42), True, interval_level)
+            return self._recursive_forecast_with_regressor(frame, profile, horizon, self._tree_booster_model("catboost", frame, profile, final=True), True, interval_level)
         if candidate == "ets":
+            use_seasonal = self._has_measured_seasonality(profile)
             model = ExponentialSmoothing(
                 target,
                 trend="add" if len(target) >= 8 else None,
-                seasonal="add" if profile.seasonal_period > 1 else None,
-                seasonal_periods=profile.seasonal_period if profile.seasonal_period > 1 else None,
+                seasonal="add" if use_seasonal else None,
+                seasonal_periods=profile.seasonal_period if use_seasonal else None,
                 initialization_method="estimated",
             ).fit(optimized=True)
             forecast = np.asarray(model.forecast(horizon))
@@ -329,9 +411,15 @@ class ForecastingAgent:
 
     def _fit_sarimax(self, frame: pd.DataFrame, profile: DatasetProfile, horizon: int) -> np.ndarray:
         target = frame[profile.target_column].astype(float)
-        seasonal_period = profile.seasonal_period if profile.seasonal_period > 1 else 0
+        seasonal_period = profile.seasonal_period if self._has_measured_seasonality(profile) else 0
         seasonal_order = (1, 0, 0, seasonal_period) if seasonal_period else (0, 0, 0, 0)
-        model = SARIMAX(target, order=(1, 1, 1), seasonal_order=seasonal_order, enforce_stationarity=False, enforce_invertibility=False).fit(disp=False)
+        # Diagnostics-derived stationarity avoids unnecessary differencing when most inspected series are already stationary.
+        differencing = 0 if self._stationary_share(profile) >= 0.7 else 1
+        with warnings.catch_warnings():
+            # Small backtest folds can make SARIMAX likelihood fits noisy; validation handles failures, so keep stdout clean.
+            warnings.filterwarnings("ignore", category=ConvergenceWarning)
+            warnings.filterwarnings("ignore", category=RuntimeWarning, message="divide by zero encountered in log")
+            model = SARIMAX(target, order=(1, differencing, 1), seasonal_order=seasonal_order, enforce_stationarity=False, enforce_invertibility=False).fit(disp=False)
         return np.asarray(model.forecast(horizon))
 
     def _recursive_forecast_with_regressor(
@@ -347,7 +435,17 @@ class ForecastingAgent:
         if features.empty:
             fallback = np.repeat(float(frame[profile.target_column].iloc[-1]), horizon)
             return (fallback, None, None) if return_interval else fallback
-        regressor.fit(features, target)
+        # Ridge is scaled and regularized; catch only the known numerical warning at this fit site.
+        with warnings.catch_warnings():
+            try:
+                from scipy.linalg import LinAlgWarning
+
+                warnings.filterwarnings("ignore", category=LinAlgWarning)
+            except Exception:
+                pass
+            # Some booster libraries ask joblib for physical cores even with n_jobs=1; this environment can report none.
+            warnings.filterwarnings("ignore", category=UserWarning, message="Could not find the number of physical cores.*")
+            regressor.fit(features, target)
         history = frame[profile.target_column].astype(float).tolist()
         rows: list[float] = []
         for step in range(1, horizon + 1):
@@ -362,10 +460,12 @@ class ForecastingAgent:
             return forecast, lower, upper
         return forecast
 
-    def _build_supervised_features(self, frame: pd.DataFrame, profile: DatasetProfile, max_lag: int = 8) -> tuple[pd.DataFrame, pd.Series]:
+    def _build_supervised_features(self, frame: pd.DataFrame, profile: DatasetProfile, max_lag: int | None = None) -> tuple[pd.DataFrame, pd.Series]:
         target = frame[profile.target_column].astype(float).reset_index(drop=True)
         data = pd.DataFrame({"y": target})
-        lag_limit = min(max_lag, max(2, len(data) // 4))
+        max_lag = self._adaptive_max_lag(len(data)) if max_lag is None else max_lag
+        # Tiny series used to lose too many rows to fixed lag depth; adapt lags to improve fair comparison.
+        lag_limit = min(max_lag, max(1, len(data) // 4))
         for lag in range(1, lag_limit + 1):
             data[f"lag_{lag}"] = data["y"].shift(lag)
         data["rolling_mean_3"] = data["y"].shift(1).rolling(3).mean()
@@ -399,22 +499,36 @@ class ForecastingAgent:
         for item in ordered:
             metric = "inf" if not np.isfinite(item.metric) else f"{item.metric:.4f}"
             score = "inf" if not np.isfinite(item.score) else f"{item.score:.4f}"
-            candidate_lines.append(f"- {item.name}: validation_mae={metric}, adjusted_score={score}")
+            parts = [f"- {item.name}: validation_mae={metric}", f"adjusted_score={score}", f"validation={item.validation_style}"]
+            if item.rolling_metric is not None:
+                parts.append(f"rolling_mae={item.rolling_metric:.4f}")
+            if item.holdout_metric is not None:
+                parts.append(f"holdout_mae={item.holdout_metric:.4f}")
+            if item.backend:
+                parts.append(f"backend={item.backend}")
+            if item.usable_rows is not None and item.total_rows is not None:
+                parts.append(f"trained_on={item.usable_rows}/{item.total_rows}_rows_after_lag_construction")
+            if item.reliability_note:
+                parts.append(item.reliability_note)
+            candidate_lines.append(", ".join(parts))
         signals = (
             f"rows={profile.row_count}, series_count={profile.series_count}, frequency={profile.frequency or 'unknown'}, "
             f"seasonal_period={profile.seasonal_period}, regular_index={'yes' if profile.is_regular else 'no'}, "
             f"exogenous_features={'yes' if profile.has_exogenous else 'no'}"
         )
+        warning = self._diagnostic_warning(profile)
         return (
             f"Data signals: {signals}. Diagnostics: {profile.diagnostics_summary}. "
+            f"{warning}"
             f"Chosen model: {best.name} because it had the lowest adjusted score on rolling time-aware validation. "
             f"{drift_note} Candidates:\n" + "\n".join(candidate_lines)
         )
 
     def _drift_note(self, request: ForecastRequest, series_value: Any | None, best: CandidateScore, scores: list[CandidateScore]) -> str:
-        state_path = self._state_path(request, series_value)
+        state_path = self._state_path(request)
+        series_key = self._safe_state_name(str(series_value)) if series_value is not None else None
         current_sample = best.residuals[-2000:]
-        previous = load_state(state_path)
+        previous = load_state(state_path, series_key=series_key)
         note = "No previous residual state was available for drift comparison."
         if previous and previous.residual_sample:
             signal = compute_drift_signal(previous.residual_sample, current_sample, request.drift_threshold)
@@ -427,16 +541,15 @@ class ForecastingAgent:
                 drift_score=0.0,
                 residual_sample=current_sample,
             ),
+            series_key=series_key,
         )
         return note
 
-    def _state_path(self, request: ForecastRequest, series_value: Any | None) -> Path:
+    def _state_path(self, request: ForecastRequest) -> Path:
         if request.state_path:
             return request.state_path
-        stem = self._safe_state_name(request.source_label)
-        if series_value is not None:
-            stem = f"{stem}_{self._safe_state_name(str(series_value))}"
-        return request.output_path.parent / f".{stem}_forecast_state.json"
+        # Store drift state in a dedicated folder and consolidate panel series into one JSON file.
+        return request.output_path.parent / ".forecast_state" / "drift_state.json"
 
     def _choose_best(self, scores: list[CandidateScore]) -> CandidateScore:
         finite = [score for score in scores if np.isfinite(score.score)]
@@ -448,14 +561,17 @@ class ForecastingAgent:
         spread = self._z_value(interval_level) * float(np.std(values)) if len(values) else 0.0
         return forecast - spread, forecast + spread
 
-    def _rolling_splits(self, n_samples: int, horizon: int) -> list[tuple[int, int]]:
-        if n_samples <= horizon * 2:
+    def _rolling_splits(self, n_samples: int, horizon: int, max_folds: int = 5, fold_size: int | None = None) -> list[tuple[int, int]]:
+        fold_size = max(1, int(fold_size or horizon))
+        max_folds = max(1, int(max_folds))
+        if n_samples <= horizon + fold_size:
             return []
         split_points = []
-        first_train = max(horizon * 2, n_samples - 5 * horizon)
-        for train_end in range(first_train, n_samples - horizon + 1, horizon):
-            split_points.append((train_end, min(train_end + horizon, n_samples)))
-        return split_points[-5:]
+        # Fold count and size are configurable so large horizons do not force very thin validation.
+        first_train = max(fold_size * 2, n_samples - max_folds * fold_size)
+        for train_end in range(first_train, n_samples - fold_size + 1, fold_size):
+            split_points.append((train_end, min(train_end + fold_size, n_samples)))
+        return split_points[-max_folds:]
 
     def _future_index(self, time_index: pd.Series, horizon: int, frequency: str | None) -> pd.Index:
         observed = pd.to_datetime(time_index).dropna().sort_values()
@@ -536,24 +652,112 @@ class ForecastingAgent:
         return (profile.has_exogenous and row_count >= 40) or (profile.series_count > 1 and row_count >= 80) or row_count >= 60
 
     def _available_booster_candidates(self) -> list[str]:
-        candidates = []
-        if LGBMRegressor is not None:
-            candidates.append("lightgbm")
-        if XGBRegressor is not None:
-            candidates.append("xgboost")
-        if CatBoostRegressor is not None:
-            candidates.append("catboost")
-        return candidates
+        if getattr(self, "_current_request", None) and self._current_request.compare_boosters:
+            candidates = []
+            if LGBMRegressor is not None:
+                candidates.append("lightgbm")
+            if XGBRegressor is not None:
+                candidates.append("xgboost")
+            if CatBoostRegressor is not None:
+                candidates.append("catboost")
+            return candidates
+        # Default to one configurable booster candidate to avoid redundant compute and side effects.
+        return ["tree_booster"] if self._booster_available(getattr(self, "_tree_booster_impl", "lightgbm")) else []
 
     def _complexity_penalty(self, candidate: str) -> float:
-        return {"naive": 0.0, "seasonal_naive": 0.02, "ridge": 0.03, "ets": 0.05, "sarimax": 0.08, "boosting": 0.06, "lightgbm": 0.07, "xgboost": 0.07, "catboost": 0.07}.get(candidate, 0.0)
+        return {"naive": 0.0, "seasonal_naive": 0.005, "ridge": 0.01, "ets": 0.015, "sarimax": 0.025, "boosting": 0.02, "tree_booster": 0.025, "lightgbm": 0.025, "xgboost": 0.025, "catboost": 0.025}.get(candidate, 0.0)
 
     def _preference_bonus(self, profile: DatasetProfile, candidate: str) -> float:
-        if candidate in {"lightgbm", "xgboost", "catboost"} and profile.has_exogenous and profile.row_count >= 40:
-            return 0.05
+        if candidate in {"tree_booster", "lightgbm", "xgboost", "catboost"} and profile.has_exogenous and profile.row_count >= 40:
+            return 0.015
         if candidate == "boosting" and profile.has_exogenous and profile.row_count >= 40:
-            return 0.03
+            return 0.01
         return 0.0
+
+    def _is_regressor_candidate(self, candidate: str) -> bool:
+        return candidate in {"ridge", "boosting", "tree_booster", "lightgbm", "xgboost", "catboost"}
+
+    def _adaptive_max_lag(self, row_count: int) -> int:
+        return max(1, min(4, row_count // 6)) if row_count < 80 else 8
+
+    def _candidate_training_info(self, frame: pd.DataFrame, profile: DatasetProfile, candidate: str) -> tuple[int | None, int | None, str | None]:
+        if not self._is_regressor_candidate(candidate):
+            return None, None, None
+        features, _ = self._build_supervised_features(frame, profile)
+        usable_rows = int(len(features))
+        total_rows = int(len(frame))
+        note = "low-data-reliability" if usable_rows < 40 else None
+        return usable_rows, total_rows, note
+
+    def _format_training_info(self, candidate: str, usable_rows: int | None, total_rows: int | None, note: str | None) -> str | None:
+        if usable_rows is None or total_rows is None:
+            return None
+        suffix = f" ({note})" if note else ""
+        return f"{candidate} trained on {usable_rows}/{total_rows} rows after lag construction{suffix}"
+
+    def _candidate_fold_size(self, frame: pd.DataFrame, profile: DatasetProfile, candidate: str, horizon: int, requested: int | None) -> int:
+        if requested:
+            return requested
+        if self._is_regressor_candidate(candidate):
+            usable_rows, _, _ = self._candidate_training_info(frame, profile, candidate)
+            if usable_rows is not None and usable_rows < 80:
+                # Use wider folds for small regressor histories so lag dropna is not compounded by tiny fragments.
+                return max(horizon, min(max(horizon, len(frame) // 4), max(1, len(frame) - 1)))
+        return horizon
+
+    def _ridge_model(self, frame: pd.DataFrame, profile: DatasetProfile) -> Any:
+        usable_rows, _, _ = self._candidate_training_info(frame, profile, "ridge")
+        alpha = 10.0 if (usable_rows or 0) < 40 else 3.0 if (usable_rows or 0) < 100 else 1.0
+        return make_pipeline(StandardScaler(), Ridge(alpha=alpha))
+
+    def _sklearn_boosting_model(self, frame: pd.DataFrame, profile: DatasetProfile, final: bool = False) -> HistGradientBoostingRegressor:
+        usable_rows, _, _ = self._candidate_training_info(frame, profile, "boosting")
+        rows = usable_rows or len(frame)
+        max_iter = 80 if rows < 80 else 150 if rows < 200 else (250 if final else 200)
+        l2 = 1.0 if rows < 80 else 0.1 if rows < 200 else 0.0
+        return HistGradientBoostingRegressor(max_depth=3 if rows < 100 else 4, learning_rate=0.04 if rows < 100 else 0.05, max_iter=max_iter, l2_regularization=l2, random_state=42)
+
+    def _tree_booster_model(self, backend: str, frame: pd.DataFrame, profile: DatasetProfile, final: bool = False) -> Any:
+        usable_rows, _, _ = self._candidate_training_info(frame, profile, "tree_booster")
+        rows = usable_rows or len(frame)
+        estimators = 80 if rows < 80 else 150 if rows < 200 else (300 if final else 220)
+        depth = 3 if rows < 100 else 5
+        learning_rate = 0.04 if rows < 100 else 0.05
+        if backend == "lightgbm" and LGBMRegressor is not None:
+            return LGBMRegressor(n_estimators=estimators, learning_rate=learning_rate, max_depth=depth, min_child_samples=max(5, min(20, rows // 4)), reg_lambda=1.0 if rows < 100 else 0.1, n_jobs=1, verbose=-1, random_state=42)
+        if backend == "xgboost" and XGBRegressor is not None:
+            return XGBRegressor(n_estimators=estimators, learning_rate=learning_rate, max_depth=depth, reg_lambda=2.0 if rows < 100 else 1.0, objective="reg:squarederror", n_jobs=1, verbosity=0, random_state=42)
+        if backend == "catboost" and CatBoostRegressor is not None:
+            return CatBoostRegressor(iterations=estimators, learning_rate=learning_rate, depth=depth, l2_leaf_reg=6.0 if rows < 100 else 3.0, loss_function="RMSE", verbose=False, random_seed=42, thread_count=1, train_dir=str(self._booster_log_dir()))
+        raise ValueError(f"Tree booster '{backend}' is not available.")
+
+    def _booster_available(self, backend: str) -> bool:
+        return (backend == "lightgbm" and LGBMRegressor is not None) or (backend == "xgboost" and XGBRegressor is not None) or (backend == "catboost" and CatBoostRegressor is not None)
+
+    def _candidate_backend(self, candidate: str) -> str | None:
+        return getattr(self, "_tree_booster_impl", "lightgbm") if candidate == "tree_booster" else (candidate if candidate in {"lightgbm", "xgboost", "catboost"} else None)
+
+    def _booster_log_dir(self) -> Path:
+        request = getattr(self, "_current_request", None)
+        base = request.output_path.parent if request else Path.cwd()
+        path = base / ".forecast_state" / "booster_logs"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def _has_measured_seasonality(self, profile: DatasetProfile, threshold: float = 0.3) -> bool:
+        return profile.seasonal_period > 1 and float(profile.diagnostics_summary.get("avg_seasonal_strength", 0.0)) >= threshold
+
+    def _stationary_share(self, profile: DatasetProfile) -> float:
+        return float(profile.diagnostics_summary.get("stationary_share", 0.0))
+
+    def _diagnostic_warning(self, profile: DatasetProfile) -> str:
+        avg_strength = float(profile.diagnostics_summary.get("avg_seasonal_strength", 0.0))
+        if profile.seasonal_period > 1 and avg_strength < 0.1:
+            return (
+                f"Warning: frequency implies seasonal_period={profile.seasonal_period}, "
+                f"but measured avg_seasonal_strength={avg_strength:.4f}; seasonal candidates/components were limited. "
+            )
+        return ""
 
     def _z_value(self, interval_level: float) -> float:
         from statistics import NormalDist

@@ -52,6 +52,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--calendar-feature-set", default="basic", help="Calendar feature set: basic, holiday, seasonal, fiscal, all")
     parser.add_argument("--calendar-region", default=None, help="Optional holidays region code, for example IN or US")
     parser.add_argument("--drift-threshold", default=0.2, type=float, help="Drift threshold for retrain triggering")
+    parser.add_argument("--tree-booster", choices=("lightgbm", "xgboost", "catboost"), default="lightgbm", help="Implementation behind the default tree_booster candidate")
+    parser.add_argument("--compare-boosters", action="store_true", help="Score LightGBM, XGBoost, and CatBoost separately for one-off comparison")
     return parser
 
 
@@ -87,7 +89,7 @@ def _print_metadata(frame: pd.DataFrame, profile, total_rows: int | None = None,
         if column_stats and column in column_stats:
             stats = column_stats[column]
             details = []
-            for key in ("null_rate", "distinct_rows", "variance", "stddev", "parse_success_rows"):
+            for key in ("null_rate", "distinct_rows", "variance", "stddev", "numeric_parse_success_rows", "date_parse_success_rows"):
                 if key in stats and stats[key] is not None:
                     details.append(f"{key}={stats[key]}")
             if details:
@@ -217,6 +219,8 @@ def main() -> None:
             frequency=args.frequency,
             interval_level=args.interval_level,
             source_label=source_label,
+            tree_booster=args.tree_booster,
+            compare_boosters=args.compare_boosters,
             progress_callback=_progress,
         )
         with _activity_indicator("inferring columns"):
@@ -278,8 +282,13 @@ def main() -> None:
             if stats:
                 for name, value in stats.columns.items():
                     summary = f"null_rate={value.null_rate:.4f}, distinct={value.distinct_rows or 0}"
-                    if value.parse_success_rate is not None:
-                        summary += f", parse_success={value.parse_success_rate:.4f}"
+                    # Text columns may be numeric strings; label parse stats by type instead of implying a failed date parse.
+                    numeric_rate = value.numeric_parse_success_rate
+                    date_rate = value.date_parse_success_rate
+                    if numeric_rate is not None and numeric_rate >= (date_rate or 0.0):
+                        summary += f", numeric_parse_success={numeric_rate:.4f}"
+                    if date_rate is not None and date_rate > (numeric_rate or 0.0):
+                        summary += f", date_parse_success={date_rate:.4f}"
                     if value.variance is not None:
                         summary += f", variance={value.variance:.4f}"
                     inferred_candidates.append((name, summary))
@@ -351,6 +360,8 @@ def main() -> None:
         imputation_strategy=args.imputation_strategy,
         calendar_feature_config=CalendarFeatureConfig(feature_set=args.calendar_feature_set, region=args.calendar_region),
         drift_threshold=args.drift_threshold,
+        tree_booster=args.tree_booster,
+        compare_boosters=args.compare_boosters,
         progress_callback=_progress,
     )
     with _activity_indicator("running model selection and forecast"):

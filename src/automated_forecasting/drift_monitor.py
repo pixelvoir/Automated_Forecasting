@@ -50,11 +50,16 @@ def compute_drift_signal(reference_residuals: np.ndarray | list[float], current_
     )
 
 
-def load_state(path: str | Path) -> RunState | None:
+def load_state(path: str | Path, series_key: str | None = None) -> RunState | None:
     file_path = Path(path)
     if not file_path.exists():
         return None
     data = json.loads(file_path.read_text(encoding="utf-8"))
+    if series_key is not None:
+        # Panel runs now store every series in one file; missing keys are treated like no prior state.
+        data = data.get(series_key)
+        if not isinstance(data, dict):
+            return None
     return RunState(
         selected_model=str(data.get("selected_model", "naive")),
         residual_summary=dict(data.get("residual_summary", {})),
@@ -63,10 +68,19 @@ def load_state(path: str | Path) -> RunState | None:
     )
 
 
-def save_state(path: str | Path, state: RunState) -> None:
+def save_state(path: str | Path, state: RunState, series_key: str | None = None) -> None:
     file_path = Path(path)
     file_path.parent.mkdir(parents=True, exist_ok=True)
-    file_path.write_text(json.dumps(asdict(state), indent=2, sort_keys=True), encoding="utf-8")
+    payload = asdict(state)
+    if series_key is not None:
+        # Load-modify-write preserves other series entries during sequential panel forecasting.
+        existing = {}
+        if file_path.exists():
+            loaded = json.loads(file_path.read_text(encoding="utf-8"))
+            existing = loaded if isinstance(loaded, dict) else {}
+        existing[series_key] = payload
+        payload = existing
+    file_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
 
 
 def residual_summary(residuals: np.ndarray | list[float]) -> dict[str, float]:

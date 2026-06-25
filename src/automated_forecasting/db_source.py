@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Iterable
+import warnings
 
 import pandas as pd
 
@@ -40,12 +41,30 @@ class ColumnStats:
     stddev: float | None = None
     parse_success_rows: int | None = None
     parse_failure_rows: int | None = None
+    numeric_parse_success_rows: int | None = None
+    numeric_parse_failure_rows: int | None = None
+    date_parse_success_rows: int | None = None
+    date_parse_failure_rows: int | None = None
 
     @property
     def parse_success_rate(self) -> float | None:
+        if self.date_parse_success_rows is not None:
+            return self.date_parse_success_rate
         if self.parse_success_rows is None:
             return None
         return float(self.parse_success_rows) / max(self.total_rows, 1)
+
+    @property
+    def numeric_parse_success_rate(self) -> float | None:
+        if self.numeric_parse_success_rows is None:
+            return None
+        return float(self.numeric_parse_success_rows) / max(self.non_null_rows, 1)
+
+    @property
+    def date_parse_success_rate(self) -> float | None:
+        if self.date_parse_success_rows is None:
+            return None
+        return float(self.date_parse_success_rows) / max(self.non_null_rows, 1)
 
 
 @dataclass
@@ -167,8 +186,8 @@ def fetch_table_stats(connection, table_name: str, schema: str = "public") -> Ta
             data_type = str(column["data_type"])
             stats = _fetch_column_stats(cursor, schema, table_name, name, data_type, metadata.row_count)
             column_stats[name] = stats
-            if stats.parse_success_rate is not None and stats.parse_success_rate >= 0.8:
-                time_candidates.append((stats.parse_success_rate, stats.distinct_rows or 0, name))
+            if stats.date_parse_success_rate is not None and stats.date_parse_success_rate >= 0.8:
+                time_candidates.append((stats.date_parse_success_rate, stats.distinct_rows or 0, name))
 
         time_column = max(time_candidates, default=(0.0, 0, None))[2]
         time_stats = _fetch_time_stats(cursor, schema, table_name, time_column) if time_column else None
@@ -247,6 +266,8 @@ def _fetch_column_stats(cursor, schema: str, table_name: str, column_name: str, 
             distinct_rows=int(distinct_rows or 0),
             min_value=min_value,
             max_value=max_value,
+            date_parse_success_rows=int(non_null_rows or 0),
+            date_parse_failure_rows=0,
         )
 
     cursor.execute(
@@ -259,15 +280,30 @@ def _fetch_column_stats(cursor, schema: str, table_name: str, column_name: str, 
                 COUNT(DISTINCT {col}) AS distinct_rows,
                 MIN({col}::text) AS min_value,
                 MAX({col}::text) AS max_value,
-                SUM(CASE WHEN {col}::text ~ '^[0-9]{{4}}-[0-9]{{1,2}}-[0-9]{{1,2}}|^[0-9]{{1,2}}/[0-9]{{1,2}}/[0-9]{{2,4}}' THEN 1 ELSE 0 END) AS parse_success_rows,
-                SUM(CASE WHEN {col} IS NOT NULL AND NOT ({col}::text ~ '^[0-9]{{4}}-[0-9]{{1,2}}-[0-9]{{1,2}}|^[0-9]{{1,2}}/[0-9]{{1,2}}/[0-9]{{2,4}}') THEN 1 ELSE 0 END) AS parse_failure_rows
+                SUM(CASE WHEN {col} IS NOT NULL AND btrim({col}::text) ~ '^[-+]?[0-9]*\\.?[0-9]+$' THEN 1 ELSE 0 END) AS numeric_parse_success_rows,
+                SUM(CASE WHEN {col} IS NOT NULL AND NOT (btrim({col}::text) ~ '^[-+]?[0-9]*\\.?[0-9]+$') THEN 1 ELSE 0 END) AS numeric_parse_failure_rows,
+                SUM(CASE WHEN {col} IS NOT NULL AND btrim({col}::text) ~ '^[0-9]{{4}}-[0-9]{{1,2}}-[0-9]{{1,2}}|^[0-9]{{1,2}}/[0-9]{{1,2}}/[0-9]{{2,4}}' THEN 1 ELSE 0 END) AS date_parse_success_rows,
+                SUM(CASE WHEN {col} IS NOT NULL AND NOT (btrim({col}::text) ~ '^[0-9]{{4}}-[0-9]{{1,2}}-[0-9]{{1,2}}|^[0-9]{{1,2}}/[0-9]{{1,2}}/[0-9]{{2,4}}') THEN 1 ELSE 0 END) AS date_parse_failure_rows
             FROM {table}
             """
         ).format(col=column_sql, table=table_sql)
     )
-    total_rows, non_null_rows, null_rows, distinct_rows, min_value, max_value, parse_success_rows, parse_failure_rows = cursor.fetchone()
-    parse_success_rows = int(parse_success_rows or 0)
-    parse_failure_rows = int(parse_failure_rows or 0)
+    (
+        total_rows,
+        non_null_rows,
+        null_rows,
+        distinct_rows,
+        min_value,
+        max_value,
+        numeric_parse_success_rows,
+        numeric_parse_failure_rows,
+        date_parse_success_rows,
+        date_parse_failure_rows,
+    ) = cursor.fetchone()
+    numeric_parse_success_rows = int(numeric_parse_success_rows or 0)
+    numeric_parse_failure_rows = int(numeric_parse_failure_rows or 0)
+    date_parse_success_rows = int(date_parse_success_rows or 0)
+    date_parse_failure_rows = int(date_parse_failure_rows or 0)
     non_null_rows = int(non_null_rows or 0)
     return ColumnStats(
         name=column_name,
@@ -279,8 +315,13 @@ def _fetch_column_stats(cursor, schema: str, table_name: str, column_name: str, 
         distinct_rows=int(distinct_rows or 0),
         min_value=min_value,
         max_value=max_value,
-        parse_success_rows=parse_success_rows,
-        parse_failure_rows=parse_failure_rows,
+        # Text profiling separates numeric-looking values from date-looking values so numeric text is not shown as a date parse failure.
+        parse_success_rows=date_parse_success_rows,
+        parse_failure_rows=date_parse_failure_rows,
+        numeric_parse_success_rows=numeric_parse_success_rows,
+        numeric_parse_failure_rows=numeric_parse_failure_rows,
+        date_parse_success_rows=date_parse_success_rows,
+        date_parse_failure_rows=date_parse_failure_rows,
     )
 
 
@@ -346,13 +387,13 @@ def fetch_preview_sample(connection, table_name: str, schema: str = "public", li
 
     query = sql.SQL("SELECT * FROM {}.{} TABLESAMPLE SYSTEM (%s)").format(sql.Identifier(schema), sql.Identifier(table_name))
     try:
-        return pd.read_sql_query(query.as_string(connection), connection, params=(min(max(limit / 1000, 0.1), 100.0),))
+        return _read_sql_query(query.as_string(connection), connection, params=(min(max(limit / 1000, 0.1), 100.0),))
     except Exception:
         fallback = sql.SQL("SELECT * FROM {}.{} LIMIT %s").format(sql.Identifier(schema), sql.Identifier(table_name))
-        return pd.read_sql_query(fallback.as_string(connection), connection, params=(limit,))
+        return _read_sql_query(fallback.as_string(connection), connection, params=(limit,))
 
     query = sql.SQL("SELECT * FROM {}.{} LIMIT %s").format(sql.Identifier(schema), sql.Identifier(table_name))
-    return pd.read_sql_query(query.as_string(connection), connection, params=(limit,))
+    return _read_sql_query(query.as_string(connection), connection, params=(limit,))
 
 
 def load_table(connection, table_name: str, schema: str = "public", columns: list[str] | None = None) -> pd.DataFrame:
@@ -363,7 +404,7 @@ def load_table(connection, table_name: str, schema: str = "public", columns: lis
         query = sql.SQL("SELECT {} FROM {}.{}").format(column_list, sql.Identifier(schema), sql.Identifier(table_name))
     else:
         query = sql.SQL("SELECT * FROM {}.{}").format(sql.Identifier(schema), sql.Identifier(table_name))
-    return pd.read_sql_query(query.as_string(connection), connection)
+    return _read_sql_query(query.as_string(connection), connection)
 
 
 def load_grouped_aggregated_frame(
@@ -427,7 +468,7 @@ def load_grouped_aggregated_frame(
         group_list=sql.SQL(", ").join(sql.SQL(item) for item in group_items),
         order_list=sql.SQL(", ").join(sql.SQL(item) for item in order_items),
     )
-    return pd.read_sql_query(query.as_string(connection), connection, params=params)
+    return _read_sql_query(query.as_string(connection), connection, params=params)
 
 
 def _postgres_date_trunc_frequency(frequency: str | None) -> str:
@@ -472,7 +513,14 @@ def fetch_group_count_feature(
         count_col=sql.Identifier(count_column),
         table=sql.SQL("{}.{}").format(sql.Identifier(schema), sql.Identifier(table_name)),
     )
-    return pd.read_sql_query(query.as_string(connection), connection)
+    return _read_sql_query(query.as_string(connection), connection)
+
+
+def _read_sql_query(query: str, connection, params: Any | None = None) -> pd.DataFrame:
+    with warnings.catch_warnings():
+        # Pandas warns about raw psycopg2 connections; this app owns the connection lifecycle and uses parameterized SQL here.
+        warnings.filterwarnings("ignore", message="pandas only supports SQLAlchemy connectable", category=UserWarning)
+        return pd.read_sql_query(query, connection, params=params)
 
 
 def fetch_indexes(connection, schema: str, table_name: str) -> IndexInfo:

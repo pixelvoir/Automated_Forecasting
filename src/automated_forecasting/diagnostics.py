@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any
+import warnings
 
 import numpy as np
 import pandas as pd
 from statsmodels.tsa.seasonal import STL
 from statsmodels.tsa.stattools import adfuller, acf, kpss, pacf
+from statsmodels.tools.sm_exceptions import InterpolationWarning
 
 
 @dataclass
@@ -33,6 +35,7 @@ class SeriesDiagnostics:
     pacf_peak_lag: int | None
     order_bounds: dict[str, int]
     quality: SeriesQuality
+    kpss_note: str | None = None
 
 
 @dataclass
@@ -168,13 +171,18 @@ def _diagnose_single_series(group: pd.DataFrame, target_column: str, time_column
             pacf_peak_lag=None,
             order_bounds={"p": 0, "d": 0, "q": 0, "P": 0, "D": 0, "Q": 0},
             quality=quality,
+            kpss_note=None,
         )
 
     trend_strength, seasonal_strength = _stl_strength(target, seasonal_period)
     adf_pvalue = _safe_adf_pvalue(target)
-    kpss_pvalue = _safe_kpss_pvalue(target)
+    kpss_pvalue, kpss_note = _safe_kpss_pvalue(target)
     acf_peak_lag = _peak_lag(acf(target, nlags=min(24, len(target) - 1), fft=True))
-    pacf_peak_lag = _peak_lag(pacf(target, nlags=min(24, len(target) - 1), method="yw"))
+    with warnings.catch_warnings():
+        # PACF can hit a divide-by-zero log warning on perfectly linear small samples; peak-lag routing still remains usable.
+        warnings.filterwarnings("ignore", category=RuntimeWarning, message="divide by zero encountered in log")
+        # PACF requires nlags below half the sample; cap it so diagnostics do not fail short sanity runs.
+        pacf_peak_lag = _peak_lag(pacf(target, nlags=min(24, max(1, len(target) // 2 - 1)), method="yw"))
 
     d = 1 if (adf_pvalue is not None and adf_pvalue > 0.05) else 0
     D = 1 if seasonal_period > 1 and seasonal_strength >= 0.4 else 0
@@ -196,6 +204,7 @@ def _diagnose_single_series(group: pd.DataFrame, target_column: str, time_column
         pacf_peak_lag=pacf_peak_lag,
         order_bounds={"p": p, "d": d, "q": q, "P": P, "D": D, "Q": Q},
         quality=quality,
+        kpss_note=kpss_note,
     )
 
 
@@ -214,16 +223,25 @@ def _stl_strength(series: pd.Series, seasonal_period: int) -> tuple[float, float
 
 def _safe_adf_pvalue(series: pd.Series) -> float | None:
     try:
-        return float(adfuller(series, autolag="AIC")[1])
+        with warnings.catch_warnings():
+            # ADF's internal OLS can warn on perfectly collinear tiny samples; a failed statistic is handled by the caller.
+            warnings.filterwarnings("ignore", category=RuntimeWarning, message="divide by zero encountered in log")
+            return float(adfuller(series, autolag="AIC")[1])
     except Exception:
         return None
 
 
-def _safe_kpss_pvalue(series: pd.Series) -> float | None:
+def _safe_kpss_pvalue(series: pd.Series) -> tuple[float | None, str | None]:
     try:
-        return float(kpss(series, regression="c", nlags="auto")[1])
+        with warnings.catch_warnings(record=True) as caught:
+            # Statsmodels emits InterpolationWarning for out-of-table KPSS p-values; clamp and record a note instead of printing noise.
+            warnings.simplefilter("always", InterpolationWarning)
+            pvalue = float(kpss(series, regression="c", nlags="auto")[1])
+        if any(issubclass(item.category, InterpolationWarning) for item in caught):
+            return float(np.clip(pvalue, 0.01, 0.1)), "kpss_pvalue_clamped_out_of_table"
+        return pvalue, None
     except Exception:
-        return None
+        return None, None
 
 
 def _peak_lag(values: np.ndarray) -> int | None:
@@ -274,10 +292,12 @@ def _is_regular_series(time_index: pd.Series) -> bool:
 def _summarize(per_series: list[SeriesDiagnostics]) -> dict[str, Any]:
     if not per_series:
         return {}
+    notes = sorted({item.kpss_note for item in per_series if item.kpss_note})
     return {
         "series_inspected": len(per_series),
         "avg_missing_rate": float(np.mean([item.missing_rate for item in per_series])),
         "avg_outlier_rate": float(np.mean([item.outlier_rate for item in per_series])),
         "avg_seasonal_strength": float(np.mean([item.seasonal_strength for item in per_series])),
         "stationary_share": float(np.mean([(item.adf_pvalue or 1.0) <= 0.05 for item in per_series])),
+        "diagnostic_notes": notes,
     }
