@@ -1,6 +1,14 @@
 # Automated Forecasting Agent
 
-Privacy-first, local-only forecasting agent that uses deterministic heuristics to infer the dataset shape, shortlist candidate models, validate them with time-aware splits, and export forecasts to CSV.
+Privacy-first, local-only forecasting agent that connects to PostgreSQL on the local machine, inspects table metadata, lets you confirm the inferred time-series columns, shortlists candidate models with deterministic heuristics, validates them with time-aware splits, and exports forecasts to CSV.
+
+The database connection stays on your machine. No raw database rows need to be sent to any third-party service.
+
+## Client Database Safety
+
+By default, the database workflow uses lightweight metadata and avoids exact `COUNT(*)` and full-table per-column statistics. Heavy profiling and exact row counts are opt-in with `--pro-max`.
+
+For sensitive client systems, prefer a read-only replica, a client-approved Parquet export, or a bounded date range with `--start-date` and `--end-date`. The final forecasting query still has to aggregate the selected time/target columns, so run that only on an approved table/window and ideally on an indexed time column.
 
 ## Install
 
@@ -34,22 +42,29 @@ Boosted-tree models are considered automatically when the dataset is large enoug
 
 ## Run
 
-Windows launcher:
+Database-first workflow on Windows:
 
 ```bash
-run_forecast.bat --csv data.csv --horizon 30 --output forecast.csv
+run_forecast.bat --db-host localhost --db-port 5432 --db-name mydb --db-user myuser --db-password mypass --db-schema public
 ```
+
+The agent will list tables, show metadata, infer the time/target/series columns, and then ask for the forecast horizon and output file path.
 
 Direct CLI:
 
 ```bash
-automated-forcasting-agent --csv data.csv --horizon 30 --output forecast.csve
+automated-forecasting-agent --db-host localhost --db-port 5432 --db-name mydb --db-user myuser --db-password mypass --db-schema public
 ```
 
 Optional arguments:
 
+- `--db-table`
+- `--db-sslmode`
+- `--csv` for compatibility with older workflows
 - `--time-column`
 - `--target-column`
 - `--series-column`
 - `--frequency`
 - `--interval-level`
+
+If you omit the database arguments, the CLI will prompt for them interactively.

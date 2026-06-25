@@ -1,336 +1,237 @@
-# Automated Forecasting Agent Workflow Plan
+# Automated Forecasting Agent Workflow (Database-First, Local-Only)
 
-## Goal
+## What this document is
 
-Build an automated forecasting agent that takes a dataset in CSV form, performs preprocessing and exploratory analysis, selects a small number of suitable forecasting models, tunes them within a bounded compute budget, generates forecasts for the requested horizon, and returns the final prediction output as a CSV file.
+This is a simplified, code-accurate description of how the current agent connects to a local PostgreSQL database, inspects metadata, lets the user confirm the inferred columns, and then runs the forecasting workflow entirely on the local machine.
 
-## Privacy-first constraint
+## End-to-end flow
 
-The agent must operate under a privacy-first rule:
+1. Ask for PostgreSQL connection details if they were not passed on the command line.
+2. Connect locally to the database.
+3. List available tables in the chosen schema.
+4. Let the user choose the table to forecast from.
+5. Read table metadata, infer columns from a small preview sample, then load only the columns needed for forecasting into a local dataframe.
+6. Infer the time column, target column, optional series column, and frequency from the preview sample.
+7. Show the inferred metadata and let the user edit it before continuing.
+8. Ask for the forecast horizon and output CSV path.
+9. Build a dataset profile from local diagnostics.
+10. Route to a small model shortlist using deterministic rules.
+11. Score candidates with time-aware backtesting.
+12. Pick the model with the best adjusted score.
+13. Retrain that model on full history.
+14. Forecast the requested horizon.
+15. Write the forecast output to CSV.
 
-- Raw customer data must never be sent to an external LLM or third-party service.
-- Any optional language-model component may only receive sanitized metadata, schema summaries, and non-sensitive diagnostics.
-- If privacy cannot be guaranteed, the agent must fall back to a fully local, deterministic workflow with no LLM involvement.
-- The forecasting models themselves should run inside the controlled environment where the data already lives.
+No LLM is used for database access, routing, or model choice.
 
-## Core idea
+## Inputs supported by the CLI
 
-The agent should behave like a compact decision system:
+Database mode:
 
-1. Inspect the dataset structure.
-2. Identify the time column, target column, optional series identifier, and optional exogenous features.
-3. Perform data quality checks and time-series diagnostics.
-4. Narrow the model family to a small shortlist.
-5. Train and validate the shortlisted models with time-aware evaluation.
-6. Choose the best model or small ensemble.
-7. Produce forecast rows in CSV format.
+- `--db-host`: PostgreSQL server host
+- `--db-port`: PostgreSQL server port
+- `--db-name`: PostgreSQL database name
+- `--db-user`: PostgreSQL username
+- `--db-password`: PostgreSQL password
+- `--db-schema`: PostgreSQL schema name
+- `--db-table`: Optional table name override
+- `--db-sslmode`: Optional PostgreSQL sslmode
 
-## Inputs the agent should accept
+Forecast settings:
 
-Required:
+- `--horizon`: forecast horizon in time steps
+- `--output`: output forecast CSV path
+- `--time-column`: optional explicit time column
+- `--target-column`: optional explicit target column
+- `--series-column`: optional panel/group identifier
+- `--frequency`: optional frequency override
+- `--interval-level`: optional prediction interval level (default 0.9)
 
-- CSV file path or uploaded CSV.
-- Forecast horizon, expressed as number of future time steps.
-- Time frequency if it cannot be inferred reliably.
+CSV mode still works for compatibility, but the database flow is the primary path.
 
-Usually required or strongly recommended:
+## Step 1: Connection and table discovery
 
-- Target column name if the dataset has multiple numeric columns.
-- Time column name if the schema is ambiguous.
-- Series/group column name for panel or multi-entity forecasting.
-- Forecast start date if the future index must be explicit.
+The CLI prompts for host, port, database, username, password, and schema when those values are missing.
 
-Optional but useful:
+After connecting, it queries `information_schema.tables` and shows the available base tables in the selected schema.
 
-- Exogenous feature columns.
-- Confidence interval level, such as 80 percent or 95 percent.
-- Evaluation metric preference, such as MAE, RMSE, MAPE, sMAPE, or pinball loss.
-- Maximum training time or model budget.
-- Whether the output should include intervals or only point forecasts.
-- Whether the agent should forecast one target or multiple targets.
+## Step 2: Table metadata
 
-## Workflow
+The agent reads table metadata locally:
 
-### Step 1: Schema detection
+- column names
+- column data types
+- nullability
+- approximate dimensional structure through row count and column list
 
-The agent should inspect the dataset and infer:
+It then loads the selected table into an in-memory dataframe on the local machine.
 
-- Which column is the timestamp.
-- Which column is the target to forecast.
-- Whether the data is one series or multiple related series.
-- Whether there are categorical or numeric exogenous variables.
-- Whether the dataset is sorted and regularly spaced.
+## Step 3: Schema and profile detection
 
-If the time or target field is ambiguous, the agent should use heuristics and, if still uncertain, choose the most likely candidate while warning the user.
+The agent infers structure if fields are not explicitly provided.
 
-### Step 2: Data validation
+### Time column inference
 
-The agent should check:
+- Prefer names containing: `date`, `datetime`, `timestamp`, `time`, `ds`.
+- Otherwise score each column by datetime parse success and uniqueness.
 
-- Missing values.
-- Duplicate timestamps.
-- Non-monotonic time order.
-- Gaps in the time index.
-- Constant or near-constant target values.
-- Outliers and extreme spikes.
-- Zero inflation or intermittent demand.
-- Very short history relative to the requested horizon.
+### Target inference
 
-If needed, the agent should normalize the time index, de-duplicate records, and align to the inferred frequency.
+- Prefer names containing: `target`, `y`, `value`, `sales`, `demand`, `load`, `price`, `volume`.
+- Otherwise choose the strongest numeric candidate by non-nullness, uniqueness, and variance.
 
-### Step 3: Exploratory data analysis
+### Series inference (optional)
 
-The agent should compute and summarize:
+- Prefer names containing: `series`, `series_id`, `id`, `store`, `item`, `sku`, `entity`, `group`.
+- Otherwise detect suitable low/medium-cardinality object columns.
 
-- Trend and seasonality strength.
-- Autocorrelation and partial autocorrelation.
-- Cross-correlation between target and candidate exogenous variables.
-- Rolling mean and rolling variance.
-- Change points or structural breaks.
-- Distribution shape and skewness.
-- Intermittency measures such as zero ratio and average demand interval.
-- Missingness patterns.
-- Correlation between multiple target series if relevant.
+### Frequency and regularity
 
-This EDA should directly influence model selection rather than only being descriptive.
+For single series or each panel group:
 
-### Step 4: Feature engineering
+- Try `pandas.infer_freq`.
+- If unavailable, infer from median time delta (`H`, `D`, `W`, `MS`, `QS`, `YS`).
+- Mark whether the time index is regular.
 
-The agent should create features such as:
+### Seasonal period mapping
 
-- Lags of the target.
-- Rolling statistics: mean, median, min, max, std, quantiles.
-- Calendar features: day of week, month, quarter, weekend, holiday, hour, week of year.
-- Fourier or seasonal basis terms when useful.
-- Differencing features if stationarity is weak.
-- Exogenous lags and lead-safe known future variables.
-- Static series metadata for panel forecasting.
+- Hourly -> 24
+- Daily -> 7
+- Weekly -> 52
+- Monthly -> 12
+- Quarterly -> 4
+- Otherwise -> 1
 
-The agent must avoid leakage by only using information that would be available at prediction time.
+### Exogenous detection signal
 
-### Step 5: Model narrowing logic
+`has_exogenous` is true when numeric columns exist beyond time/target/(optional) series columns.
 
-The agent should not test many models. It should narrow to a small shortlist, usually 2 to 4 models, based on the data diagnosis.
+## Step 4: User confirmation of inferred columns
 
-A practical selection rule is:
+The CLI prints the inferred time column, target column, optional series column, and frequency.
 
-- Use naive or seasonal naive as a baseline always.
-- Use ETS or SARIMA/SARIMAX when the series is short, seasonal, and relatively clean.
-- Use gradient boosting when engineered lag and calendar features are informative.
-- Use a deep model such as N-BEATS, N-HiTS, DeepAR, or a transformer only when there is enough data to justify it.
-- Use intermittent-demand methods when the target contains many zeros.
-- Use hierarchical reconciliation only when the data is explicitly hierarchical.
+The user can press Enter to keep each guess or type a different column name before the model runs.
 
-### Step 5a: No-LLM fallback mode
+This is still local-only: the dataframe never leaves the machine.
 
-When the system runs in no-LLM mode, all routing decisions must be deterministic and based on local metadata and diagnostics.
+## Step 5: Candidate routing (shortlist)
 
-The fallback router should use rules such as:
+The router builds a compact shortlist from profile signals. It does not brute-force every model.
 
-- If the series is short, stable, and seasonal, prefer ETS or SARIMA/SARIMAX.
-- If the dataset has useful exogenous features and enough rows, prefer gradient boosting.
-- If there are many related series and sufficient history, consider a global forecasting model.
-- If the target is sparse or intermittent, prefer intermittent-demand methods.
-- If the data is ambiguous or weakly structured, keep the shortlist small and include a baseline such as seasonal naive.
+### Always include
 
-The no-LLM path should still perform:
+- `naive`
 
-- schema detection,
-- preprocessing,
-- feature engineering,
-- diagnostics,
-- shortlist generation,
-- time-aware validation,
-- bounded hyperparameter tuning,
-- final forecasting,
-- CSV export.
+### Add conditionally
 
-It should not require any external model to interpret the dataset or choose the final forecasting candidate.
+- `seasonal_naive` if seasonal period > 1 and enough history (`>= max(2*seasonal_period, 12)`).
+- `ridge` if at least 12 rows.
+- `ets` if seasonal period > 1 and enough history (`>= max(3*seasonal_period, 20)`).
+- `sarimax` if at least 24 rows.
+- `boosting` (HistGradientBoosting) if at least 30 rows.
 
-Model choice should depend on:
+### Optional tree boosters (if installed and justified)
 
-- History length.
-- Seasonality strength.
-- Number of series.
-- Exogenous feature richness.
-- Horizon length.
-- Compute budget.
-- Desired uncertainty output.
+The agent may add `lightgbm`, `xgboost`, and/or `catboost` if package is available and one of these is true:
 
-### Step 6: Validation strategy
+- Exogenous signal exists and rows >= 40, or
+- Panel-style structure exists and rows >= 80, or
+- Rows >= 60 with irregular time index.
 
-The agent should use time-aware validation only.
+This is how the agent narrows to the most plausible model families before scoring.
 
-Recommended approaches:
+## Step 6: Time-aware scoring
 
-- Rolling-origin backtesting.
-- Expanding window validation.
-- Sliding window validation when the series is non-stationary.
+Each candidate is evaluated using rolling-origin style backtesting.
 
-The agent should avoid random shuffling because it breaks temporal order.
+### Split logic
 
-### Step 7: Hyperparameter tuning
+- Build up to 3 rolling splits.
+- Each test segment size is horizon.
+- No random shuffle.
 
-The agent should use bounded search strategies:
+### Metric
 
-- Small grid search for statistical models.
-- Random search or Bayesian optimization for tree and deep models.
-- Early stopping for boosting and neural models.
-- A strict cap on training trials.
+- Validation metric is MAE.
 
-Tuning should focus only on a small number of impactful parameters.
+### Adjusted score used for ranking
 
-Examples:
+The winner is chosen by minimizing:
 
-- SARIMA: p, d, q, P, D, Q, seasonal period.
-- ETS: additive or multiplicative trend and seasonality.
-- Boosting: lag window, tree depth, learning rate, number of estimators, subsampling.
-- Deep models: context length, hidden size, dropout, learning rate, batch size.
-- Transformers: patch size or sequence length, attention heads, model width, dropout.
+`adjusted_score = validation_mae + complexity_penalty - preference_bonus`
 
-### Step 8: Model selection
+Complexity penalties lightly favor simpler models:
 
-The final choice should be based on a combination of:
+- naive: 0.00
+- seasonal_naive: 0.02
+- ridge: 0.03
+- ets: 0.05
+- boosting: 0.06
+- lightgbm/xgboost/catboost: 0.07
+- sarimax: 0.08
 
-- Validation score.
-- Prediction stability across folds.
-- Error distribution over time.
-- Forecast calibration if intervals are produced.
-- Compute cost.
-- Interpretability requirements.
+Preference bonuses can offset this when data supports boosters:
 
-If two models are close, the agent may:
+- +0.05 for `lightgbm/xgboost/catboost` when exogenous signal and rows >= 40
+- +0.03 for `lightgbm/xgboost/catboost` when panel-like data and rows >= 80
+- +0.03 for `boosting` when exogenous signal and rows >= 40
 
-- Choose the simpler one if accuracy is similar.
-- Build a small ensemble if the gains are meaningful and cheap.
+## Step 7: Model execution after routing
 
-### Step 9: Final training and forecasting
+After candidate ranking, the top model is retrained on the full available history.
 
-After selection, the agent should retrain the chosen model on the full history and generate forecasts for the full requested horizon.
+### How each family is run
 
-The output should include:
+- `naive`: repeat last observed value.
+- `seasonal_naive`: repeat last seasonal pattern.
+- `ridge` / `boosting` / optional boosters:
+  - Build supervised lag/calendar features.
+  - Train regressor on full history.
+  - Forecast recursively step-by-step for horizon.
+- `ets`: fit Exponential Smoothing and forecast horizon.
+- `sarimax`: fit SARIMAX(1,1,1) with seasonal order when applicable, then forecast horizon.
 
-- Timestamp or future index.
-- Forecast value.
-- Lower and upper bounds if intervals are requested.
-- Series identifier if multiple series are forecasted.
-- Model name used.
-- Optional confidence score or quantile columns.
+If a model fails at fit/forecast time, the agent falls back to a safe naive-style output.
 
-### Step 10: Export
+## Step 8: Prediction intervals
 
-The final output should be saved as CSV with a clear schema.
+When supported in the selected path, intervals are estimated from residual spread and a z-value from `interval_level`.
 
-Recommended columns:
+- Regressor paths: residual std on training fit.
+- ETS/SARIMAX paths: residual/differenced spread based intervals.
+- Naive/seasonal naive: currently point forecasts only.
+
+## Step 9: Panel (multi-series) behavior
+
+If a series/group column exists:
+
+1. Split by group.
+2. Route and score each group independently.
+3. Train and forecast per group.
+4. Concatenate all forecasts.
+
+Selected model names may differ across groups.
+
+## Step 10: Output format
+
+Output CSV includes:
 
 - `timestamp`
-- `series_id` if relevant
 - `forecast`
-- `lower_bound` if relevant
-- `upper_bound` if relevant
 - `model_name`
+- optional `series_column` (for panel data)
+- optional `lower_bound`, `upper_bound` (when interval path is available)
 
-If the user requests multiple horizons or multiple series, the file should be in long format rather than wide format unless explicitly requested otherwise.
+## Practical summary in plain language
 
-## Practical model selection rules
+- The agent connects to PostgreSQL locally and lists the tables.
+- It loads a small preview first, then reloads only the required columns into memory on the local machine.
+- It guesses the key time-series columns and lets the user correct them.
+- It compares a small shortlist of models with rolling time validation.
+- It retrains the winner on all available history and exports forecast rows to CSV.
 
-### If the dataset is small and seasonal
-- Start with seasonal naive, ETS, and SARIMA/SARIMAX.
-- Use a simple boosted model only if there are useful covariates.
+## Where this is implemented
 
-### If the dataset is tabular with strong exogenous variables
-- Prioritize gradient boosting.
-- Add linear or regularized regression as a baseline.
-- Add SARIMAX only if the time structure is strong and interpretable.
-
-### If there are many related series
-- Use a global model such as DeepAR, N-BEATS, N-HiTS, or a transformer-based model if enough data exists.
-- Consider tree-based global forecasting if feature engineering is practical.
-
-### If the target is intermittent
-- Use Croston-style methods or a model that explicitly handles sparse zeros.
-
-### If the horizon is long
-- Prefer direct multi-step approaches or models built for multi-horizon forecasting.
-- Avoid fully recursive strategies unless the dataset is small and simple.
-
-## Cheap discriminating checks before expensive training
-
-Before training expensive candidates, the agent should use these low-cost checks:
-
-- Compare naive vs seasonal naive.
-- Measure seasonality and autocorrelation strength.
-- Check if exogenous variables have meaningful cross-correlation with the target.
-- Estimate series length relative to horizon.
-- Check the number of related series.
-- Detect intermittency.
-- Check for trend breaks or regime shifts.
-
-These checks should decide whether deep learning is even worth trying.
-
-## Recommended system architecture
-
-### Privacy and orchestration layer
-- Enforces local-only execution rules.
-- Sanitizes any optional metadata before it reaches a language model.
-- Switches between no-LLM mode and optional local assist mode.
-- Blocks external API calls for raw data processing.
-
-### Orchestration layer
-- Reads the CSV.
-- Detects schema.
-- Runs diagnostics.
-- Chooses candidate models.
-- Triggers training and evaluation.
-- Writes outputs.
-
-### Feature and diagnostics layer
-- Handles preprocessing.
-- Generates lags and calendar features.
-- Computes correlations and time-series statistics.
-
-### Model registry
-- Stores available model wrappers.
-- Provides a uniform interface for fit, predict, and forecast interval generation.
-
-### Evaluation layer
-- Runs backtests.
-- Computes metrics.
-- Tracks runtime and memory.
-
-### Output layer
-- Produces forecast CSV.
-- Optionally writes a report with diagnostics and model selection rationale.
-
-## Suggested output behavior
-
-The agent should return:
-
-- A forecast CSV.
-- A short summary of which models were tested.
-- The best model selected.
-- The main reason for selection.
-- The validation metric values.
-- Any warnings about data quality or uncertainty.
-
-## Failure handling
-
-The agent should degrade gracefully when data quality is poor.
-
-Examples:
-
-- If the series is too short, use simple baselines and warn the user.
-- If timestamps are irregular, resample or reject with a clear message.
-- If exogenous features are unavailable, fall back to pure time-series models.
-- If deep models fail or are too slow, keep the strongest statistical or boosting model.
-
-## Practical recommendation
-
-For an efficient first version, the agent should follow this default shortlist order:
-
-1. Seasonal naive baseline.
-2. ETS or SARIMA/SARIMAX if seasonal structure is clear.
-3. Gradient boosting with lag and calendar features.
-4. One deep model only if data volume justifies it.
-
-This gives strong practical performance without testing too many expensive models.
+- Database input helpers: `src/automated_forecasting/db_source.py`
+- Routing, scoring, model execution: `src/automated_forecasting/pipeline.py`
+- CLI and interactive prompts: `src/automated_forecasting/cli.py`
