@@ -146,6 +146,13 @@ def _choose_stat_based_column(label: str, options: list[tuple[str, str]], defaul
     return choice or default
 
 
+def _choose_frequency(inferred: str | None, provided: str | None = None) -> str:
+    if provided:
+        return provided
+    default = inferred or "D"
+    return _prompt("Aggregation frequency (H, D, W, MS, QS, YS)", default)
+
+
 def _infer_target_from_stats(stats, time_column: str | None) -> str | None:
     numeric_types = {"smallint", "integer", "bigint", "numeric", "real", "double precision", "decimal"}
     candidates = []
@@ -218,7 +225,7 @@ def main() -> None:
         time_column = _choose_column("time column", preview_profile.time_column, frame)
         target_column = _choose_column("target column", preview_profile.target_column, frame)
         series_column = _choose_column("series column", preview_profile.series_column, frame, optional=True)
-        frequency = args.frequency or preview_profile.frequency
+        frequency = _choose_frequency(preview_profile.frequency, args.frequency)
         horizon = args.horizon or int(_prompt("Forecast horizon in steps"))
         output_path = args.output or _prompt("Output CSV file path")
     else:
@@ -292,9 +299,7 @@ def main() -> None:
                 or _infer_column_from_names(column_names, ("target", "y", "value", "sales", "demand", "load", "price", "volume"), {candidate_time} if candidate_time else set()),
             )
             inferred_series = _choose_column("series column", args.series_column or None, pd.DataFrame(columns=[name for name, _ in inferred_candidates]), optional=True)
-            frequency = args.frequency or (stats.time_stats.frequency if stats and stats.time_stats else None)
-            if not frequency:
-                frequency = _prompt("Aggregation frequency (H, D, W, MS, QS, YS)", "D")
+            frequency = _choose_frequency(stats.time_stats.frequency if stats and stats.time_stats else None, args.frequency)
             print("Would you like to engineer a new feature by aggregating the count of one column grouped by another column?", flush=True)
             engineered_feature = None
             if _prompt_optional("Type yes to add a grouped count feature", "no") in {"yes", "y"}:
@@ -307,8 +312,6 @@ def main() -> None:
             time_column = inferred_time
             target_column = inferred_target
             series_column = inferred_series
-            if args.frequency:
-                frequency = args.frequency
             horizon = args.horizon or int(_prompt("Forecast horizon in steps"))
             output_path = args.output or _prompt("Output CSV file path")
 
