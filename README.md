@@ -1,70 +1,54 @@
 # Automated Forecasting Agent
 
-Privacy-first, local-only forecasting agent that connects to PostgreSQL on the local machine, inspects table metadata, lets you confirm the inferred time-series columns, shortlists candidate models with deterministic heuristics, validates them with time-aware splits, and exports forecasts to CSV.
+Infrastructure scaffold for an automated forecasting pipeline.
 
-The database connection stays on your machine. No raw database rows need to be sent to any third-party service.
+## Folder Structure
 
-## Client Database Safety
-
-By default, the database workflow uses lightweight metadata and avoids exact `COUNT(*)` and full-table per-column statistics. Heavy profiling and exact row counts are opt-in with `--pro-max`.
-
-For sensitive client systems, prefer a read-only replica, a client-approved Parquet export, or a bounded date range with `--start-date` and `--end-date`. The final forecasting query still has to aggregate the selected time/target columns, so run that only on an approved table/window and ideally on an indexed time column.
-
-## Install
-
-Use the installed Python interpreter directly if `python` is not on your PATH yet:
-
-```bash
-"%LOCALAPPDATA%\Programs\Python\Python312\python.exe" -m pip install -e .
+```text
+.
+├── agents/
+├── api/
+├── config/
+├── data/
+├── frontend/
+├── models_lib/
+├── pipeline/
+├── runs/
+├── tests/
+├── .env.example
+├── .gitignore
+├── docker-compose.yml
+├── Dockerfile
+├── README.md
+└── requirements.txt
 ```
 
-If Python is already on PATH, this also works:
+## Prerequisites
+- Python 3.11+
 
-```bash
-pip install -e .
+## Quickstart
+
+This is the infrastructure scaffold step; pipeline stages are implemented incrementally in later steps. Async job handling and external artifact storage were deliberately left out until there is an actual need for them.
+
+**One-time setup** (creates `.venv` and installs dependencies):
+```bat
+setup_venv.bat
 ```
 
-## Dependencies
-
-Runtime dependencies are:
-
-- numpy
-- pandas
-- scikit-learn
-- statsmodels
-- lightgbm
-- xgboost
-- catboost
-
-The agent is designed to run locally with no external LLM calls.
-
-Boosted-tree models are considered automatically when the dataset is large enough and the schema is feature-rich enough to justify them.
-
-## Run
-
-Database-first workflow on Windows:
-
-```bash
-run_forecast.bat --db-host localhost --db-port 5432 --db-name mydb --db-user myuser --db-password mypass --db-schema public
+**Start the dev server** (auto-reloads on file changes):
+```bat
+run_dev.bat
 ```
 
-The agent will list tables, show metadata, infer the time/target/series columns, and then ask for the forecast horizon and output file path.
-
-Direct CLI:
-
-```bash
-automated-forecasting-agent --db-host localhost --db-port 5432 --db-name mydb --db-user myuser --db-password mypass --db-schema public
+**Health check:**
+```
+curl http://localhost:8000/health
 ```
 
-Optional arguments:
+**Start the Dash UI** (in a second terminal, after the API is running):
+```bat
+run_frontend.bat
+```
+Then open `http://localhost:8050` in your browser.
 
-- `--db-table`
-- `--db-sslmode`
-- `--csv` for compatibility with older workflows
-- `--time-column`
-- `--target-column`
-- `--series-column`
-- `--frequency`
-- `--interval-level`
-
-If you omit the database arguments, the CLI will prompt for them interactively.
+> **Note on `prophet`:** It requires C++ build tools (`pystan` backend) and is commented out of `requirements.txt`. See the comment there for install options. All other dependencies install cleanly via pip.

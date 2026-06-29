@@ -1,2 +1,0 @@
-[console_scripts]
-automated-forecasting-agent = automated_forecasting.cli:main

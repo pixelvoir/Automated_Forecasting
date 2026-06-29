@@ -1,0 +1,17 @@
+# API Key env var names (not the actual keys)
+llm_provider: "gemini" # Can be 'gemini' or 'openai'
+gemini_api_key_env: "GEMINI_API_KEY"
+openai_api_key_env: "OPENAI_API_KEY"
+
+# Confidence thresholds
+confidence_threshold: 0.85
+
+# Validation gate thresholds
+validation_gate:
+  max_row_loss_pct: 15
+
+# Stage 1: ingestion settings
+ingest:
+  row_limit: null          # null = fetch all rows; set an integer to cap rows (useful for large tables during dev)
+  raw_format: parquet
+  top_n_categories: 5      # how many top values to include in cardinality stats

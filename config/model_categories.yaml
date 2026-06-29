@@ -1,0 +1,14 @@
+# Note: This gets heavily extended in a later step when transformer models are added.
+categories:
+  seasonal_stationary:
+    - statistical
+    - prophet
+  trending_univariate:
+    - statistical
+    - prophet
+  multivariate_ml:
+    - xgboost
+    - lightgbm
+  intermittent:
+    - intermittent_model_1
+    - intermittent_model_2
