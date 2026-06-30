@@ -1,11 +1,13 @@
 """API routes for pipeline runs."""
 import json
+import shutil
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, model_validator
 
-from pipeline import ingest, pre_clean_eda
+from agents import cleaning_agent
+from pipeline import ingest, pre_clean_eda, cleaner, validation_gate
 
 ROOT = Path(__file__).resolve().parent.parent
 RUNS_DIR = ROOT / "runs"
@@ -86,6 +88,7 @@ def list_runs():
                 "cols": meta.get("shape", {}).get("cols", 0),
                 "source": meta.get("source", {}),
                 "has_stage2": (run_dir / "cleaning_decision_payload.json").exists(),
+                "has_stage3": (run_dir / "cleaning_recipe.json").exists(),
             })
         except Exception:
             continue
@@ -173,7 +176,38 @@ def get_run_summary(run_id: str):
     dp_path = RUNS_DIR / run_id / "cleaning_decision_payload.json"
     if dp_path.exists():
         data["_stage2"] = {"decision_payload": json.loads(dp_path.read_text())}
+
+    recipe_path = RUNS_DIR / run_id / "cleaning_recipe.json"
+    report_path = RUNS_DIR / run_id / "cleaning_report.json"
+    vg_path = RUNS_DIR / run_id / "validation_gate.json"
+    if recipe_path.exists():
+        stage3: dict = {
+            "recipe_source": "unknown",
+            "recipe": json.loads(recipe_path.read_text()),
+        }
+        if report_path.exists():
+            stage3.update(json.loads(report_path.read_text()))
+        if vg_path.exists():
+            stage3["_validation"] = json.loads(vg_path.read_text())
+        data["_stage3"] = stage3
+
     return data
+
+
+@router.delete("/{run_id}")
+def delete_run(run_id: str):
+    """Delete all local files for a run: run directory + raw parquet. No DB involvement."""
+    if not run_id.startswith("run_") or ".." in run_id or "/" in run_id or "\\" in run_id:
+        raise HTTPException(status_code=400, detail="Invalid run_id.")
+    run_dir = RUNS_DIR / run_id
+    if not run_dir.exists():
+        raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found.")
+    shutil.rmtree(run_dir)
+    for rel in [f"data/raw/{run_id}_raw.parquet", f"data/cleaned/{run_id}_cleaned.parquet"]:
+        p = ROOT / rel
+        if p.exists():
+            p.unlink()
+    return {"deleted": run_id, "status": "ok"}
 
 
 @router.get("/{run_id}/status")
@@ -191,3 +225,47 @@ def get_metadata(run_id: str):
     if not meta_path.exists():
         raise HTTPException(status_code=404, detail=f"Metadata for run '{run_id}' not found.")
     return json.loads(meta_path.read_text())
+
+
+class CleanRequest(BaseModel):
+    timestamp_col: str | None = None
+
+
+@router.post("/{run_id}/clean")
+def run_clean(run_id: str, req: CleanRequest = CleanRequest()):
+    """Stage 3: call LLM cleaning agent then execute the recipe on the raw parquet.
+    No DB connection. No raw data sent to LLM — only cleaning_decision_payload.json."""
+    run_dir = RUNS_DIR / run_id
+    if not run_dir.exists():
+        raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found.")
+    try:
+        selections = {"timestamp_col": req.timestamp_col}
+        (run_dir / "user_selections.json").write_text(json.dumps(selections, indent=2))
+
+        agent_result = cleaning_agent.run(run_id)
+        cleaner_result = cleaner.run(run_id)
+        return {
+            "run_id": run_id,
+            "status": "completed",
+            "recipe_source": agent_result["recipe_source"],
+            "recipe": agent_result["recipe"],
+            **{k: v for k, v in cleaner_result.items() if k != "run_id"},
+        }
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/{run_id}/validate")
+def run_validate(run_id: str):
+    """Stage 3.5: run post-cleaning validation gate checks. No LLM, no DB."""
+    run_dir = RUNS_DIR / run_id
+    if not run_dir.exists():
+        raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found.")
+    try:
+        return validation_gate.run(run_id)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

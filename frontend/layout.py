@@ -5,13 +5,13 @@ import dash_bootstrap_components as dbc
 # Stage pill definitions: (label, id, icon, default-color)
 _STAGES = [
     ("Ingest",        "pill-ingest",     "bi-cloud-download",    "success"),
-    ("Pre-clean EDA", "pill-preclean",   "bi-search",            "secondary"),
-    ("Cleaning",      "pill-cleaning",   "bi-scissors",          "secondary"),
-    ("Validation",    "pill-validation", "bi-shield-check",      "secondary"),
-    ("Forecast EDA",  "pill-fcst-eda",   "bi-graph-up",          "secondary"),
-    ("Model Select",  "pill-model",      "bi-cpu",               "secondary"),
-    ("Training",      "pill-training",   "bi-lightning-fill",    "secondary"),
-    ("Results",       "pill-results",    "bi-trophy",            "secondary"),
+    ("Pre-clean EDA", "pill-preclean",   "bi-search",            "success"),
+    ("Cleaning",      "pill-cleaning",   "bi-scissors",          "success"),
+    ("Validation",    "pill-validation", "bi-shield-check",      "success"),
+    ("Forecast EDA",  "pill-fcst-eda",   "bi-graph-up",          "success"),
+    ("Model Select",  "pill-model",      "bi-cpu",               "success"),
+    ("Training",      "pill-training",   "bi-lightning-fill",    "success"),
+    ("Results",       "pill-results",    "bi-trophy",            "success"),
 ]
 
 _lbl = lambda text: dbc.Label(
@@ -271,6 +271,17 @@ def create_layout():
 
                 # ── Right panel ───────────────────────────────────────────
                 dbc.Col(width=9, children=[
+                    dcc.Loading(
+                        html.Div(
+                            id="cleaning-status",
+                            className="mb-2",
+                            style={"minHeight": "40px"},
+                        ),
+                        type="circle",
+                        color="#6366f1",
+                        delay_show=100,
+                        target_components={"cleaning-status": "children"},
+                    ),
                     dbc.Spinner(
                         html.Div(
                             id="results-panel",

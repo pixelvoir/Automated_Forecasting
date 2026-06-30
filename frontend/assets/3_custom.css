@@ -181,45 +181,81 @@ input[type="number"] { color: #e2e8f0 !important; }
 
 .btn-link:hover { color: #818cf8 !important; }
 
-/* ── Dropdown (dcc.Dropdown) ──────────────────────────────── */
-.Select-control {
-  background-color: #1e2235 !important;
+/* ── Dropdown (dcc.Dropdown) — Dash 4 dark mode ───────────── */
+/* Dash 4 uses --Dash-* CSS variables; override them on the wrapper */
+.dash-dropdown-wrapper {
+  --Dash-Fill-Inverse-Strong: #1e2235;
+  --Dash-Text-Strong: #e2e8f0;
+  --Dash-Text-Disabled: #4b5563;
+  --Dash-Text-Weak: #94a3b8;
+  --Dash-Stroke-Strong: rgba(255, 255, 255, 0.10);
+  --Dash-Fill-Interactive-Strong: #6366f1;
+  --Dash-Fill-Interactive-Weak: rgba(99, 102, 241, 0.12);
+  --Dash-Fill-Disabled: rgba(255, 255, 255, 0.07);
+  --Dash-Shading-Strong: rgba(0, 0, 0, 0.5);
+  --Dash-Shading-Weak: rgba(0, 0, 0, 0.2);
+  --Dash-Spacing: 4px;
+}
+
+.dash-dropdown {
+  background: #1e2235 !important;
   border: 1px solid rgba(255, 255, 255, 0.10) !important;
   border-radius: 8px !important;
   color: #e2e8f0 !important;
-}
-
-.Select-placeholder, .Select-value-label {
-  color: #94a3b8 !important;
   font-size: 0.85rem !important;
+  min-height: 34px !important;
 }
 
-.Select-menu-outer {
-  background-color: #1e2235 !important;
+.dash-dropdown:focus {
+  border-color: rgba(99, 102, 241, 0.6) !important;
+  outline: 1px solid rgba(99, 102, 241, 0.6) !important;
+}
+
+.dash-dropdown-value { color: #e2e8f0 !important; }
+.dash-dropdown-placeholder { color: #4b5563 !important; }
+
+.dash-dropdown-content {
+  background: #1e2235 !important;
   border: 1px solid rgba(255, 255, 255, 0.09) !important;
   border-radius: 10px !important;
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5) !important;
-  margin-top: 4px !important;
+  z-index: 9999 !important;
 }
 
-.Select-option {
-  background-color: transparent !important;
+.dash-dropdown-option {
+  background: #1e2235 !important;
   color: #94a3b8 !important;
   font-size: 0.85rem !important;
-  transition: background 0.15s ease !important;
+  transition: background 0.15s ease, color 0.15s ease !important;
 }
 
-.Select-option.is-focused {
-  background-color: rgba(99, 102, 241, 0.12) !important;
+.dash-dropdown-option:hover {
+  background: rgba(99, 102, 241, 0.12) !important;
   color: #c7d2fe !important;
 }
 
-.Select-option.is-selected {
-  background-color: rgba(99, 102, 241, 0.2) !important;
-  color: #a5b4fc !important;
+.dash-dropdown-search {
+  background: transparent !important;
+  color: #e2e8f0 !important;
+  caret-color: #e2e8f0 !important;
 }
 
-.dash-dropdown .Select-control { min-height: 34px; }
+.dash-dropdown-search-container {
+  background: #1e2235 !important;
+  border: 1px solid rgba(255, 255, 255, 0.12) !important;
+}
+
+.dash-dropdown-search-container:focus-within {
+  border-color: rgba(99, 102, 241, 0.6) !important;
+  outline: 1px solid rgba(99, 102, 241, 0.6) !important;
+}
+
+.dash-dropdown-trigger-icon, .dash-dropdown-clear {
+  color: #64748b !important;
+  fill: #64748b !important;
+}
+
+.dash-dropdown-clear:hover { color: #e2e8f0 !important; }
 
 /* ── DataTable ────────────────────────────────────────────── */
 .dash-spreadsheet-container {
@@ -402,29 +438,59 @@ body.light-mode .form-select:focus {
 body.light-mode .form-control::placeholder { color: #94a3b8 !important; }
 body.light-mode input[type="number"] { color: #1e293b !important; }
 
-body.light-mode .Select-control {
-  background-color: #ffffff !important;
+body.light-mode .dash-dropdown-wrapper {
+  --Dash-Fill-Inverse-Strong: #ffffff;
+  --Dash-Text-Strong: #1e293b;
+  --Dash-Text-Disabled: #94a3b8;
+  --Dash-Text-Weak: #64748b;
+  --Dash-Stroke-Strong: #cbd5e1;
+  --Dash-Fill-Interactive-Strong: #059669;
+  --Dash-Fill-Interactive-Weak: rgba(5, 150, 105, 0.08);
+  --Dash-Fill-Disabled: rgba(0, 0, 0, 0.06);
+  --Dash-Shading-Strong: rgba(0, 0, 0, 0.12);
+  --Dash-Shading-Weak: rgba(0, 0, 0, 0.05);
+}
+
+body.light-mode .dash-dropdown {
+  background: #ffffff !important;
   border: 1px solid #cbd5e1 !important;
   color: #1e293b !important;
 }
 
-body.light-mode .Select-placeholder,
-body.light-mode .Select-value-label { color: #64748b !important; }
+body.light-mode .dash-dropdown:focus {
+  border-color: #059669 !important;
+  outline: 1px solid #059669 !important;
+}
 
-body.light-mode .Select-menu-outer {
-  background-color: #ffffff !important;
+body.light-mode .dash-dropdown-value { color: #1e293b !important; }
+body.light-mode .dash-dropdown-placeholder { color: #94a3b8 !important; }
+
+body.light-mode .dash-dropdown-content {
+  background: #ffffff !important;
   border: 1px solid #e2e8f0 !important;
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.12) !important;
 }
 
-body.light-mode .Select-option { color: #475569 !important; }
-body.light-mode .Select-option.is-focused {
-  background-color: rgba(99, 102, 241, 0.08) !important;
-  color: #4338ca !important;
+body.light-mode .dash-dropdown-option {
+  background: #ffffff !important;
+  color: #475569 !important;
 }
-body.light-mode .Select-option.is-selected {
-  background-color: rgba(99, 102, 241, 0.12) !important;
-  color: #4338ca !important;
+
+body.light-mode .dash-dropdown-option:hover {
+  background: rgba(5, 150, 105, 0.08) !important;
+  color: #065f46 !important;
+}
+
+body.light-mode .dash-dropdown-search { color: #1e293b !important; }
+
+body.light-mode .dash-dropdown-search-container {
+  background: #ffffff !important;
+  border: 1px solid #cbd5e1 !important;
+}
+
+body.light-mode .dash-dropdown-search-container:focus-within {
+  border-color: #059669 !important;
+  outline: 1px solid #059669 !important;
 }
 
 body.light-mode .badge.bg-secondary {
@@ -517,18 +583,6 @@ body.light-mode .form-select:focus {
 body.light-mode input[type="radio"] { accent-color: #059669 !important; }
 body.light-mode .btn-link { color: #059669 !important; }
 body.light-mode .btn-link:hover { color: #047857 !important; }
-body.light-mode .Select-option.is-focused {
-  background-color: rgba(5, 150, 105, 0.08) !important;
-  color: #065f46 !important;
-}
-body.light-mode .Select-option.is-selected {
-  background-color: rgba(5, 150, 105, 0.12) !important;
-  color: #065f46 !important;
-}
-body.light-mode .Select-control:focus-within {
-  border-color: #059669 !important;
-  box-shadow: 0 0 0 3px rgba(5, 150, 105, 0.15) !important;
-}
 body.light-mode #upload-file:hover {
   border-color: #059669 !important;
   background: rgba(5, 150, 105, 0.04) !important;

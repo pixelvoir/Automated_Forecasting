@@ -1,7 +1,21 @@
-# API Key env var names (not the actual keys)
-llm_provider: "gemini" # Can be 'gemini' or 'openai'
-gemini_api_key_env: "GEMINI_API_KEY"
-openai_api_key_env: "OPENAI_API_KEY"
+# LLM provider configuration
+# provider: ollama | openai | gemini | groq
+#
+# ollama  — local, free, no key needed. Best for privacy (nothing leaves the machine).
+#           Popular models: llama3.1:8b, mistral:7b, qwen2.5:7b
+# groq    — free tier available, very fast inference. Set GROQ_API_KEY in .env.
+#           Popular models: llama-3.1-8b-instant, mixtral-8x7b-32768, gemma2-9b-it
+# openai  — Set OPENAI_API_KEY in .env. Models: gpt-4o-mini, gpt-4o
+# gemini  — Set GEMINI_API_KEY in .env. Models: gemini-1.5-flash, gemini-1.5-pro
+#
+# Only computed statistics (~200 tokens) are sent — no raw data, no row values.
+# Column names ARE included in the payload (unavoidable for recipe keying).
+llm:
+  provider: "ollama"
+  model: "llama3.1:8b"
+  base_url: "http://localhost:11434/v1"   # only used for ollama (custom endpoint)
+  timeout_seconds: 60
+  max_retries: 2
 
 # Confidence thresholds
 confidence_threshold: 0.85
@@ -9,6 +23,7 @@ confidence_threshold: 0.85
 # Validation gate thresholds
 validation_gate:
   max_row_loss_pct: 15
+  min_series_length: 30
 
 # Stage 1: ingestion settings
 ingest:

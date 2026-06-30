@@ -20,6 +20,20 @@ RUNS_DIR = ROOT / "runs"
 RAW_DIR = ROOT / "data" / "raw"
 CONFIG_PATH = ROOT / "config" / "settings.yaml"
 
+# Maps frequency label → seasonality period (used for rolling window size)
+_FREQ_PERIOD = {
+    "hourly": 24, "daily": 7, "weekly": 52,
+    "monthly": 12, "quarterly": 4, "yearly": 1,
+}
+
+
+def _pick_ts_col(frequency: dict) -> str | None:
+    """Return the most granular (highest-frequency) datetime column name."""
+    if not frequency:
+        return None
+    order = {"hourly": 0, "daily": 1, "weekly": 2, "monthly": 3, "quarterly": 4, "yearly": 5}
+    return min(frequency, key=lambda c: order.get(frequency[c], 99))
+
 
 def _load_config() -> dict:
     with open(CONFIG_PATH) as f:
@@ -72,9 +86,13 @@ def _outlier_counts(
     iqr_mult: float = 1.5,
     z_thresh: float = 3.0,
     mad_thresh: float = 3.0,
+    frequency: dict | None = None,
 ) -> dict:
-    """Count outliers per numeric column using three methods.
-    Uses Stage 1's pre-computed Q1/Q3/IQR/mean/std to avoid recomputation."""
+    """Count outliers per numeric column using three global methods + one temporal method.
+    Uses Stage 1's pre-computed Q1/Q3/IQR/mean/std to avoid recomputation.
+    temporal_pct uses rolling IQR aligned on the most granular datetime column — a much
+    lower temporal_pct vs iqr_pct signals seasonal inflation, not real errors."""
+    ts_col = _pick_ts_col(frequency or {})
     result = {}
     for col, stats in stage1_numeric.items():
         if col not in df.columns:
@@ -104,7 +122,29 @@ def _outlier_counts(
         else:
             mad_pct = 0.0
 
-        result[col] = {"iqr_pct": iqr_pct, "zscore_pct": z_pct, "mad_pct": mad_pct}
+        # Temporal rolling-IQR method — only when a timestamp col exists and series ≥ 30
+        temporal_pct: float | None = None
+        if ts_col and ts_col in df.columns and ts_col != col and n >= 30:
+            try:
+                freq_str = (frequency or {}).get(ts_col, "daily")
+                window = max(_FREQ_PERIOD.get(freq_str, 7), 7)
+                # Align series on the timestamp so rolling uses sorted time order
+                ts_index = pd.to_datetime(df.loc[s.index, ts_col], errors="coerce")
+                s_t = s.copy()
+                s_t.index = ts_index
+                s_t = s_t.sort_index()
+                q1_r = s_t.rolling(window, center=True, min_periods=1).quantile(0.25)
+                q3_r = s_t.rolling(window, center=True, min_periods=1).quantile(0.75)
+                iqr_r = q3_r - q1_r
+                mask = (s_t < q1_r - 1.5 * iqr_r) | (s_t > q3_r + 1.5 * iqr_r)
+                temporal_pct = round(float(mask.sum()) / len(s_t) * 100, 2)
+            except Exception:
+                temporal_pct = None
+
+        result[col] = {
+            "iqr_pct": iqr_pct, "zscore_pct": z_pct, "mad_pct": mad_pct,
+            "temporal_pct": temporal_pct,
+        }
     return result
 
 
@@ -276,7 +316,7 @@ def _build_decision_payload(full_stats: dict, stage1: dict) -> dict:
     outlier_payload = {
         col: stats
         for col, stats in full_stats["outliers"].items()
-        if any(v > 0 for v in stats.values())
+        if any(v is not None and v > 0 for v in stats.values())
     }
 
     return {
@@ -323,6 +363,7 @@ def run(run_id: str) -> dict:
             iqr_mult=cfg.get("outlier_iqr_multiplier", 1.5),
             z_thresh=cfg.get("outlier_zscore_threshold", 3.0),
             mad_thresh=cfg.get("outlier_mad_threshold", 3.0),
+            frequency=frequency,
         ),
         "duplicates": {
             "rows": stage1.get("duplicates", {}).get("row_count", 0),

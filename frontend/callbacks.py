@@ -6,7 +6,7 @@ from pathlib import Path
 
 import requests
 import dash_bootstrap_components as dbc
-from dash import Input, Output, State, html, dash_table, no_update, callback, ALL, ctx, clientside_callback
+from dash import Input, Output, State, dcc, html, dash_table, no_update, callback, ALL, ctx, clientside_callback
 
 API_URL = os.environ.get("API_URL", "http://localhost:8000")
 
@@ -55,23 +55,6 @@ def _save_upload(contents: str, filename: str) -> str:
     finally:
         tmp.close()
     return tmp.name
-
-
-# ── 0. Update stage pills when results-store changes ─────────────────────
-
-@callback(
-    Output("pill-preclean", "color"),
-    Input("results-store", "data"),
-)
-def update_pills(data):
-    if not data:
-        return "secondary"
-    s2 = data.get("_stage2") or {}
-    # _stage2 from a live run: {"decision_payload": {...}, "status": "completed", ...}
-    # _stage2 from a past run: {"decision_payload": {...}}
-    if s2.get("decision_payload") is not None or s2.get("status") == "completed":
-        return "success"
-    return "secondary"
 
 
 # ── 1. Toggle DB / File sections based on source radio ────────────────────
@@ -227,7 +210,7 @@ def trigger_run(_, source, table, query, host, port, database, user, password,
         }
 
     try:
-        run_resp = requests.post(f"{API_URL}/runs", json=payload, timeout=120)
+        run_resp = requests.post(f"{API_URL}/runs", json=payload, timeout=1800)  # 30 min for large tables
         if not run_resp.ok:
             detail = run_resp.json().get("detail", "Unknown error")
             return no_update, dbc.Alert(f"Run failed: {detail}", color="danger", dismissable=True), False
@@ -246,7 +229,7 @@ def trigger_run(_, source, table, query, host, port, database, user, password,
 
         # Auto-trigger Stage 2 immediately after Stage 1
         try:
-            eda_resp = requests.post(f"{API_URL}/runs/{run_id}/pre-clean-eda", timeout=60)
+            eda_resp = requests.post(f"{API_URL}/runs/{run_id}/pre-clean-eda", timeout=600)  # 10 min for large tables
             if eda_resp.ok:
                 full_data["_stage2"] = eda_resp.json()
         except Exception:
@@ -258,8 +241,8 @@ def trigger_run(_, source, table, query, host, port, database, user, password,
 
     except requests.exceptions.Timeout:
         return no_update, dbc.Alert(
-            "Request timed out — the table may be very large. "
-            "Set 'row_limit' in config/settings.yaml to cap rows during dev.",
+            "Request timed out after 30 minutes — the dataset may be too large to ingest fully. "
+            "Set 'row_limit' in config/settings.yaml to cap rows (e.g. row_limit: 500000).",
             color="danger", dismissable=True,
         ), False
     except requests.exceptions.ConnectionError:
@@ -353,6 +336,91 @@ def render_results(data):
     stage2 = data.get("_stage2", {})
     stage2_section = _render_stage2(stage2) if stage2 else []
 
+    stage3 = data.get("_stage3", {})
+    stage3_section = _render_stage3(stage3) if stage3 else []
+
+    # Confirmation card + "Run Cleaning" button — shown when Stage 2 done, Stage 3 not yet run
+    cleaning_trigger = []
+    if stage2 and not stage3:
+        ts_options = [{"label": c, "value": c} for c in datetime_cols]
+        default_ts = datetime_cols[0] if datetime_cols else None
+        cleaning_trigger = [
+            html.Hr(className="my-4"),
+            dbc.Card(
+                dbc.CardBody([
+                    html.P(
+                        [html.I(className="bi bi-calendar-check me-2"),
+                         "Confirm Cleaning Settings"],
+                        className="fw-semibold mb-3",
+                        style={"color": "#c7d2fe"},
+                    ),
+                    dbc.Row([
+                        dbc.Col([
+                            html.Label(
+                                "Timestamp Column",
+                                className="form-label",
+                                style={"fontSize": "0.8rem", "color": "#94a3b8"},
+                            ),
+                            dcc.Dropdown(
+                                id="dropdown-ts-confirm",
+                                options=ts_options,
+                                value=default_ts,
+                                clearable=False,
+                                style={"fontSize": "0.85rem"},
+                            ),
+                        ], md=6),
+                    ], className="mb-3"),
+                    dbc.Button(
+                        [html.I(className="bi bi-scissors me-2"),
+                         "Run Cleaning (Stage 3)"],
+                        id="btn-run-cleaning",
+                        color="primary",
+                        className="w-100",
+                        disabled=default_ts is None,
+                        style={"fontWeight": "600", "letterSpacing": "0.02em"},
+                    ),
+                ]),
+                className="mb-3",
+                style={
+                    "background": "rgba(30, 41, 59, 0.7)",
+                    "border": "1px solid rgba(99, 102, 241, 0.3)",
+                },
+            ),
+        ]
+
+    # Stage 3 top banner — visible immediately without scrolling
+    stage3_banner = []
+    if stage3:
+        rows_b = stage3.get("rows_before", 0)
+        rows_a = stage3.get("rows_after", 0)
+        src = stage3.get("recipe_source", "")
+        vld = stage3.get("_validation", {})
+        vld_passed = vld.get("passed", True)
+        vld_badge = (
+            dbc.Badge("Validation passed", color="success", className="ms-1")
+            if vld_passed
+            else dbc.Badge("Validation issues", color="warning", className="ms-1")
+        )
+        stage3_banner = [dbc.Alert(
+            [
+                html.I(className="bi bi-check-circle-fill me-2", style={"color": "#10b981"}),
+                html.Strong("Stage 3 cleaning complete"),
+                html.Span(
+                    f" — {rows_b:,} → {rows_a:,} rows",
+                    style={"fontSize": "0.85rem", "marginLeft": "4px"},
+                ),
+                dbc.Badge(
+                    "LLM recipe" if src == "llm" else "Rule-based",
+                    color="success" if src == "llm" else "warning",
+                    className="ms-2",
+                ),
+                vld_badge,
+            ],
+            color="success",
+            className="py-2 mb-3",
+            style={"cursor": "default"},
+        )]
+
     def _icon(name):
         return html.I(className=f"bi {name}", style={"marginRight": "5px"})
 
@@ -372,12 +440,15 @@ def render_results(data):
 
     return [
         header,
+        *stage3_banner,
         shape_card,
         html.H6([_icon("bi-table"), "Schema"], className="mb-2 fw-semibold",
                 style={"color": "#94a3b8", "fontSize": "0.78rem", "textTransform": "uppercase", "letterSpacing": "0.06em"}),
         _datatable(schema_rows, ["Column", "Inferred type", "DB dtype", "Null count", "Null %", "Frequency"]),
         *numeric_section,
         *stage2_section,
+        *cleaning_trigger,
+        *stage3_section,
     ]
 
 
@@ -424,47 +495,82 @@ def new_dataset(_):
     return None
 
 
-# ── 9. Populate past-runs list (updates after every run + on page load) ────
+# ── 9. Past-runs list ─────────────────────────────────────────────────────
+
+def _build_runs_list() -> list:
+    """Render past-run items with load + delete buttons. Shared by two callbacks."""
+    try:
+        resp = requests.get(f"{API_URL}/runs", timeout=5)
+        if not resp.ok:
+            return [html.P("Could not load runs.", className="text-muted small mb-0",
+                           style={"fontSize": "0.78rem"})]
+        runs = resp.json().get("runs", [])
+        if not runs:
+            return [html.P("No runs yet.", className="text-muted small mb-0",
+                           style={"fontSize": "0.78rem"})]
+
+        items = []
+        for r in runs:
+            source = r.get("source", {})
+            label = (source.get("table") or Path(source.get("file", "")).name or r["run_id"])
+            s2_badge = dbc.Badge("S2", color="success", className="ms-1") if r.get("has_stage2") else None
+            s3_badge = dbc.Badge("S3", color="info", className="ms-1") if r.get("has_stage3") else None
+            items.append(
+                html.Div([
+                    dbc.Button(
+                        [
+                            html.Div([label, s2_badge, s3_badge],
+                                     className="small fw-semibold text-truncate"),
+                            html.Div(f"{r['rows']:,} rows × {r['cols']} cols",
+                                     className="text-muted", style={"fontSize": "11px"}),
+                        ],
+                        id={"type": "btn-past-run", "run_id": r["run_id"]},
+                        color="link", size="sm",
+                        className="text-start p-1 text-decoration-none flex-grow-1",
+                        style={"minWidth": 0, "overflow": "hidden"},
+                    ),
+                    dbc.Button(
+                        html.I(className="bi bi-trash3"),
+                        id={"type": "btn-delete-run", "run_id": r["run_id"]},
+                        color="link", size="sm",
+                        className="p-1 ms-1",
+                        style={"color": "#ef4444", "flexShrink": "0"},
+                        title=f"Delete {r['run_id']}",
+                    ),
+                ], className="d-flex align-items-center border-bottom")
+            )
+        return items
+    except Exception:
+        return [html.P("Could not reach API.", className="text-muted small mb-0",
+                       style={"fontSize": "0.78rem"})]
+
 
 @callback(
     Output("past-runs-list", "children"),
     Input("results-store", "data"),
 )
 def populate_past_runs(_):
-    try:
-        resp = requests.get(f"{API_URL}/runs", timeout=5)
-        if not resp.ok:
-            return html.P("Could not load runs.", className="text-muted small mb-0")
-        runs = resp.json().get("runs", [])
-        if not runs:
-            return html.P("No runs yet.", className="text-muted small mb-0")
+    return _build_runs_list()
 
-        items = []
-        for r in runs:
-            source = r.get("source", {})
-            label = (source.get("table")
-                     or Path(source.get("file", "")).name
-                     or r["run_id"])
-            badge = dbc.Badge("S2", color="success", className="ms-1") if r.get("has_stage2") else None
-            items.append(
-                html.Div([
-                    dbc.Button(
-                        [html.Div([label, badge], className="small fw-semibold text-truncate"),
-                         html.Div(f"{r['rows']:,} rows x {r['cols']} cols",
-                                  className="text-muted", style={"fontSize": "11px"})],
-                        id={"type": "btn-past-run", "run_id": r["run_id"]},
-                        color="link",
-                        size="sm",
-                        className="text-start p-1 text-decoration-none w-100",
-                    ),
-                ], className="border-bottom")
-            )
-        return items
+
+@callback(
+    Output("past-runs-list", "children", allow_duplicate=True),
+    Input({"type": "btn-delete-run", "run_id": ALL}, "n_clicks"),
+    prevent_initial_call=True,
+)
+def delete_run(n_clicks_list):
+    if not ctx.triggered_id or not any(v for v in n_clicks_list if v):
+        return no_update
+    run_id = ctx.triggered_id["run_id"]
+    try:
+        requests.delete(f"{API_URL}/runs/{run_id}", timeout=10)
     except Exception:
-        return html.P("Could not reach API.", className="text-muted small mb-0")
+        pass
+    return _build_runs_list()
 
 
 # ── 10. Load a past run from disk (no DB, reads local JSON) ────────────────
+# Only updates the store; toggle_ingestion_panel handles hiding the form.
 
 @callback(
     Output("results-store", "data", allow_duplicate=True),
@@ -587,3 +693,163 @@ def _datatable(rows, columns):
 
 def _fmt(v: float) -> str:
     return f"{v:,.4f}" if abs(v) < 1e6 else f"{v:,.2f}"
+
+
+# ── 11. Stage 3: run cleaning ─────────────────────────────────────────────────
+# Outputs to cleaning-status (persistent in layout) instead of btn-run-cleaning
+# or cleaning-alert (both are dynamically rendered), so the store update always
+# reaches render_results regardless of component lifecycle timing in Dash 4.
+
+@callback(
+    Output("results-store", "data", allow_duplicate=True),
+    Output("cleaning-status", "children"),
+    Input("btn-run-cleaning", "n_clicks"),
+    State("results-store", "data"),
+    State("dropdown-ts-confirm", "value"),
+    prevent_initial_call=True,
+)
+def run_cleaning(n_clicks, store_data, ts_val):
+    if not n_clicks or not store_data:
+        return no_update, no_update
+    run_id = store_data.get("run_id")
+    if not run_id:
+        return no_update, dbc.Alert("No active run found.", color="warning", className="mb-2")
+
+    try:
+        clean_resp = requests.post(
+            f"{API_URL}/runs/{run_id}/clean",
+            json={"timestamp_col": ts_val},
+            timeout=1800,  # 30 min — large datasets can take time
+        )
+        if not clean_resp.ok:
+            detail = clean_resp.json().get("detail", "Cleaning failed")
+            return no_update, dbc.Alert(f"Cleaning error: {detail}", color="danger", dismissable=True, className="mb-2")
+
+        stage3_data = clean_resp.json()
+
+        validate_resp = requests.post(f"{API_URL}/runs/{run_id}/validate", timeout=30)
+        if validate_resp.ok:
+            stage3_data["_validation"] = validate_resp.json()
+
+        new_store = {**store_data, "_stage3": stage3_data}
+        return new_store, ""
+
+    except requests.exceptions.Timeout:
+        return no_update, dbc.Alert(
+            "Cleaning timed out after 5 minutes.", color="danger", dismissable=True, className="mb-2"
+        )
+    except requests.exceptions.ConnectionError:
+        return no_update, dbc.Alert(
+            "Cannot reach API — is run_dev.bat running?", color="danger", dismissable=True, className="mb-2"
+        )
+    except Exception as e:
+        return no_update, dbc.Alert(str(e), color="danger", dismissable=True, className="mb-2")
+
+
+def _render_stage3(stage3: dict) -> list:
+    if not stage3:
+        return []
+
+    _sh = {"color": "#94a3b8", "fontSize": "0.78rem", "textTransform": "uppercase", "letterSpacing": "0.06em"}
+
+    recipe_source = stage3.get("recipe_source", "unknown")
+    rows_before = stage3.get("rows_before", "—")
+    rows_after = stage3.get("rows_after", "—")
+    row_loss_pct = stage3.get("row_loss_pct", "—")
+    cols_dropped = stage3.get("cols_dropped", [])
+    recipe = stage3.get("recipe", {})
+    validation = stage3.get("_validation", {})
+
+    source_badge = dbc.Badge(
+        "LLM recipe" if recipe_source == "llm" else "Rule-based fallback",
+        color="success" if recipe_source == "llm" else "warning",
+        className="ms-2",
+    )
+
+    sections = [
+        html.Hr(className="my-4"),
+        html.H5(
+            [html.I(className="bi bi-scissors", style={"marginRight": "7px", "color": "#6366f1"}),
+             "Stage 3 — Cleaning", source_badge],
+            className="fw-semibold mb-3 d-flex align-items-center", style={"color": "#c7d2fe"},
+        ),
+    ]
+
+    # Before/after summary
+    sections.append(
+        dbc.Card(dbc.CardBody(dbc.Row([
+            dbc.Col([
+                html.Div([html.I(className="bi bi-table", style={"marginRight": "4px", "color": "#64748b", "fontSize": "0.7rem"}),
+                          html.Span("Rows before", style={"fontSize": "0.65rem", "color": "#94a3b8", "textTransform": "uppercase"})],
+                         className="d-flex align-items-center mb-1"),
+                html.Div(f"{rows_before:,}" if isinstance(rows_before, int) else str(rows_before),
+                         style={"fontSize": "1rem", "fontWeight": "700"}),
+            ], width=3),
+            dbc.Col([
+                html.Div([html.I(className="bi bi-table", style={"marginRight": "4px", "color": "#64748b", "fontSize": "0.7rem"}),
+                          html.Span("Rows after", style={"fontSize": "0.65rem", "color": "#94a3b8", "textTransform": "uppercase"})],
+                         className="d-flex align-items-center mb-1"),
+                html.Div(f"{rows_after:,}" if isinstance(rows_after, int) else str(rows_after),
+                         style={"fontSize": "1rem", "fontWeight": "700"}),
+            ], width=3),
+            dbc.Col([
+                html.Div([html.I(className="bi bi-percent", style={"marginRight": "4px", "color": "#64748b", "fontSize": "0.7rem"}),
+                          html.Span("Row loss", style={"fontSize": "0.65rem", "color": "#94a3b8", "textTransform": "uppercase"})],
+                         className="d-flex align-items-center mb-1"),
+                html.Div(f"{row_loss_pct}%", style={"fontSize": "1rem", "fontWeight": "700"}),
+            ], width=3),
+            dbc.Col([
+                html.Div([html.I(className="bi bi-columns-gap", style={"marginRight": "4px", "color": "#64748b", "fontSize": "0.7rem"}),
+                          html.Span("Cols dropped", style={"fontSize": "0.65rem", "color": "#94a3b8", "textTransform": "uppercase"})],
+                         className="d-flex align-items-center mb-1"),
+                html.Div(str(len(cols_dropped)), style={"fontSize": "1rem", "fontWeight": "700"}),
+            ], width=3),
+        ])), className="mb-3", style={"borderLeft": "3px solid #6366f1"}),
+    )
+
+    # Cleaning recipe table
+    col_recipes = recipe.get("columns", {})
+    if col_recipes:
+        recipe_rows = [
+            {
+                "Column": col,
+                "Action": r.get("action", "—"),
+                "Missing strategy": r.get("missing_strategy", "—"),
+                "Outlier strategy": r.get("outlier_strategy", "—"),
+                "Type fix": r.get("type_fix", "—"),
+            }
+            for col, r in col_recipes.items()
+        ]
+        sections += [
+            html.H6([html.I(className="bi bi-list-check", style={"marginRight": "5px"}), "Cleaning Recipe"],
+                    className="fw-semibold mb-2", style=_sh),
+            _datatable(recipe_rows, ["Column", "Action", "Missing strategy", "Outlier strategy", "Type fix"]),
+        ]
+
+    # Validation gate results
+    if validation:
+        checks = validation.get("checks", {})
+        passed_overall = validation.get("passed", False)
+        gate_badge = dbc.Badge(
+            "Validation PASSED" if passed_overall else "Validation FAILED",
+            color="success" if passed_overall else "danger",
+            className="ms-2",
+        )
+        sections.append(
+            html.H6(
+                [html.I(className="bi bi-shield-check", style={"marginRight": "5px"}),
+                 "Stage 3.5 — Validation Gate", gate_badge],
+                className="fw-semibold mb-2 mt-3 d-flex align-items-center", style=_sh,
+            )
+        )
+        check_rows = [
+            {
+                "Check": name.replace("_", " ").title(),
+                "Result": "✓ Pass" if c["passed"] else "✗ Fail",
+                "Detail": c.get("detail", ""),
+            }
+            for name, c in checks.items()
+        ]
+        sections.append(_datatable(check_rows, ["Check", "Result", "Detail"]))
+
+    return sections
