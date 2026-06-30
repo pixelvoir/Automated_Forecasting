@@ -12,6 +12,7 @@ import pandas as pd
 import yaml
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import URL
+from sqlalchemy.pool import NullPool
 
 ROOT = Path(__file__).resolve().parent.parent
 RUNS_DIR = ROOT / "runs"
@@ -48,7 +49,7 @@ def build_engine(host: str, port: int, db: str, user: str, password: str):
             "options": "-c default_transaction_read_only=on",
             "connect_timeout": 5,
         },
-        pool_pre_ping=True,
+        poolclass=NullPool,  # every connection is physically closed on release — no idle connections
     )
 
 
@@ -115,9 +116,11 @@ def fetch_data(
     return cx.read_sql(conn_str, sql, return_type="pandas")
 
 
-def list_tables() -> list[dict]:
-    """Return all user tables in the connected DB. Queries information_schema only (read-only)."""
-    creds = _credentials()
+def list_tables(credentials: dict = None) -> list[dict]:
+    """Return all user tables in the connected DB. Queries information_schema only (read-only).
+    credentials dict: {host, port, db, user, password}. Falls back to env vars if None.
+    Engine is disposed immediately after the query — no persistent connection kept."""
+    creds = credentials if credentials is not None else _credentials()
     engine = build_engine(**creds)
     sql = text("""
         SELECT table_schema, table_name
@@ -126,9 +129,28 @@ def list_tables() -> list[dict]:
           AND table_schema NOT IN ('pg_catalog', 'information_schema')
         ORDER BY table_schema, table_name
     """)
-    with engine.connect() as conn:
-        rows = conn.execute(sql).fetchall()
-    return [{"schema": r[0], "table": r[1], "qualified": f"{r[0]}.{r[1]}"} for r in rows]
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(sql).fetchall()
+        return [{"schema": r[0], "table": r[1], "qualified": f"{r[0]}.{r[1]}"} for r in rows]
+    finally:
+        engine.dispose()  # disconnect immediately — never hold an idle connection
+
+
+def _read_file(file_path: str, row_limit: int = None) -> pd.DataFrame:
+    """Read a local CSV, Excel, or Parquet file into a DataFrame."""
+    path = Path(file_path)
+    if not path.exists():
+        raise FileNotFoundError(f"File not found: {file_path}")
+    suffix = path.suffix.lower()
+    if suffix == ".csv":
+        return pd.read_csv(path, nrows=row_limit)
+    if suffix in (".xlsx", ".xls"):
+        return pd.read_excel(path, nrows=row_limit)
+    if suffix == ".parquet":
+        df = pd.read_parquet(path)
+        return df.head(row_limit) if row_limit else df
+    raise ValueError(f"Unsupported file type '{suffix}'. Supported: .csv, .xlsx, .xls, .parquet")
 
 
 # ── Metadata extraction ─────────────────────────────────────────────────────
@@ -233,13 +255,27 @@ def extract_metadata(df: pd.DataFrame, top_n: int = 5) -> dict:
 
 # ── Stage 1 entry point ─────────────────────────────────────────────────────
 
-def run(table: str = None, query: str = None) -> dict:
-    """Stage 1 entry point: ingest from PostgreSQL and save locally."""
-    cfg = _load_config()
-    creds = _credentials()
+def run(
+    table: str = None,
+    query: str = None,
+    credentials: dict = None,
+    file_path: str = None,
+) -> dict:
+    """Stage 1 entry point: ingest from PostgreSQL or a local file and save locally.
 
-    conn_str = _build_conn_str(**creds)
-    df = fetch_data(conn_str, table=table, query=query, row_limit=cfg.get("row_limit"))
+    DB mode: credentials dict {host, port, db, user, password} or falls back to env vars.
+    File mode: file_path to a local .csv / .xlsx / .parquet file.
+    """
+    cfg = _load_config()
+
+    if file_path:
+        df = _read_file(file_path, row_limit=cfg.get("row_limit"))
+        source_info = {"file": str(file_path)}
+    else:
+        creds = credentials if credentials is not None else _credentials()
+        conn_str = _build_conn_str(**creds)
+        df = fetch_data(conn_str, table=table, query=query, row_limit=cfg.get("row_limit"))
+        source_info = {"table": table, "query": query}
 
     run_id = f"run_{datetime.now():%Y%m%d_%H%M%S}"
     run_dir = RUNS_DIR / run_id
@@ -251,7 +287,7 @@ def run(table: str = None, query: str = None) -> dict:
 
     metadata = extract_metadata(df, top_n=cfg.get("top_n_categories", 5))
     metadata["run_id"] = run_id
-    metadata["source"] = {"table": table, "query": query}
+    metadata["source"] = source_info
 
     meta_path = run_dir / "metadata.json"
     meta_path.write_text(json.dumps(metadata, indent=2, default=str))

@@ -5,19 +5,18 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from frontend.layout import layout
+from frontend.layout import create_layout
 
 app = dash.Dash(
     __name__,
-    external_stylesheets=[dbc.themes.FLATLY],
-    suppress_callback_exceptions=False,
+    external_stylesheets=[],   # themes served from assets/ — no CDN needed
+    suppress_callback_exceptions=True,
     title="Forecasting Agent",
 )
-app.layout = layout
+app.layout = create_layout()
 
-# Import callbacks after app is defined — registers them as a side-effect.
-# The circular import (callbacks imports app) is intentional and safe here
-# because `app` is fully constructed before this line executes.
+# Importing callbacks registers them via the global @callback decorator (Dash 4.x pattern).
+# Must happen AFTER app is created so Dash knows which app to attach them to.
 import frontend.callbacks  # noqa: E402, F401
 
 if __name__ == "__main__":

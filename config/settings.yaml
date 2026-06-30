@@ -15,3 +15,12 @@ ingest:
   row_limit: null          # null = fetch all rows; set an integer to cap rows (useful for large tables during dev)
   raw_format: parquet
   top_n_categories: 5      # how many top values to include in cardinality stats
+
+# Stage 2: pre-cleaning EDA settings
+pre_clean_eda:
+  outlier_iqr_multiplier: 1.5          # IQR fence multiplier (standard = 1.5, strict = 3.0)
+  outlier_zscore_threshold: 3.0        # |z| > this → outlier
+  outlier_mad_threshold: 3.0           # |x - median| / MAD > this → outlier
+  constant_col_variance_threshold: 0.001  # std/|mean| < this → near-constant
+  structural_breaks_min_rows: 50       # skip break detection if fewer rows
+  structural_breaks_penalty: "bic"     # ruptures penalty: "bic" | "aic" | "l2"
