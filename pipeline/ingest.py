@@ -163,7 +163,16 @@ def _infer_dtype(series: pd.Series) -> str:
     if pd.api.types.is_numeric_dtype(series):
         return "numeric"
     if series.dtype == object:
-        sample = series.dropna().head(50)
+        sample = series.dropna().head(200)
+        if len(sample) == 0:
+            return "categorical"
+        # Numeric-as-string check first (matches Stage 2's _dtype_issues precedence) —
+        # CSV/DB columns are commonly read as strings even when the values are numeric.
+        # Getting this right here matters: numeric_stats below (and Stage 2's outlier
+        # detection, which only looks at columns classified "numeric") both depend on it —
+        # miss it here and a numeric column silently gets zero outlier analysis downstream.
+        if pd.to_numeric(sample, errors="coerce").notna().mean() > 0.8:
+            return "numeric"
         try:
             pd.to_datetime(sample)
             return "datetime"
@@ -225,7 +234,9 @@ def extract_metadata(df: pd.DataFrame, top_n: int = 5) -> dict:
     numeric_stats = {}
     for col, dt in dtype_map.items():
         if dt == "numeric":
-            s = df[col].dropna()
+            # to_numeric is a no-op for already-numeric dtypes and safely coerces columns
+            # that were classified "numeric" via the string-detection path above.
+            s = pd.to_numeric(df[col], errors="coerce").dropna()
             if len(s) == 0:
                 continue
             q1, q3 = float(np.percentile(s, 25)), float(np.percentile(s, 75))

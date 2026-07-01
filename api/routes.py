@@ -6,13 +6,23 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, model_validator
 
-from agents import cleaning_agent
-from pipeline import ingest, pre_clean_eda, cleaner, validation_gate
+from api import jobs, tasks
+from pipeline import ingest  # list_tables only — light, stays in-process
 
 ROOT = Path(__file__).resolve().parent.parent
 RUNS_DIR = ROOT / "runs"
 
 router = APIRouter(prefix="/runs", tags=["runs"])
+
+
+def _run_job(func, *args, track_id=None, **kwargs):
+    """Run a heavy stage in the cancellable job slot, mapping job outcomes to HTTP errors."""
+    try:
+        return jobs.run_job(func, *args, track_id=track_id, **kwargs)
+    except jobs.JobCancelled as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except jobs.JobError as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ── Shared credential model ─────────────────────────────────────────────────
@@ -95,6 +105,16 @@ def list_runs():
     return {"runs": runs}
 
 
+# ── Cancel the running job ──────────────────────────────────────────────────
+# Defined before /{run_id} routes so the literal path isn't captured as a run_id.
+
+@router.post("/cancel")
+def cancel_running():
+    """Terminate whatever heavy stage is currently running (if any). Used when the user
+    starts a new run or switches datasets so old work stops burning CPU immediately."""
+    return {"cancelled": jobs.cancel_active()}
+
+
 # ── Run management ──────────────────────────────────────────────────────────
 
 class RunRequest(BaseModel):
@@ -125,28 +145,23 @@ class RunResponse(BaseModel):
 
 @router.post("", response_model=RunResponse)
 def create_run(req: RunRequest):
-    try:
-        creds = None
-        if req.credentials:
-            creds = {
-                "host": req.credentials.host,
-                "port": req.credentials.port,
-                "db": req.credentials.database,
-                "user": req.credentials.user,
-                "password": req.credentials.password,
-            }
-        result = ingest.run(
-            table=req.table,
-            query=req.query,
-            credentials=creds,
-            file_path=req.file_path,
-        )
-    except KeyError as e:
-        raise HTTPException(status_code=500, detail=f"Missing env variable: {e}")
-    except (ValueError, FileNotFoundError) as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    # Starting a new run preempts any heavy stage still running for a previous dataset.
+    creds = None
+    if req.credentials:
+        creds = {
+            "host": req.credentials.host,
+            "port": req.credentials.port,
+            "db": req.credentials.database,
+            "user": req.credentials.user,
+            "password": req.credentials.password,
+        }
+    result = _run_job(
+        tasks.ingest_task,
+        table=req.table,
+        query=req.query,
+        credentials=creds,
+        file_path=req.file_path,
+    )
     return RunResponse(status="completed", **result)
 
 
@@ -156,13 +171,7 @@ def run_pre_clean_eda(run_id: str):
     run_dir = RUNS_DIR / run_id
     if not run_dir.exists():
         raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found.")
-    try:
-        result = pre_clean_eda.run(run_id)
-        return result
-    except FileNotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    return _run_job(tasks.eda_task, run_id, track_id=run_id)
 
 
 @router.get("/{run_id}/summary")
@@ -180,9 +189,15 @@ def get_run_summary(run_id: str):
     recipe_path = RUNS_DIR / run_id / "cleaning_recipe.json"
     report_path = RUNS_DIR / run_id / "cleaning_report.json"
     vg_path = RUNS_DIR / run_id / "validation_gate.json"
+    status_path = RUNS_DIR / run_id / "cleaning_status.json"
     if recipe_path.exists():
+        status = (
+            json.loads(status_path.read_text()) if status_path.exists()
+            else {"recipe_source": "unknown", "recipe_error": None}
+        )
         stage3: dict = {
-            "recipe_source": "unknown",
+            "recipe_source": status.get("recipe_source", "unknown"),
+            "recipe_error": status.get("recipe_error"),
             "recipe": json.loads(recipe_path.read_text()),
         }
         if report_path.exists():
@@ -229,6 +244,7 @@ def get_metadata(run_id: str):
 
 class CleanRequest(BaseModel):
     timestamp_col: str | None = None
+    use_llm: bool = True
 
 
 @router.post("/{run_id}/clean")
@@ -238,23 +254,11 @@ def run_clean(run_id: str, req: CleanRequest = CleanRequest()):
     run_dir = RUNS_DIR / run_id
     if not run_dir.exists():
         raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found.")
-    try:
-        selections = {"timestamp_col": req.timestamp_col}
-        (run_dir / "user_selections.json").write_text(json.dumps(selections, indent=2))
+    selections = {"timestamp_col": req.timestamp_col}
+    (run_dir / "user_selections.json").write_text(json.dumps(selections, indent=2))
 
-        agent_result = cleaning_agent.run(run_id)
-        cleaner_result = cleaner.run(run_id)
-        return {
-            "run_id": run_id,
-            "status": "completed",
-            "recipe_source": agent_result["recipe_source"],
-            "recipe": agent_result["recipe"],
-            **{k: v for k, v in cleaner_result.items() if k != "run_id"},
-        }
-    except FileNotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    result = _run_job(tasks.clean_task, run_id, use_llm=req.use_llm, track_id=run_id)
+    return {"run_id": run_id, "status": "completed", **result}
 
 
 @router.post("/{run_id}/validate")
@@ -263,9 +267,4 @@ def run_validate(run_id: str):
     run_dir = RUNS_DIR / run_id
     if not run_dir.exists():
         raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found.")
-    try:
-        return validation_gate.run(run_id)
-    except FileNotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    return _run_job(tasks.validate_task, run_id, track_id=run_id)

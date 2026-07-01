@@ -54,12 +54,13 @@ class CleaningRecipe(BaseModel):
 # ── System prompt ─────────────────────────────────────────────────────────────
 
 _SYSTEM_PROMPT = """\
-You are a data cleaning strategy assistant for time-series forecasting pipelines.
+Task:
+You are a data cleaning strategy expert for time-series forecasting pipelines.
 You will receive a JSON object describing data quality issues in a dataset: missing values,
 outliers, type problems, and duplicate counts. You must return a cleaning recipe.
-
+Mandatory:
 Use ONLY the options listed below. Do NOT invent new strategy names.
-
+Instructions:
 MISSING STRATEGY options:
   "interpolate"    - time-based interpolation (best for evenly-spaced numeric time series)
   "forward_fill"   - propagate last valid value forward (good for sparse or step data)
@@ -212,14 +213,16 @@ def _rule_based_fallback(payload: dict, all_cols: list[str], rows: int = 0) -> d
 
 # ── Stage 3 entry point ───────────────────────────────────────────────────────
 
-def run(run_id: str) -> dict:
+def run(run_id: str, use_llm: bool = True) -> dict:
     """Stage 3 entry point: decide cleaning strategy via LLM (with rule-based fallback).
 
     Reads:  runs/{run_id}/cleaning_decision_payload.json  (Stage 2 output)
             runs/{run_id}/metadata.json                   (Stage 1 output, for column list)
             runs/{run_id}/user_selections.json            (optional: user-confirmed timestamp_col)
     Writes: runs/{run_id}/cleaning_recipe.json
-    Returns {run_id, recipe, recipe_source: "llm" | "fallback"}.
+            runs/{run_id}/cleaning_status.json            (recipe_source + recipe_error)
+    Set use_llm=False to skip the LLM entirely and use the rule-based recipe directly.
+    Returns {run_id, recipe, recipe_source: "llm" | "fallback", recipe_error: str | None}.
     """
     run_dir = RUNS_DIR / run_id
     payload_path = run_dir / "cleaning_decision_payload.json"
@@ -238,43 +241,61 @@ def run(run_id: str) -> dict:
     rows = meta.get("shape", {}).get("rows", 0)
 
     recipe_source = "llm"
+    recipe_error: str | None = None
     recipe: dict | None = None
 
-    messages = [
-        {"role": "system", "content": _SYSTEM_PROMPT},
-        {
-            "role": "user",
-            "content": (
-                "Here is the dataset quality report:\n\n"
-                + json.dumps(payload, indent=2)
-                + "\n\nPlease return the cleaning recipe JSON."
-            ),
-        },
-    ]
-
-    try:
-        raw = llm_client.call(messages, require_json=True)
-
-        # Fill in any columns the LLM may have omitted
-        if "columns" in raw and isinstance(raw["columns"], dict):
-            for col in all_cols:
-                if col not in raw["columns"]:
-                    raw["columns"][col] = {
-                        "missing_strategy": "none",
-                        "outlier_strategy": "keep",
-                        "type_fix": "none",
-                        "action": "keep",
-                    }
-
-        validated = CleaningRecipe.model_validate(raw)
-        recipe = validated.model_dump()
-    except (LLMError, ValidationError, Exception) as exc:
-        print(
-            f"[cleaning_agent] LLM unavailable or invalid "
-            f"({type(exc).__name__}: {exc}). Using rule-based fallback."
-        )
+    if not use_llm:
+        # Deliberate rule-based-only run — not a failure, so no error is recorded.
         recipe_source = "fallback"
         recipe = _rule_based_fallback(payload, all_cols, rows=rows)
+    else:
+        messages = [
+            {"role": "system", "content": _SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": (
+                    "Here is the dataset quality report:\n\n"
+                    + json.dumps(payload, indent=2)
+                    + "\n\nPlease return the cleaning recipe JSON."
+                ),
+            },
+        ]
+
+        try:
+            raw = llm_client.call(messages, require_json=True)
+
+            # Fill in any columns the LLM may have omitted
+            if "columns" in raw and isinstance(raw["columns"], dict):
+                for col in all_cols:
+                    if col not in raw["columns"]:
+                        raw["columns"][col] = {
+                            "missing_strategy": "none",
+                            "outlier_strategy": "keep",
+                            "type_fix": "none",
+                            "action": "keep",
+                        }
+
+            validated = CleaningRecipe.model_validate(raw)
+            recipe = validated.model_dump()
+        except (LLMError, ValidationError, Exception) as exc:
+            recipe_error = f"{type(exc).__name__}: {exc}"
+            print(
+                f"[cleaning_agent] LLM unavailable or invalid "
+                f"({recipe_error}). Using rule-based fallback."
+            )
+            recipe_source = "fallback"
+            recipe = _rule_based_fallback(payload, all_cols, rows=rows)
+
+    # Safety net: force the correct type_fix for any column Stage 2 flagged as stored-as-
+    # string, regardless of what the LLM chose (the rule-based fallback already gets this
+    # right, but an LLM response isn't guaranteed to honor the dtype_issues signal). Without
+    # the cast, cleaner.py's numeric/datetime operations would silently no-op on that column.
+    _ISSUE_TO_FIX = {"numeric_as_string": "cast_numeric", "datetime_as_string": "parse_datetime"}
+    for issue_item in payload.get("dtype_issues", []):
+        col, issue = issue_item.get("col"), issue_item.get("issue")
+        col_recipe = recipe.get("columns", {}).get(col)
+        if col_recipe and col_recipe.get("type_fix") == "none" and issue in _ISSUE_TO_FIX:
+            col_recipe["type_fix"] = _ISSUE_TO_FIX[issue]
 
     # Inject frequency + period into recipe so the cleaner can use temporal window sizes
     freq_dict = payload.get("frequency", {})
@@ -300,5 +321,14 @@ def run(run_id: str) -> dict:
             recipe["period"] = _FREQ_PERIOD.get(user_freq_str, 7) if user_freq_str else 7
 
     (run_dir / "cleaning_recipe.json").write_text(json.dumps(recipe, indent=2))
+    # Persist status so a reloaded run (/summary) can show the real source + error.
+    (run_dir / "cleaning_status.json").write_text(
+        json.dumps({"recipe_source": recipe_source, "recipe_error": recipe_error}, indent=2)
+    )
 
-    return {"run_id": run_id, "recipe": recipe, "recipe_source": recipe_source}
+    return {
+        "run_id": run_id,
+        "recipe": recipe,
+        "recipe_source": recipe_source,
+        "recipe_error": recipe_error,
+    }
