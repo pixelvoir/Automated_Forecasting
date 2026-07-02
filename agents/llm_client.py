@@ -83,7 +83,13 @@ def call(messages: list[dict], *, require_json: bool = True) -> dict:
         timeout=timeout,
     )
 
-    kwargs: dict = {"model": model, "messages": messages}
+    kwargs: dict = {
+        "model": model,
+        "messages": messages,
+        # Configurable in settings.yaml — low default keeps recipes stable run-to-run
+        # (provider default of 1.0 produced wildly inconsistent strategies).
+        "temperature": float(cfg.get("temperature", 0.2)),
+    }
     if require_json:
         kwargs["response_format"] = {"type": "json_object"}
 

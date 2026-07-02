@@ -62,83 +62,164 @@ def run(run_id: str) -> dict:
     clean_nulls: dict = cleaned.get("nulls", {})
     numeric_variance: dict = cleaned.get("numeric_variance", {})
 
+    # Every check carries a severity: "blocking" checks decide the gate outcome
+    # (they catch data destruction); "warning" checks surface forecasting risks
+    # without failing the run.
     checks: dict = {}
 
-    # 1. Row loss within threshold
+    # 1. Row loss within threshold (percentage-based, configurable)
     checks["row_loss"] = {
         "passed": row_delta_pct <= max_row_loss_pct,
+        "severity": "blocking",
         "detail": f"{row_delta_pct}% rows removed (threshold: {max_row_loss_pct}%)",
     }
 
-    # 2. Minimum series length
+    # 2. Minimum series length (deliberately absolute — 30 rows is a statistical
+    # floor for any seasonal/trend estimation, regardless of dataset size)
     checks["series_length"] = {
         "passed": rows_after >= min_series_length,
+        "severity": "blocking",
         "detail": f"{rows_after} rows remaining (minimum: {min_series_length})",
     }
 
-    # 3. No null regression — nulls must not increase for any column
+    # 3. No null regression — nulls must not increase for any column.
+    # Columns with a type_fix are exempt: cast_numeric/parse_datetime legitimately
+    # turn junk strings into NaN — that's a repair, not a regression.
+    recipe_cols = recipe.get("columns", {})
+    coerced_cols = {
+        c for c, r in recipe_cols.items() if r.get("type_fix") not in (None, "none")
+    }
     null_regressions = []
     for col, orig in orig_nulls.items():
+        if col in coerced_cols:
+            continue
         orig_pct = orig.get("pct", 0)
         cleaned_pct = clean_nulls.get(col, {}).get("pct", 0)
         if cleaned_pct > orig_pct + 0.1:  # 0.1% tolerance for float precision
             null_regressions.append(f"{col}: {orig_pct}% → {cleaned_pct}%")
     checks["no_null_regression"] = {
         "passed": len(null_regressions) == 0,
+        "severity": "blocking",
         "detail": (
             f"Null increases detected: {null_regressions}"
             if null_regressions
             else "No null regressions"
+            + (f" ({len(coerced_cols)} type-coerced column(s) exempt)" if coerced_cols else "")
         ),
     }
 
-    # 4. Numeric columns still have variance (cleaning didn't zero them out)
-    zero_variance = [col for col, var in numeric_variance.items() if var == 0.0]
+    # 4. Cleaning must not destroy variance. Relative check: only blame cleaning for
+    # columns that HAD variance before (a column that was already constant is a
+    # drop-candidate problem, not a cleaning regression).
+    stage1_stats = stage1.get("numeric_stats", {})
+    zero_variance = [
+        col for col, var in numeric_variance.items()
+        if var == 0.0 and stage1_stats.get(col, {}).get("std", 0) > 0
+    ]
     checks["numeric_variance"] = {
         "passed": len(zero_variance) == 0,
+        "severity": "blocking",
         "detail": (
-            f"Zero-variance columns after cleaning: {zero_variance}"
+            f"Cleaning collapsed variance to zero: {zero_variance}"
             if zero_variance
-            else "All numeric columns retain variance"
+            else "No column had its variance destroyed by cleaning"
         ),
     }
 
-    # 5. Timestamp monotonicity (only relevant if the recipe sorted by timestamp)
+    # 5. Timestamp completeness — rows without a timestamp are unusable for forecasting
+    if ts_col:
+        ts_null_count = clean_nulls.get(ts_col, {}).get("count", 0)
+        checks["timestamp_nulls"] = {
+            "passed": ts_null_count == 0,
+            "severity": "blocking",
+            "detail": (
+                f"Timestamp '{ts_col}' has no missing values"
+                if ts_null_count == 0
+                else f"Timestamp '{ts_col}' still has {ts_null_count} missing value(s) after cleaning"
+            ),
+        }
+
+    # 6. At least one usable numeric column must survive — no target, no forecast
+    usable_numeric = [col for col, var in numeric_variance.items() if var > 0]
+    checks["forecastable_columns"] = {
+        "passed": len(usable_numeric) > 0,
+        "severity": "blocking",
+        "detail": (
+            f"{len(usable_numeric)} numeric column(s) with variance available as forecast targets"
+            if usable_numeric
+            else "No numeric column with variance remains — nothing to forecast"
+        ),
+    }
+
+    # 7. Timestamp monotonicity (only relevant if the recipe sorted by timestamp)
+    # 8. Future-dated timestamps (warning) — they silently corrupt train/test splits
+    ts_series = None
     if ts_col and recipe.get("sort_by_timestamp"):
         cleaned_path = CLEANED_DIR / f"{run_id}_cleaned.parquet"
         if cleaned_path.exists():
             try:
-                df_ts = pd.read_parquet(cleaned_path, columns=[ts_col])
-                is_monotonic = bool(df_ts[ts_col].is_monotonic_increasing)
-                checks["timestamp_monotonic"] = {
-                    "passed": is_monotonic,
-                    "detail": (
-                        f"Timestamp '{ts_col}' is monotonically increasing"
-                        if is_monotonic
-                        else f"Timestamp '{ts_col}' is NOT monotonic — possible duplicate timestamps"
-                    ),
-                }
-            except Exception as exc:
-                checks["timestamp_monotonic"] = {
-                    "passed": True,
-                    "detail": f"Skipped (could not read column): {exc}",
-                }
-        else:
-            checks["timestamp_monotonic"] = {
-                "passed": True,
-                "detail": "Skipped (cleaned parquet not found)",
-            }
+                ts_series = pd.to_datetime(
+                    pd.read_parquet(cleaned_path, columns=[ts_col])[ts_col],
+                    errors="coerce",
+                )
+            except Exception:
+                ts_series = None
+    if ts_series is not None:
+        is_monotonic = bool(ts_series.is_monotonic_increasing)
+        checks["timestamp_monotonic"] = {
+            "passed": is_monotonic,
+            "severity": "blocking",
+            "detail": (
+                f"Timestamp '{ts_col}' is monotonically increasing"
+                if is_monotonic
+                else f"Timestamp '{ts_col}' is NOT monotonic — sort did not apply"
+            ),
+        }
+        future_count = int((ts_series > pd.Timestamp.now() + pd.Timedelta(days=1)).sum())
+        future_pct = round(future_count / max(len(ts_series), 1) * 100, 2)
+        checks["future_timestamps"] = {
+            "passed": future_count == 0,
+            "severity": "warning",
+            "detail": (
+                "No future-dated timestamps"
+                if future_count == 0
+                else f"{future_count} row(s) ({future_pct}%) are dated in the future — "
+                     "verify before train/test splitting"
+            ),
+        }
     else:
         checks["timestamp_monotonic"] = {
             "passed": True,
-            "detail": "Not applicable (no timestamp column or sort not requested)",
+            "severity": "blocking",
+            "detail": "Not applicable (no timestamp column, sort not requested, or column unreadable)",
         }
 
-    passed = all(c["passed"] for c in checks.values())
+    # 9. Enough history for seasonal models (warning) — needs ≥ 2 full cycles
+    period = recipe.get("period")
+    if period:
+        enough = rows_after >= 2 * int(period)
+        checks["seasonal_history"] = {
+            "passed": enough,
+            "severity": "warning",
+            "detail": (
+                f"History covers >= 2 seasonal cycles (period {period})"
+                if enough
+                else f"Fewer than 2 seasonal cycles of data (period {period}) — "
+                     "seasonal models (STL, SARIMA) will be unreliable"
+            ),
+        }
+
+    # Only blocking checks decide the gate; warnings inform the modeling stage.
+    passed = all(c["passed"] for c in checks.values() if c["severity"] == "blocking")
+    warnings_failed = [
+        name for name, c in checks.items()
+        if c["severity"] == "warning" and not c["passed"]
+    ]
 
     result = {
         "run_id": run_id,
         "passed": passed,
+        "warnings": warnings_failed,
         "checks": checks,
         "row_delta_pct": row_delta_pct,
         "rows_before": rows_before,

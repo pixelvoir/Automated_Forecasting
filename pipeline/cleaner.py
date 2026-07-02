@@ -22,15 +22,26 @@ def _apply_missing(df: pd.DataFrame, col: str, strategy: str,
                    ts_col: str | None = None) -> pd.DataFrame:
     s = df[col]
     if strategy == "interpolate":
+        # Interpolation is only defined for numerics — a recipe (LLM or fallback) can
+        # still assign it to a string/datetime column, so degrade to fill instead of
+        # letting pandas raise.
+        if not pd.api.types.is_numeric_dtype(s):
+            df[col] = s.ffill().bfill()
+            return df
         # time-based interpolation requires a DatetimeIndex.
         # Raw parquet has a RangeIndex, so temporarily align the series on the
         # timestamp column so pandas uses actual time gaps between rows.
         if ts_col and ts_col in df.columns and ts_col != col:
             ts_index = pd.to_datetime(df[ts_col], errors="coerce")
-            temp = s.copy()
-            temp.index = ts_index
-            temp = temp.interpolate(method="time")
-            df[col] = temp.values
+            if ts_index.isna().any():
+                # pandas raises NotImplementedError on NaT in the index; positional
+                # interpolation is the safe approximation when timestamps are missing.
+                df[col] = s.interpolate().values
+            else:
+                temp = s.copy()
+                temp.index = ts_index
+                temp = temp.interpolate(method="time")
+                df[col] = temp.values
         else:
             df[col] = s.interpolate()  # linear fallback when no timestamp col
     elif strategy == "forward_fill":
@@ -305,9 +316,15 @@ def run(run_id: str) -> dict:
     if recipe.get("drop_duplicates", False):
         df = df.drop_duplicates().reset_index(drop=True)
 
-    # 7. Sort by timestamp
+    # 7. Sort by timestamp. The column must be real datetimes first — string dates sort
+    # lexicographically, which is NOT chronological order (caught by the validation
+    # gate's monotonicity check). The sanitizer normally forces parse_datetime for the
+    # ts col; this is the backstop for recipes that skipped it.
     ts_col = recipe.get("timestamp_col")
     if recipe.get("sort_by_timestamp") and ts_col and ts_col in df.columns:
+        if not pd.api.types.is_datetime64_any_dtype(df[ts_col]):
+            df[ts_col] = pd.to_datetime(df[ts_col], errors="coerce")
+            df = df[df[ts_col].notna()].reset_index(drop=True)
         df = df.sort_values(ts_col).reset_index(drop=True)
 
     rows_after = len(df)

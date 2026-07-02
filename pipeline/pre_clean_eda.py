@@ -330,6 +330,47 @@ def _ruptures_penalty(signal: np.ndarray, method: str) -> float:
     return var  # l2 fallback
 
 
+# ── Column profile (statistics only — no raw values) ────────────────────────
+
+def _column_profile(df: pd.DataFrame, stage1: dict) -> dict:
+    """Compact per-column facts for the LLM payload (~10 tokens/column). This is what
+    lets the model choose strategies from evidence instead of guessing:
+    - zero_pct  → IQR-family outlier strategies are degenerate on zero-inflated columns
+    - skew      → mean_fill vs median_fill
+    - distinct_pct → ID-like columns (≈100 on non-timestamp columns carry no signal)
+    - dtype/null_pct → drop candidates, fill feasibility
+    """
+    rows = max(stage1.get("shape", {}).get("rows", len(df)), 1)
+    nulls = stage1.get("nulls", {})
+    cardinality = stage1.get("cardinality", {})
+    numeric_stats = stage1.get("numeric_stats", {})
+
+    profile = {}
+    for item in stage1.get("schema", []):
+        col = item["col"]
+        p: dict = {
+            "dtype": item.get("dtype_inferred", "unknown"),
+            "null_pct": nulls.get(col, {}).get("pct", 0),
+        }
+        unique = cardinality.get(col, {}).get("unique_count")
+        if unique is None and col in df.columns:
+            # Stage 1 only computes cardinality for categoricals — numeric/datetime ID
+            # columns need it too (a per-row-unique "id" column is a drop candidate).
+            try:
+                unique = int(df[col].nunique())
+            except Exception:
+                unique = None
+        if unique is not None:
+            p["distinct_pct"] = round(unique / rows * 100, 2)
+        stats = numeric_stats.get(col)
+        if stats is not None and col in df.columns:
+            s = pd.to_numeric(df[col], errors="coerce")
+            p["zero_pct"] = round(float((s == 0).mean() * 100), 2)
+            p["skew"] = round(stats.get("skew", 0), 2)
+        profile[col] = p
+    return profile
+
+
 # ── Decision payload extractor ───────────────────────────────────────────────
 
 def _build_decision_payload(full_stats: dict, stage1: dict) -> dict:
@@ -351,6 +392,8 @@ def _build_decision_payload(full_stats: dict, stage1: dict) -> dict:
     }
 
     return {
+        "n_rows": stage1.get("shape", {}).get("rows", 0),
+        "column_profile": full_stats.get("column_profile", {}),
         "missing": missing_payload,
         "outliers": outlier_payload,
         "duplicates": {
@@ -387,6 +430,7 @@ def run(run_id: str) -> dict:
     ts_integrity = _timestamp_integrity(df, datetime_cols, frequency)
 
     full_stats = {
+        "column_profile": _column_profile(df, stage1),
         "missing": _extended_missing(df, stage1.get("nulls", {})),
         "outliers": _outlier_counts(
             df,

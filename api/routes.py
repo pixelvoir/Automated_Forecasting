@@ -198,6 +198,8 @@ def get_run_summary(run_id: str):
         stage3: dict = {
             "recipe_source": status.get("recipe_source", "unknown"),
             "recipe_error": status.get("recipe_error"),
+            "llm_model": status.get("llm_model"),
+            "llm_response": status.get("llm_response"),
             "recipe": json.loads(recipe_path.read_text()),
         }
         if report_path.exists():

@@ -32,6 +32,8 @@ def clean_task(run_id: str, use_llm: bool = True) -> dict:
         "recipe_source": agent["recipe_source"],
         "recipe_error": agent["recipe_error"],
         "recipe": agent["recipe"],
+        "llm_model": agent.get("llm_model"),
+        "llm_response": agent.get("llm_response"),
     }
     out.update({k: v for k, v in clean.items() if k != "run_id"})
     return out

@@ -182,15 +182,25 @@ def _infer_dtype(series: pd.Series) -> str:
 
 
 def _infer_frequency(series: pd.Series) -> str:
+    """Infer the frequency of the time GRID from *distinct* timestamps.
+
+    Deduplicating first is load-bearing: panel/multi-series data has many rows per
+    timestamp (e.g. ~1,800 store×product rows per day), which drives the median raw
+    row-to-row diff to 0 and mislabeled daily panels as "hourly". The grid frequency
+    is what seasonal periods/windows need, regardless of how many series share it.
+    Full Timedelta resolution (not .days) distinguishes hourly from daily properly,
+    and errors="coerce" stops a few malformed values from forcing "unknown"."""
     try:
-        s = pd.to_datetime(series.dropna()).sort_values()
+        s = pd.to_datetime(series.dropna(), errors="coerce").dropna()
+        s = s.drop_duplicates().sort_values()
         if len(s) < 2:
             return "unknown"
-        median_days = s.diff().dropna().median().days
-        if median_days == 0:
+        med = s.diff().dropna().median()
+        if med <= pd.Timedelta(minutes=90):
             return "hourly"
-        if median_days == 1:
+        if med <= pd.Timedelta(hours=36):
             return "daily"
+        median_days = med.days
         if 5 <= median_days <= 8:
             return "weekly"
         if 25 <= median_days <= 32:

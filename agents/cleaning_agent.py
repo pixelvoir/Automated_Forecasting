@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ValidationError, model_validator
+from pydantic import BaseModel, ValidationError, field_validator, model_validator
 
 from agents import llm_client
 from agents.llm_client import LLMError
@@ -34,6 +34,19 @@ class ColumnRecipe(BaseModel):
     ]
     type_fix: Literal["parse_datetime", "cast_numeric", "encode_boolean", "none"]
     action: Literal["keep", "drop"]
+
+    # LLMs routinely swap the two no-op spellings ("none" vs "keep") across fields —
+    # a full-recipe rejection over that (16 literal_errors → fallback) is self-inflicted.
+    # Normalize instead of failing; real invalid strategies still raise.
+    @field_validator("outlier_strategy", mode="before")
+    @classmethod
+    def _outlier_none_means_keep(cls, v):
+        return "keep" if v == "none" else v
+
+    @field_validator("missing_strategy", "type_fix", mode="before")
+    @classmethod
+    def _keep_means_none(cls, v):
+        return "none" if v == "keep" else v
 
 
 class CleaningRecipe(BaseModel):
@@ -95,6 +108,15 @@ KEY SIGNAL: each column's outlier stats include "temporal_pct" (rolling-window I
   - If temporal_pct ≈ iqr_pct, outliers are real noise → choose "clip_iqr" or "remove".
   - If temporal_pct is null, the series is too short or has no timestamp → use "clip_iqr".
 
+COLUMN PROFILE: the payload's "column_profile" gives per-column facts — use them:
+  - "zero_pct" > 50 (zero-inflated column): quartiles collapse to zero, so clip_iqr,
+    rolling_iqr, stl_residuals and remove would DESTROY the column's real values.
+    Use "keep" (or "winsorize" only if extreme values are clearly errors).
+  - "skew" with |skew| > 1: prefer "median_fill" over "mean_fill".
+  - "distinct_pct" near 100 on a non-timestamp column = a row identifier, not a signal.
+  - "null_pct" >= 95: nothing left to fill — set action "drop".
+  - "n_rows" tells you the total series length for the strategy length requirements.
+
 TYPE FIX options:
   "parse_datetime" - parse string column as datetime
   "cast_numeric"   - parse string column as float
@@ -103,7 +125,11 @@ TYPE FIX options:
 
 COLUMN ACTION options:
   "keep"  - include this column in the cleaned dataset
-  "drop"  - exclude this column entirely (use for constant or near-constant columns)
+  "drop"  - exclude this column entirely. Use for columns that carry no forecasting
+            signal: constant/near-constant columns, columns with null_pct >= 95,
+            pure row identifiers (distinct_pct ≈ 100, e.g. "id"), and system/ETL audit
+            columns (created_on, created_at, updated_at, loaded_at, inserted_at,
+            source_file, batch/file metadata). Dropping is safe — raw data is preserved.
 
 REQUIRED OUTPUT FORMAT (strict JSON, no additional text):
 {
@@ -122,8 +148,10 @@ REQUIRED OUTPUT FORMAT (strict JSON, no additional text):
 
 Rules:
 - Every column listed in the payload must appear in "columns".
-- Use "none" for strategies that don't apply to a column.
-- Set action to "drop" only for columns listed in constant_cols.
+- No-op values differ per field: use "none" for missing_strategy and type_fix,
+  but "keep" for outlier_strategy ("none" is NOT a valid outlier_strategy).
+- Set action to "drop" for the no-signal column types listed under COLUMN ACTION —
+  do not invent other reasons to drop a column.
 - Set drop_duplicates to true if duplicates.rows > 0.
 - Set sort_by_timestamp to true and set timestamp_col if the frequency dict is non-empty.
 - timestamp_col must be the business/event timestamp (e.g. transaction_date, sale_date),
@@ -211,6 +239,90 @@ def _rule_based_fallback(payload: dict, all_cols: list[str], rows: int = 0) -> d
     }
 
 
+# Column-name tokens that mark ETL/system metadata — safe to drop for forecasting.
+_AUDIT_TOKENS = ("created", "updated", "loaded", "inserted", "modified",
+                 "source_file", "audit", "batch")
+
+
+def _is_audit_col(name: str) -> bool:
+    n = name.lower()
+    return any(t in n for t in _AUDIT_TOKENS)
+
+
+def _sanitize_recipe(recipe: dict, meta: dict, payload: dict | None = None) -> None:
+    """Recipe safety net applied to BOTH LLM and fallback output (in place).
+
+    Fixes strategy/column mismatches that crash or corrupt the cleaner:
+    - a column that is (almost) entirely null can't be filled from itself → drop it
+    - rows without a timestamp are unusable for forecasting → drop_row on the ts col
+      (interpolating the ts col itself, or time-interpolating anything else while the
+      ts col has NaT, raised pandas' "NaNs in the index" NotImplementedError)
+    - interpolate/mean/median are undefined for non-numeric columns → forward_fill
+      (allowed when a cast_numeric type_fix makes the column numeric first)
+    - quartile-based outlier strategies are degenerate on columns with IQR == 0 or
+      heavy zero-inflation: the clip bounds collapse to a constant and the column's
+      real values are destroyed (a 94%-zeros column failed the numeric_variance gate
+      this way). Downgrade to "keep" — the gate should never see that again.
+    """
+    dtypes = {s["col"]: s.get("dtype_inferred") for s in meta.get("schema", [])}
+    raw_dtypes = {s["col"]: s.get("dtype_raw", "") for s in meta.get("schema", [])}
+    nulls = meta.get("nulls", {})
+    numeric_stats = meta.get("numeric_stats", {})
+    profile = (payload or {}).get("column_profile", {})
+    constant_cols = set((payload or {}).get("constant_cols", []))
+    ts_col = recipe.get("timestamp_col")
+
+    _IQR_FAMILY = {"clip_iqr", "rolling_iqr", "stl_residuals", "remove"}
+
+    for col, cr in recipe.get("columns", {}).items():
+        null_pct = nulls.get(col, {}).get("pct", 0)
+        if null_pct >= 95:
+            if cr.get("action") == "keep":
+                cr["action"] = "drop"
+            continue
+
+        # Columns whose INFERRED type differs from their STORED type must be cast —
+        # dtype_issues alone doesn't cover these (it only flags categorical-inferred
+        # columns). String-stored dates sort lexicographically (not chronologically);
+        # string-stored numerics make fills/outlier math/downstream stages silently
+        # no-op, leaving zero usable forecast targets in the cleaned parquet.
+        raw = raw_dtypes.get(col, "")
+        if cr.get("type_fix") == "none":
+            if dtypes.get(col) == "datetime" and "datetime" not in raw:
+                cr["type_fix"] = "parse_datetime"
+            elif dtypes.get(col) == "numeric" and not any(t in raw for t in ("int", "float")):
+                cr["type_fix"] = "cast_numeric"
+
+        if col == ts_col:
+            # drop_row is a no-op when there are no nulls, and also removes rows whose
+            # timestamps fail to parse (NaT) — either way unusable for forecasting.
+            cr["missing_strategy"] = "drop_row"
+            cr["action"] = "keep"  # the timestamp itself is never droppable
+            continue
+
+        # A "drop" must be justified by a provable no-signal reason. LLM responses
+        # sometimes drop measure columns (observed: an entire total_* family — the
+        # would-be forecast targets); revert any drop that isn't clearly justified.
+        if cr.get("action") == "drop":
+            distinct_pct = profile.get(col, {}).get("distinct_pct", 0)
+            justified = (
+                col in constant_cols
+                or distinct_pct >= 99      # per-row identifier
+                or _is_audit_col(col)      # ETL/system metadata
+            )
+            if not justified:
+                cr["action"] = "keep"
+
+        numeric_ok = dtypes.get(col) == "numeric" or cr.get("type_fix") == "cast_numeric"
+        if cr.get("missing_strategy") in ("interpolate", "mean_fill", "median_fill") and not numeric_ok:
+            cr["missing_strategy"] = "forward_fill"
+
+        iqr = numeric_stats.get(col, {}).get("iqr")
+        zero_pct = profile.get(col, {}).get("zero_pct", 0)
+        if cr.get("outlier_strategy") in _IQR_FAMILY and (iqr == 0 or zero_pct >= 50):
+            cr["outlier_strategy"] = "keep"
+
+
 # ── Stage 3 entry point ───────────────────────────────────────────────────────
 
 def run(run_id: str, use_llm: bool = True) -> dict:
@@ -243,6 +355,9 @@ def run(run_id: str, use_llm: bool = True) -> dict:
     recipe_source = "llm"
     recipe_error: str | None = None
     recipe: dict | None = None
+    llm_response: dict | None = None   # raw parsed model output, kept for UI display
+    llm_cfg = llm_client._load_llm_config()
+    llm_model = f"{llm_cfg.get('provider', '?')}/{llm_cfg.get('model', '?')}"
 
     if not use_llm:
         # Deliberate rule-based-only run — not a failure, so no error is recorded.
@@ -263,6 +378,9 @@ def run(run_id: str, use_llm: bool = True) -> dict:
 
         try:
             raw = llm_client.call(messages, require_json=True)
+            # Keep the model's own output (pre fill-in/validation) so the UI can show
+            # exactly what came back — also useful when validation rejects it.
+            llm_response = json.loads(json.dumps(raw))
 
             # Fill in any columns the LLM may have omitted
             if "columns" in raw and isinstance(raw["columns"], dict):
@@ -320,10 +438,19 @@ def run(run_id: str, use_llm: bool = True) -> dict:
             recipe["frequency"] = user_freq_str
             recipe["period"] = _FREQ_PERIOD.get(user_freq_str, 7) if user_freq_str else 7
 
+    # Runs after the user timestamp override so the ts-col rule targets the final choice.
+    _sanitize_recipe(recipe, meta, payload)
+
     (run_dir / "cleaning_recipe.json").write_text(json.dumps(recipe, indent=2))
-    # Persist status so a reloaded run (/summary) can show the real source + error.
+    # Persist status so a reloaded run (/summary) can show the real source + error,
+    # plus the model identity and its raw response for the Cleaning tab display.
     (run_dir / "cleaning_status.json").write_text(
-        json.dumps({"recipe_source": recipe_source, "recipe_error": recipe_error}, indent=2)
+        json.dumps({
+            "recipe_source": recipe_source,
+            "recipe_error": recipe_error,
+            "llm_model": llm_model if use_llm else None,
+            "llm_response": llm_response,
+        }, indent=2)
     )
 
     return {
@@ -331,4 +458,6 @@ def run(run_id: str, use_llm: bool = True) -> dict:
         "recipe": recipe,
         "recipe_source": recipe_source,
         "recipe_error": recipe_error,
+        "llm_model": llm_model if use_llm else None,
+        "llm_response": llm_response,
     }

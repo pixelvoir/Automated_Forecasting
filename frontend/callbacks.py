@@ -1,5 +1,28 @@
-"""Dash callbacks — all interactivity lives here."""
+"""Dash callbacks — all interactivity lives here.
+
+Hard-won rules this file follows (violating either resurfaces real bugs):
+
+1. **Tab switching is clientside-only.** All six panes stay mounted in the layout;
+   ``switch_pane`` just toggles ``style.display``. Server callbacks re-render pane
+   *bodies* only when ``results-store`` changes. Rebuilding tab content on tab switch
+   (the old ``render_tab`` pattern) unmounted/remounted components constantly, which
+   triggered rule 2 and 3 bugs on every switch.
+
+2. **Every button callback guards on ``n_clicks``.** Dash fires a callback whose Input
+   component is inserted by another callback's render even with
+   ``prevent_initial_call=True``, unless all of its Outputs are inside the same inserted
+   chunk. Unguarded, the reset buttons fired on mount and wiped the store (and their
+   ``_cancel_running()`` call killed in-flight jobs).
+
+3. **Never use pattern-matching ids in a ``running=`` spec.** When a callback with
+   ALL-pattern inputs fires because those components were added/removed by a re-render,
+   ``changedPropIds`` is empty and the Dash 4.3.0 renderer crashes in ``replacePMC``
+   ("Cannot read properties of undefined (reading 'run_id')"). The past-runs lock
+   targets the list container's plain string id instead — string-id ``running`` targets
+   are safe even while unmounted (the renderer explicitly tolerates them).
+"""
 import base64
+import json
 import os
 import tempfile
 from pathlib import Path
@@ -8,11 +31,16 @@ import requests
 import dash_bootstrap_components as dbc
 from dash import Input, Output, State, dcc, html, dash_table, no_update, callback, ALL, ctx, clientside_callback
 
+from frontend.layout import RUNS_LIST_STYLE, RUNS_LIST_STYLE_LOCKED, TAB_VALUES
+
 API_URL = os.environ.get("API_URL", "http://localhost:8000")
 
 # CSS variable, not a literal color — resolves per current theme so metric numbers stay
 # legible in both dark and light mode instead of silently inheriting an invisible color.
 _TEXT = "var(--bs-body-color)"
+
+_SHOW = {"display": "block"}
+_HIDE = {"display": "none"}
 
 
 def _cancel_running():
@@ -58,6 +86,22 @@ clientside_callback(
 )
 
 
+# ── Pane switching (clientside — zero server round-trip) ─────────────────────
+# All panes stay mounted; only style.display changes. This is what makes tab switching
+# instant and free, and it's also load-bearing for correctness (see module docstring).
+
+clientside_callback(
+    f"""
+    function(tab) {{
+        const order = {json.dumps(TAB_VALUES)};
+        return order.map(t => (t === tab ? {{display: 'block'}} : {{display: 'none'}}));
+    }}
+    """,
+    [Output(v.replace("tab-", "pane-"), "style") for v in TAB_VALUES],
+    Input("stage-tabs", "value"),
+)
+
+
 def _save_upload(contents: str, filename: str) -> str:
     """Decode a dcc.Upload base64 payload and save to a temp file. Returns the file path."""
     _, content_string = contents.split(",", 1)
@@ -72,9 +116,6 @@ def _save_upload(contents: str, filename: str) -> str:
 
 
 # ── 1. Toggle DB / File sections based on source radio ────────────────────
-
-_SHOW = {"display": "block"}
-_HIDE = {"display": "none"}
 
 @callback(
     Output("section-db", "style"),
@@ -117,7 +158,9 @@ def show_upload_filename(filename):
     running=[(Output("btn-connect", "disabled"), True, False)],
     prevent_initial_call=True,
 )
-def connect_db(_, host, port, database, user, password):
+def connect_db(n_clicks, host, port, database, user, password):
+    if not n_clicks:
+        return no_update, no_update, no_update
     missing = [name for name, val in [
         ("Host", host), ("Database", database), ("Username", user), ("Password", password)
     ] if not val or not str(val).strip()]
@@ -162,7 +205,9 @@ def connect_db(_, host, port, database, user, password):
     State("collapse-query", "is_open"),
     prevent_initial_call=True,
 )
-def toggle_query(_, is_open):
+def toggle_query(n_clicks, is_open):
+    if not n_clicks:
+        return no_update
     return not is_open
 
 
@@ -187,8 +232,10 @@ def toggle_query(_, is_open):
     running=[(Output("btn-run", "disabled"), True, False)],
     prevent_initial_call=True,
 )
-def trigger_run(_, source, table, query, host, port, database, user, password,
+def trigger_run(n_clicks, source, table, query, host, port, database, user, password,
                 upload_contents, upload_filename):
+    if not n_clicks:
+        return no_update, no_update
     if source == "file":
         if not upload_contents:
             return no_update, dbc.Alert(
@@ -280,59 +327,76 @@ def trigger_run(_, source, table, query, host, port, database, user, password,
         return no_update, dbc.Alert(f"Unexpected error: {e}", color="danger", dismissable=True)
 
 
-# ── 5. Render the active tab ───────────────────────────────────────────────
-# tab-content is rebuilt whenever the active tab OR the store changes. All stage
-# builders read from the persistent results-store, so switching tabs never loses state.
+# ── 5. Data pane — everything driven by the store, in one round trip ────────
+# Fires at page load (rebuilding the UI from session storage — this is what makes a
+# refresh or past-run "resume" work) and on every store change. Tab switching does NOT
+# re-run this.
 
 @callback(
-    Output("tab-content", "children"),
-    Input("stage-tabs", "value"),
+    Output("data-tab-results", "children"),
+    Output("ingestion-loaded", "style"),
+    Output("ingestion-form-wrap", "style"),
+    Output("loaded-source-text", "children"),
+    Output("past-runs-list", "children"),
     Input("results-store", "data"),
 )
-def render_tab(active_tab, data):
-    if active_tab == "tab-clean":
-        return _render_clean_tab(data)
-    if active_tab in ("tab-fcst-eda", "tab-model", "tab-training", "tab-results"):
-        return _placeholder_tab()
-    return _render_data_tab(data)
+def render_data_pane(data):
+    runs_list = _build_runs_list()
+    if not data:
+        return _no_data_placeholder(), _HIDE, _SHOW, "", runs_list
+    return _render_data_results(data), _SHOW, _HIDE, _loaded_source_text(data), runs_list
+
+
+@callback(
+    Output("clean-tab-body", "children"),
+    Input("results-store", "data"),
+)
+def render_clean_body(data):
+    return _render_clean_tab(data)
+
+
+@callback(
+    Output("input-password", "value"),
+    Input("results-store", "data"),
+    prevent_initial_call=True,
+)
+def clear_password(data):
+    """Once a dataset is loaded, the DB password has served its purpose — the backend
+    has already pulled the data to a local parquet and disposed the connection. Wipe it
+    from the form so it doesn't linger in the browser for the rest of the session."""
+    if data:
+        return ""
+    return no_update
+
+
+def _loaded_source_text(data):
+    source = data.get("source", {})
+    if source.get("table"):
+        return f"Table: {source['table']}"
+    if source.get("file"):
+        return f"File: {Path(source['file']).name}"
+    return f"Run: {data.get('run_id', '')}"
 
 
 def _cicon(name, **style):
     return html.I(className=f"bi {name}", style={"marginRight": "5px", **style})
 
 
-def _placeholder_tab():
+def _no_data_placeholder():
     return html.Div(
         [
-            _cicon("bi-hourglass-split", fontSize="2rem", color="#334155",
+            _cicon("bi-arrow-left-circle", fontSize="2rem", color="#334155",
                    display="block", marginBottom="12px", marginRight="0"),
-            html.P("This stage is not implemented yet.",
+            html.P("Select a data source and click Run Ingestion.",
                    style={"color": "#64748b", "fontSize": "0.9rem"}),
         ],
         className="text-center mt-5 pt-4",
     )
 
 
-# ── Tab 1: Data & Pre-clean EDA ────────────────────────────────────────────
+# ── Tab 1 right column: dataset metrics, schema, pre-clean EDA ─────────────
 
-def _render_data_tab(data):
-    left_col = dbc.Col(width=3, children=[
-        _ingestion_card(data),
-        _past_runs_card(),
-    ])
-
-    if not data:
-        right_body = html.Div(
-            [
-                _cicon("bi-arrow-left-circle", fontSize="2rem", color="#334155",
-                       display="block", marginBottom="12px", marginRight="0"),
-                html.P("Select a data source and click Run Ingestion.",
-                       style={"color": "#64748b", "fontSize": "0.9rem"}),
-            ],
-            className="text-center mt-5 pt-4",
-        )
-        return dbc.Row([left_col, dbc.Col(width=9, children=right_body)])
-
+def _render_data_results(data):
     shape = data.get("shape", {})
     schema = data.get("schema", [])
     nulls = data.get("nulls", {})
@@ -417,7 +481,7 @@ def _render_data_tab(data):
         ),
     ], className="d-flex justify-content-between align-items-center mb-3")
 
-    right_col = dbc.Col(width=9, children=[
+    return html.Div([
         header,
         shape_card,
         html.H6([_cicon("bi-table"), "Schema"], className="mb-2 fw-semibold",
@@ -427,8 +491,6 @@ def _render_data_tab(data):
         *stage2_section,
         _cleaning_hint(data),
     ])
-
-    return dbc.Row([left_col, right_col])
 
 
 def _cleaning_hint(data):
@@ -460,180 +522,12 @@ def _cleaning_hint(data):
     )
 
 
-def _lbl(text):
-    return dbc.Label(
-        text, className="fw-semibold small mb-1",
-        style={"fontSize": "0.68rem", "letterSpacing": "0.07em",
-               "textTransform": "uppercase", "color": "#94a3b8"},
-    )
-
-
-def _ingestion_card(data):
-    """Left-column card: shows the input form until a run is loaded, then a compact
-    'dataset loaded' state with a reset button."""
-    if data:
-        source = data.get("source", {})
-        if source.get("table"):
-            text = f"Table: {source['table']}"
-        elif source.get("file"):
-            text = f"File: {Path(source['file']).name}"
-        else:
-            text = f"Run: {data.get('run_id', '')}"
-        body = html.Div([
-            dbc.Alert(
-                [
-                    html.Div([
-                        _cicon("bi-check-circle-fill", color="#10b981"),
-                        html.Strong("Dataset loaded"),
-                    ], className="d-flex align-items-center mb-1"),
-                    html.Small(text, style={"color": "#6ee7b7", "fontSize": "0.78rem"}),
-                ],
-                color="success", className="py-2 mb-3",
-            ),
-            dbc.Button(
-                [_cicon("bi-arrow-counterclockwise"), "Load Different Dataset"],
-                id="btn-new-run",
-                color="outline-secondary",
-                size="sm",
-                className="w-100",
-            ),
-        ])
-    else:
-        body = _ingestion_form()
-
-    return dbc.Card([
-        dbc.CardHeader([
-            _cicon("bi-cloud-download", color="#6366f1"),
-            "Data Source",
-        ]),
-        dbc.CardBody(body),
-    ])
-
-
-def _ingestion_form():
-    return html.Div(id="ingestion-form", children=[
-        _lbl("Data source"),
-        dcc.RadioItems(
-            id="source-radio",
-            options=[
-                {"label": "  PostgreSQL database", "value": "database"},
-                {"label": "  CSV / Excel / Parquet file", "value": "file"},
-            ],
-            value="database",
-            className="mb-3",
-            inputStyle={"marginRight": "6px", "accentColor": "#6366f1"},
-            labelStyle={"display": "block", "marginBottom": "6px",
-                        "cursor": "pointer", "color": "#94a3b8", "fontSize": "0.85rem"},
-        ),
-
-        html.Div(id="section-db", children=[
-            _lbl("Host"),
-            dbc.Input(id="input-host", placeholder="192.168.1.10", size="sm", className="mb-2"),
-            dbc.Row([
-                dbc.Col([
-                    _lbl("Port"),
-                    dbc.Input(id="input-port", value="5432", type="number", size="sm", className="mb-2"),
-                ], width=4),
-                dbc.Col([
-                    _lbl("Database"),
-                    dbc.Input(id="input-database", placeholder="db_name", size="sm", className="mb-2"),
-                ], width=8),
-            ]),
-            _lbl("Username"),
-            dbc.Input(id="input-user", placeholder="postgres", size="sm", className="mb-2", autocomplete="username"),
-            _lbl("Password"),
-            dbc.Input(id="input-password", type="password", placeholder="password", size="sm",
-                      className="mb-2", autocomplete="new-password"),
-
-            dbc.Button(
-                [_cicon("bi-plug-fill"), "Connect"],
-                id="btn-connect", color="outline-secondary", size="sm",
-                className="w-100 mb-2", disabled=False,
-            ),
-            dcc.Loading(
-                children=html.Div(id="connection-alert"),
-                type="circle", color="#6366f1", delay_show=150, className="mb-2",
-            ),
-
-            _lbl("Table"),
-            dcc.Dropdown(
-                id="dropdown-table", clearable=True, placeholder="Connect first…",
-                className="mb-2", style={"fontSize": "0.85rem"},
-            ),
-
-            dbc.Button(
-                [_cicon("bi-code-slash"), "Custom SQL query"],
-                id="btn-toggle-query", color="link", size="sm",
-                className="p-0 mb-1 text-decoration-none",
-            ),
-            dbc.Collapse(
-                dbc.Textarea(
-                    id="input-query",
-                    placeholder="SELECT * FROM schema.table WHERE …",
-                    style={"height": "90px", "fontSize": "12px", "fontFamily": "monospace"},
-                    className="mb-2",
-                ),
-                id="collapse-query", is_open=False,
-            ),
-        ]),
-
-        html.Div(id="section-file", style={"display": "none"}, children=[
-            _lbl("Upload file"),
-            dcc.Upload(
-                id="upload-file",
-                children=html.Div([
-                    _cicon("bi-cloud-upload", fontSize="1.4rem", color="#4b5563",
-                           display="block", marginBottom="4px", marginRight="0"),
-                    html.Span("Drag & drop or ", style={"color": "#94a3b8"}),
-                    html.A("browse", style={"color": "#6366f1", "cursor": "pointer"}),
-                ], style={"paddingTop": "12px"}),
-                style={
-                    "width": "100%", "height": "80px", "borderWidth": "1.5px",
-                    "borderStyle": "dashed", "borderRadius": "10px", "textAlign": "center",
-                    "borderColor": "rgba(255,255,255,0.12)", "cursor": "pointer",
-                    "fontSize": "0.82rem", "transition": "all 0.2s ease",
-                },
-                accept=".csv,.xlsx,.xls,.parquet", multiple=False, className="mb-1",
-            ),
-            html.Div(id="upload-filename",
-                     style={"fontSize": "0.75rem", "color": "#94a3b8"}, className="mb-2"),
-            html.P("Supported: .csv  .xlsx  .xls  .parquet",
-                   style={"fontSize": "0.7rem", "color": "#64748b"}, className="mb-0"),
-        ]),
-
-        html.Hr(className="my-3"),
-
-        dcc.Loading(
-            children=[
-                dbc.Button(
-                    [_cicon("bi-play-fill"), "Run Ingestion"],
-                    id="btn-run", color="primary", className="w-100", disabled=False,
-                    style={"fontWeight": "600", "letterSpacing": "0.02em"},
-                ),
-                html.Div(id="alert-div", className="mt-2"),
-            ],
-            type="circle", color="#6366f1", delay_show=100,
-        ),
-    ])
-
-
-def _past_runs_card():
-    return dbc.Card(className="mt-3", children=[
-        dbc.CardHeader([
-            _cicon("bi-clock-history", color="#475569"),
-            "Past Runs",
-        ]),
-        dbc.CardBody(
-            id="past-runs-list",
-            children=_build_runs_list(),
-            style={"maxHeight": "280px", "overflowY": "auto", "padding": "0.5rem"},
-        ),
-    ])
-
-
-# ── 6. New Run / reset — clears the store and returns to the first tab ─────
-# Both the right-panel "New Run" button and the left "Load Different Dataset"
-# button reset everything, which also re-locks the Cleaning tab (see gate_clean_tab).
+# ── 6. New Run / reset — clears the store; render_data_pane restores the form ──
+# Both the right-panel "New Run" button and the left "Load Different Dataset" button
+# reset everything. The n_clicks guards are load-bearing: btn-clear-results is rendered
+# dynamically, so this callback also fires when the button MOUNTS (see module
+# docstring) — without the guard that spurious fire wipes the store and cancels
+# whatever job is running.
 
 @callback(
     Output("results-store", "data", allow_duplicate=True),
@@ -642,7 +536,9 @@ def _past_runs_card():
     running=[(Output("btn-clear-results", "disabled"), True, False)],
     prevent_initial_call=True,
 )
-def clear_results(_):
+def clear_results(n_clicks):
+    if not n_clicks:
+        return no_update, no_update
     _cancel_running()
     return None, "tab-data"
 
@@ -654,7 +550,9 @@ def clear_results(_):
     running=[(Output("btn-new-run", "disabled"), True, False)],
     prevent_initial_call=True,
 )
-def new_dataset(_):
+def new_dataset(n_clicks):
+    if not n_clicks:
+        return no_update, no_update
     _cancel_running()
     return None, "tab-data"
 
@@ -662,7 +560,8 @@ def new_dataset(_):
 # ── 9. Past-runs list ─────────────────────────────────────────────────────
 
 def _build_runs_list() -> list:
-    """Render past-run items with load + delete buttons. Shared by two callbacks."""
+    """Render past-run items with load + delete buttons. Called by render_data_pane
+    (page load + every store change) and by delete_run."""
     try:
         resp = requests.get(f"{API_URL}/runs", timeout=5)
         if not resp.ok:
@@ -709,23 +608,19 @@ def _build_runs_list() -> list:
                        style={"fontSize": "0.78rem"})]
 
 
-# Both callbacks below disable EVERY past-run button (load + delete) for the duration of
-# the request, not just the one clicked. This is what closes the "tab unlocks then re-locks"
-# bug: without it, a second click (on the same or a different past run) while a summary GET
-# is still in flight can return LATER than a subsequent click's response, silently
-# overwriting the store with the older/wrong run's data a few seconds after it looked loaded.
-# Disabling the whole list makes that overlap structurally impossible — a click can't even
-# register while another load/delete is pending.
-_PAST_RUN_RUNNING = [
-    (Output({"type": "btn-past-run", "run_id": ALL}, "disabled"), True, False),
-    (Output({"type": "btn-delete-run", "run_id": ALL}, "disabled"), True, False),
-]
+# Both callbacks below lock the WHOLE past-runs list (via pointer-events on the always-
+# mounted container) for the duration of the request, not just the button clicked. This
+# closes a real race: a second click while a summary GET is still in flight can return
+# LATER than a subsequent click's response, silently overwriting the store with the
+# older run's data. Locking the container makes that overlap structurally impossible.
+# Deliberately NOT a pattern-matching running spec — see rule 3 in the module docstring.
+_RUNS_LIST_LOCK = [(Output("past-runs-list", "style"), RUNS_LIST_STYLE_LOCKED, RUNS_LIST_STYLE)]
 
 
 @callback(
     Output("past-runs-list", "children", allow_duplicate=True),
     Input({"type": "btn-delete-run", "run_id": ALL}, "n_clicks"),
-    running=_PAST_RUN_RUNNING,
+    running=_RUNS_LIST_LOCK,
     prevent_initial_call=True,
 )
 def delete_run(n_clicks_list):
@@ -740,13 +635,15 @@ def delete_run(n_clicks_list):
 
 
 # ── 10. Load a past run from disk (no DB, reads local JSON) ────────────────
-# Only updates the store; toggle_ingestion_panel handles hiding the form.
+# "Resume": /runs/{id}/summary returns metadata + _stage2 + _stage3 in exactly the
+# shape the store uses, so writing it to the store re-renders every pane as if the
+# stages had just run.
 
 @callback(
     Output("results-store", "data", allow_duplicate=True),
     Output("cleaning-status", "children", allow_duplicate=True),
     Input({"type": "btn-past-run", "run_id": ALL}, "n_clicks"),
-    running=_PAST_RUN_RUNNING,
+    running=_RUNS_LIST_LOCK,
     prevent_initial_call=True,
 )
 def load_past_run(n_clicks_list):
@@ -919,7 +816,7 @@ def _fmt(v: float) -> str:
 # ── 11. Stage 3: run cleaning ─────────────────────────────────────────────────
 # Outputs to cleaning-status (persistent in layout) instead of btn-run-cleaning
 # or cleaning-alert (both are dynamically rendered), so the store update always
-# reaches render_results regardless of component lifecycle timing in Dash 4.
+# reaches the pane renderers regardless of component lifecycle timing in Dash 4.
 
 @callback(
     Output("results-store", "data", allow_duplicate=True),
@@ -964,7 +861,7 @@ def run_cleaning(n_clicks, store_data, ts_val, use_llm):
 
     except requests.exceptions.Timeout:
         return no_update, dbc.Alert(
-            "Cleaning timed out after 5 minutes.", color="danger", dismissable=True, className="mb-2"
+            "Cleaning timed out after 30 minutes.", color="danger", dismissable=True, className="mb-2"
         )
     except requests.exceptions.ConnectionError:
         return no_update, dbc.Alert(
@@ -976,6 +873,36 @@ def run_cleaning(n_clicks, store_data, ts_val, use_llm):
 
 # ── Tab 2: Cleaning ────────────────────────────────────────────────────────
 
+def _llm_response_details(stage3: dict):
+    """Collapsible, theme-matched view of the model's raw JSON response. Shown on
+    success (proof the LLM actually produced the recipe) and on validation failures
+    (so the user can see what the model returned that got rejected)."""
+    resp = stage3.get("llm_response")
+    if not resp:
+        return None
+    return html.Details(
+        [
+            html.Summary(
+                [_cicon("bi-chat-square-text", color="#6366f1"), "View LLM response"],
+                style={"cursor": "pointer", "fontSize": "0.78rem", "color": "#94a3b8",
+                       "userSelect": "none"},
+            ),
+            html.Pre(
+                json.dumps(resp, indent=2),
+                style={
+                    "backgroundColor": "#161b2e", "color": "#e2e8f0",
+                    "fontSize": "0.72rem", "lineHeight": "1.5",
+                    "padding": "10px 14px", "borderRadius": "10px", "marginTop": "6px",
+                    "marginBottom": "0", "maxHeight": "320px", "overflowY": "auto",
+                    "whiteSpace": "pre-wrap",
+                    "border": "1px solid rgba(99, 102, 241, 0.25)",
+                },
+            ),
+        ],
+        className="mb-3 mt-n2",
+    )
+
+
 def _llm_status_banner(stage3: dict):
     """Surface whether the LLM produced the recipe, or why it fell back."""
     if not stage3:
@@ -986,25 +913,37 @@ def _llm_status_banner(stage3: dict):
         )
     src = stage3.get("recipe_source", "unknown")
     err = stage3.get("recipe_error")
+    model = stage3.get("llm_model")
+    details = _llm_response_details(stage3)
     if src == "llm":
-        return dbc.Alert(
-            [_cicon("bi-check-circle-fill", color="#10b981"),
-             html.Strong("LLM connected"),
-             html.Span(" — cleaning recipe generated by the model.",
-                       style={"fontSize": "0.85rem", "marginLeft": "4px"})],
-            color="success", className="py-2 mb-3",
-        )
+        return html.Div([
+            dbc.Alert(
+                [_cicon("bi-check-circle-fill", color="#10b981"),
+                 html.Strong("LLM connected"),
+                 html.Span(
+                     f" — cleaning recipe generated by {model}." if model
+                     else " — cleaning recipe generated by the model.",
+                     style={"fontSize": "0.85rem", "marginLeft": "4px"})],
+                color="success", className="py-2 mb-2",
+            ),
+            *( [details] if details else [] ),
+        ])
     if src == "fallback" and err:
-        return dbc.Alert(
-            [
-                html.Div([_cicon("bi-x-circle-fill", color="#ef4444"),
-                          html.Strong("LLM connection failed — used rule-based fallback")],
-                         className="d-flex align-items-center mb-1"),
-                html.Code(err, style={"fontSize": "0.75rem", "color": "#fca5a5",
-                                      "wordBreak": "break-all"}),
-            ],
-            color="danger", className="py-2 mb-3",
-        )
+        return html.Div([
+            dbc.Alert(
+                [
+                    html.Div([_cicon("bi-x-circle-fill", color="#ef4444"),
+                              html.Strong(
+                                  f"LLM failed ({model}) — used rule-based fallback" if model
+                                  else "LLM connection failed — used rule-based fallback")],
+                             className="d-flex align-items-center mb-1"),
+                    html.Code(err, style={"fontSize": "0.75rem", "color": "#fca5a5",
+                                          "wordBreak": "break-all"}),
+                ],
+                color="danger", className="py-2 mb-2",
+            ),
+            *( [details] if details else [] ),
+        ])
     if src == "fallback":
         return dbc.Alert(
             [_cicon("bi-cpu", color="#f59e0b"),
@@ -1167,11 +1106,17 @@ def _render_stage3(stage3: dict) -> list:
     if validation:
         checks = validation.get("checks", {})
         passed_overall = validation.get("passed", False)
-        gate_badge = dbc.Badge(
-            "Validation PASSED" if passed_overall else "Validation FAILED",
-            color="success" if passed_overall else "danger",
-            className="ms-2",
-        )
+        warn_fails = [
+            name for name, c in checks.items()
+            if c.get("severity") == "warning" and not c.get("passed", True)
+        ]
+        if passed_overall and warn_fails:
+            badge_text, badge_color = f"PASSED — {len(warn_fails)} warning(s)", "warning"
+        elif passed_overall:
+            badge_text, badge_color = "Validation PASSED", "success"
+        else:
+            badge_text, badge_color = "Validation FAILED", "danger"
+        gate_badge = dbc.Badge(badge_text, color=badge_color, className="ms-2")
         sections.append(
             html.H6(
                 [html.I(className="bi bi-shield-check", style={"marginRight": "5px"}),
@@ -1179,14 +1124,21 @@ def _render_stage3(stage3: dict) -> list:
                 className="fw-semibold mb-2 mt-3 d-flex align-items-center", style=_sh,
             )
         )
+
+        def _result_cell(c):
+            if c.get("passed"):
+                return "✓ Pass"
+            return "⚠ Warn" if c.get("severity") == "warning" else "✗ Fail"
+
         check_rows = [
             {
                 "Check": name.replace("_", " ").title(),
-                "Result": "✓ Pass" if c["passed"] else "✗ Fail",
+                "Severity": c.get("severity", "blocking").title(),
+                "Result": _result_cell(c),
                 "Detail": c.get("detail", ""),
             }
             for name, c in checks.items()
         ]
-        sections.append(_datatable(check_rows, ["Check", "Result", "Detail"]))
+        sections.append(_datatable(check_rows, ["Check", "Severity", "Result", "Detail"]))
 
     return sections

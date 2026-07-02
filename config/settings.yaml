@@ -12,10 +12,14 @@
 # Column names ARE included in the payload (unavoidable for recipe keying).
 llm:
   provider: "groq"
-  model: "llama3.1:8b-instant"
+  model: "llama-3.1-8b-instant"
   base_url: "http://localhost:11434/v1"   # only used for ollama (custom endpoint)
   timeout_seconds: 60
   max_retries: 2
+  # Recipe generation is a pick-from-enums decision — sampling noise means a different
+  # recipe every run. Low-but-nonzero keeps a little judgement flexibility; raise toward
+  # 0.6+ only if recipes feel too rigid, drop to 0 for fully repeatable recipes.
+  temperature: 0.2
 
 # Confidence thresholds
 confidence_threshold: 0.85
