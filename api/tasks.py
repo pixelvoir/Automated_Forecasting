@@ -42,3 +42,15 @@ def clean_task(run_id: str, use_llm: bool = True) -> dict:
 def validate_task(run_id: str) -> dict:
     from pipeline import validation_gate
     return validation_gate.run(run_id)
+
+
+def forecast_setup_task(run_id: str) -> dict:
+    """Stage 4 phase A: scan the cleaned parquet and suggest forecast settings."""
+    from pipeline import forecasting_eda
+    return forecasting_eda.detect(run_id)
+
+
+def forecast_eda_task(run_id: str) -> dict:
+    """Stage 4 phase B: full forecasting EDA on the user-confirmed selections."""
+    from pipeline import forecasting_eda
+    return forecasting_eda.run(run_id)

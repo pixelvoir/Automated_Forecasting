@@ -99,6 +99,7 @@ def list_runs():
                 "source": meta.get("source", {}),
                 "has_stage2": (run_dir / "cleaning_decision_payload.json").exists(),
                 "has_stage3": (run_dir / "cleaning_recipe.json").exists(),
+                "has_stage4": (run_dir / "model_selection_payload.json").exists(),
             })
         except Exception:
             continue
@@ -208,6 +209,25 @@ def get_run_summary(run_id: str):
             stage3["_validation"] = json.loads(vg_path.read_text())
         data["_stage3"] = stage3
 
+    # Stage 4 — forecast EDA. setup (detection suggestions) and eda (results) are
+    # independent files: a run can have setup confirmed but the EDA not yet executed.
+    setup_path = RUNS_DIR / run_id / "forecast_setup.json"
+    fsel_path = RUNS_DIR / run_id / "forecast_user_selections.json"
+    feda_path = RUNS_DIR / run_id / "forecasting_eda_full.json"
+    payload_path = RUNS_DIR / run_id / "model_selection_payload.json"
+    if setup_path.exists() or feda_path.exists():
+        stage4: dict = {}
+        if setup_path.exists():
+            stage4["setup"] = json.loads(setup_path.read_text())
+        if fsel_path.exists():
+            stage4["selections"] = json.loads(fsel_path.read_text())
+        if feda_path.exists() and payload_path.exists():
+            stage4["eda"] = {
+                "payload": json.loads(payload_path.read_text()),
+                "full": json.loads(feda_path.read_text()),
+            }
+        data["_stage4"] = stage4
+
     return data
 
 
@@ -270,3 +290,36 @@ def run_validate(run_id: str):
     if not run_dir.exists():
         raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found.")
     return _run_job(tasks.validate_task, run_id, track_id=run_id)
+
+
+@router.post("/{run_id}/forecast-setup")
+def run_forecast_setup(run_id: str):
+    """Stage 4 phase A: detect forecast settings (target/scope/group key/frequency) from
+    the cleaned parquet, each with a confidence level. Fast, but still job-managed so a
+    dataset switch can preempt it. No LLM, no DB."""
+    run_dir = RUNS_DIR / run_id
+    if not run_dir.exists():
+        raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found.")
+    return _run_job(tasks.forecast_setup_task, run_id, track_id=run_id)
+
+
+class ForecastEDARequest(BaseModel):
+    target_col: str
+    scope: str = "aggregate"               # "aggregate" | "per_series"
+    group_cols: list[str] = []
+    agg: str = "sum"                       # "sum" | "mean"
+    exog_cols: list[str] = []
+    forecast_frequency: str | None = None  # None = data frequency
+    horizon: int | None = None             # None = frequency default
+
+
+@router.post("/{run_id}/forecast-eda")
+def run_forecast_eda(run_id: str, req: ForecastEDARequest):
+    """Stage 4 phase B: full forecasting EDA on the confirmed selections. All statistics
+    computed in Python — the LLM only ever sees model_selection_payload.json (Stage 5)."""
+    run_dir = RUNS_DIR / run_id
+    if not run_dir.exists():
+        raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found.")
+    selections = req.model_dump()
+    (run_dir / "forecast_user_selections.json").write_text(json.dumps(selections, indent=2))
+    return _run_job(tasks.forecast_eda_task, run_id, track_id=run_id)

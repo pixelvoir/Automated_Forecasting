@@ -23,6 +23,11 @@ pre_clean_eda.run(run_id)
 cleaning_agent.run(run_id, use_llm=True)   # LLM or rule-based fallback
 cleaner.run(run_id)
 validation_gate.run(run_id)
+
+from pipeline import forecasting_eda
+forecasting_eda.detect(run_id)   # Stage 4 phase A: suggest target/scope/group/horizon
+# (optionally write runs/{run_id}/forecast_user_selections.json to override suggestions)
+forecasting_eda.run(run_id)      # Stage 4 phase B: full stats + model_selection_payload.json
 ```
 
 LLM provider is configured in `config/settings.yaml` — switch between `ollama`, `openai`, `gemini`, `groq` without touching code. Ollama runs locally; cloud providers need their key in `.env`.
@@ -80,7 +85,8 @@ Each stage is a standalone Python module in `pipeline/` with a single `run(run_i
 | 2 — Pre-clean EDA | `pipeline/pre_clean_eda.py` | `runs/{id}/pre_clean_eda_full.json`, `runs/{id}/cleaning_decision_payload.json` |
 | 3 — Cleaning | `agents/cleaning_agent.py` → `pipeline/cleaner.py` | `cleaning_recipe.json`, `cleaning_status.json`, `data/cleaned/{id}_cleaned.parquet`, `cleaning_report.json`, `cleaned_metadata.json` |
 | 3.5 — Validation | `pipeline/validation_gate.py` | `runs/{id}/validation_gate.json` |
-| 4–8 | stubs in `pipeline/`, `agents/`, `models_lib/` | not yet implemented (`def run(): pass` / `def process(): pass`) |
+| 4 — Forecast EDA | `pipeline/forecasting_eda.py` (`detect()` + `run()`) | `forecast_setup.json`, `forecast_user_selections.json`, `forecasting_eda_full.json`, `model_selection_payload.json` |
+| 5–8 | stubs in `pipeline/`, `agents/`, `models_lib/` | not yet implemented (`def run(): pass` / `def process(): pass`) |
 
 Stage 3 is two-step: the LLM agent decides the recipe (`cleaning_agent.py`), then `cleaner.py` executes it. Both are called sequentially inside `api/tasks.py::clean_task`, which the `/runs/{id}/clean` endpoint runs via the job manager. The LLM only receives `cleaning_decision_payload.json`.
 
@@ -118,6 +124,8 @@ All routes are under `/runs` (defined in `api/routes.py`):
 | `/runs/{id}/pre-clean-eda` | POST | Stage 2 — pre-clean EDA, job-managed |
 | `/runs/{id}/clean` | POST | Stage 3 — cleaning agent + cleaner, job-managed (`use_llm` body flag) |
 | `/runs/{id}/validate` | POST | Stage 3.5 — validation gate only, job-managed |
+| `/runs/{id}/forecast-setup` | POST | Stage 4 phase A — detect forecast settings + confidence, job-managed |
+| `/runs/{id}/forecast-eda` | POST | Stage 4 phase B — full forecast EDA (body = confirmed selections), job-managed |
 
 Every job-managed endpoint can return **409** (preempted by a newer job) — callers must handle this explicitly, not treat a non-200 as a generic failure.
 
@@ -136,6 +144,10 @@ cleaning_status.json        # Stage 3 (recipe_source + recipe_error, survives re
 cleaning_report.json        # Stage 3 (before/after metrics)
 cleaned_metadata.json       # Stage 3 (lightweight snapshot)
 validation_gate.json        # Stage 3.5
+forecast_setup.json         # Stage 4 phase A (detected suggestions + confidence)
+forecast_user_selections.json  # Stage 4 trigger (confirmed target/scope/group/freq/horizon)
+forecasting_eda_full.json   # Stage 4 (all stats + downsampled plot arrays)
+model_selection_payload.json   # Stage 4 (compact decision JSON for Stage 5)
 ```
 
 ### Cleaner Execution Order
@@ -178,6 +190,22 @@ Deterministic safety net applied to BOTH LLM and fallback recipes, after the use
 ### LLM recipe inputs
 
 `cleaning_decision_payload.json` includes `column_profile` (per column: dtype, null_pct, distinct_pct, zero_pct, skew) and `n_rows` — statistics only, never raw values (~900 tokens on a 19-col dataset). This is what lets the model choose strategies from evidence (zero-inflation → no IQR clipping, skew → median over mean fill, distinct_pct ≈ 100 → ID column). LLM `temperature` is configurable in `settings.yaml` (default 0.2 — provider default 1.0 produced wildly inconsistent recipes; the sanitizer guarantees safety regardless).
+
+### Forecast EDA (Stage 4)
+
+`pipeline/forecasting_eda.py` — runs on **cleaned data only**, all statistics computed in Python (no LLM in computation; Stage 5 will only ever see `model_selection_payload.json`). Two-phase because the user must confirm choices before any heavy analysis:
+
+- **`detect()` (phase A, ~5s on 3M rows)** — suggests target column, aggregate-vs-per-series scope, series group key, aggregation, forecast frequency and horizon, each with `confidence: high|medium|low`. Low confidence renders a yellow "confirm" badge in the UI, it never blocks. Panel detection = duplicate-timestamp fraction > 5%; group-key detection scores `(key, ts)` uniqueness and tries **pairs** of the best single columns when no single column reaches 0.995 (Favorita needs `store_nbr × family`). Target ranking is name-heuristics + variance — ties (e.g. eight `total_*` measures) correctly yield `low` confidence.
+- **`run()` (phase B, ~40s aggregate / ~140s per-series on 3M rows)** — reads `forecast_user_selections.json` (falls back to detect()'s suggestions per field). Computes: STL strengths per candidate period (primary period = **max seasonal strength**, not the frequency default — the milk data is annual-365, not weekly-7), FFT peaks, ACF/PACF + significant lags, ADF/KPSS + `ndiffs`/`nsdiffs` (ADF/KPSS/PP consensus via pmdarima), spectral/sample/approx entropy + DFA (antropy), ADI/CV² intermittency quadrant, heteroskedasticity → log-transform recommendation, structural breaks (ruptures), Ljung-Box on STL residuals, exog cross-correlation (positive lags = usable lead) and VIF.
+
+Gotchas encoded in the module:
+- **Empty grid bins**: `resample().sum(min_count=1)` so empty bins are NaN, then filled with **0 when zero-inflated sum-aggregated demand** (absent period = zero demand — required for honest ADI) vs time-interpolation otherwise. `fill_report` records which.
+- Per-series scope computes a **vectorized panel summary** (one groupby: per-series length/ADI/CV²/class mix) + deep-dive stats on top-K series by volume — this feeds the global-ML vs per-series-classical routing decision in Stage 5. The aggregate series is *always* analyzed too.
+- All O(n²)/slow stats are capped via `config/settings.yaml → forecast_eda` (`entropy_max_points`, `stat_test_max_points`, `stl_max_points` — above which classical `seasonal_decompose` replaces STL).
+- Timestamp column is defensively re-parsed (`pd.to_datetime`) — stale cleaned parquets can carry string dates.
+- Plot arrays in `forecasting_eda_full.json` are downsampled to `plot_max_points` (JSON stays ~150–500KB; it travels through the store).
+
+Frontend: `frontend/fcst_eda_view.py` is **pure rendering** (form + verdict tiles + Plotly charts); the three callbacks (`run_forecast_setup`, `run_forecast_eda`, `toggle_fcst_group`) live in callbacks.py and follow all its rules. `run_cleaning` auto-triggers `/forecast-setup` after validation (same pattern as ingest auto-triggering Stage 2) and **drops any stale `_stage4`** from the store since cleaning rewrote the parquet. Chart colors are dataviz-validated against the `#161b2e` card surface: series `#6366f1`, trend `#059669`, seasonal `#d97706`, residual `#e66767`.
 
 ### Frontend — Tab-based UI (Dash 4.3.0)
 

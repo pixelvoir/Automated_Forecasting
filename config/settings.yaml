@@ -35,6 +35,18 @@ ingest:
   raw_format: parquet
   top_n_categories: 5      # how many top values to include in cardinality stats
 
+# Stage 4: forecasting EDA settings
+forecast_eda:
+  acf_lags: 40                 # ACF/PACF lags computed and plotted
+  entropy_max_points: 2000     # sample/approx entropy are O(n²) — hard cap (most recent points)
+  stat_test_max_points: 5000   # ADF/KPSS/PP + structural breaks run on the series tail
+  stl_max_points: 50000        # above this, classical decomposition replaces STL (LOESS too slow)
+  plot_max_points: 1500        # downsampling cap for chart arrays saved in the full JSON
+  top_series_deep_dive: 3      # per-series scope: full stats battery on top-K series by volume
+  panel_dup_ts_threshold: 0.05 # duplicate-timestamp fraction above which data is a panel
+  group_uniqueness_high: 0.995 # (group, ts) uniqueness for high-confidence group key
+  group_uniqueness_medium: 0.95
+
 # Stage 2: pre-cleaning EDA settings
 pre_clean_eda:
   outlier_iqr_multiplier: 1.5          # IQR fence multiplier (standard = 1.5, strict = 3.0)

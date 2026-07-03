@@ -31,6 +31,7 @@ import requests
 import dash_bootstrap_components as dbc
 from dash import Input, Output, State, dcc, html, dash_table, no_update, callback, ALL, ctx, clientside_callback
 
+from frontend import fcst_eda_view
 from frontend.layout import RUNS_LIST_STYLE, RUNS_LIST_STYLE_LOCKED, TAB_VALUES
 
 API_URL = os.environ.get("API_URL", "http://localhost:8000")
@@ -356,6 +357,14 @@ def render_clean_body(data):
 
 
 @callback(
+    Output("fcst-eda-tab-body", "children"),
+    Input("results-store", "data"),
+)
+def render_fcst_eda_body(data):
+    return fcst_eda_view.render_fcst_eda_tab(data)
+
+
+@callback(
     Output("input-password", "value"),
     Input("results-store", "data"),
     prevent_initial_call=True,
@@ -578,11 +587,12 @@ def _build_runs_list() -> list:
             label = (source.get("table") or Path(source.get("file", "")).name or r["run_id"])
             s2_badge = dbc.Badge("S2", color="success", className="ms-1") if r.get("has_stage2") else None
             s3_badge = dbc.Badge("S3", color="info", className="ms-1") if r.get("has_stage3") else None
+            s4_badge = dbc.Badge("S4", color="primary", className="ms-1") if r.get("has_stage4") else None
             items.append(
                 html.Div([
                     dbc.Button(
                         [
-                            html.Div([label, s2_badge, s3_badge],
+                            html.Div([label, s2_badge, s3_badge, s4_badge],
                                      className="small fw-semibold text-truncate"),
                             html.Div(f"{r['rows']:,} rows × {r['cols']} cols",
                                      className="text-muted", style={"fontSize": "11px"}),
@@ -857,6 +867,17 @@ def run_cleaning(n_clicks, store_data, ts_val, use_llm):
             stage3_data["_validation"] = validate_resp.json()
 
         new_store = {**store_data, "_stage3": stage3_data}
+        # Cleaning rewrote the cleaned parquet — any earlier Stage 4 results describe data
+        # that no longer exists. Drop them, then auto-detect fresh forecast settings (same
+        # pattern as Stage 1 auto-triggering Stage 2). Failure is fine: the Forecast EDA
+        # tab has its own "Detect Forecast Settings" button as the retry path.
+        new_store.pop("_stage4", None)
+        try:
+            setup_resp = requests.post(f"{API_URL}/runs/{run_id}/forecast-setup", timeout=300)
+            if setup_resp.ok:
+                new_store["_stage4"] = {"setup": setup_resp.json().get("setup")}
+        except Exception:
+            pass
         return new_store, ""
 
     except requests.exceptions.Timeout:
@@ -1142,3 +1163,126 @@ def _render_stage3(stage3: dict) -> list:
         sections.append(_datatable(check_rows, ["Check", "Severity", "Result", "Detail"]))
 
     return sections
+
+
+# ── Tab 3: Forecast EDA (Stage 4) ─────────────────────────────────────────────
+# Rendering lives in fcst_eda_view.py; these callbacks handle the interactivity.
+# Same hard-won rules as the rest of this file: every button guards n_clicks (all Stage 4
+# controls are dynamically rendered), running= uses string ids only, and status output
+# goes to the persistent root-level cleaning-status div.
+
+@callback(
+    Output("fcst-group-wrap", "style"),
+    Input("radio-fcst-scope", "value"),
+)
+def toggle_fcst_group(scope):
+    """Series-key picker is only meaningful in per-series scope. Fires on mount too
+    (dynamic Input) — harmless, it's a pure function of the radio value."""
+    return _SHOW if scope == "per_series" else _HIDE
+
+
+@callback(
+    Output("results-store", "data", allow_duplicate=True),
+    Output("cleaning-status", "children", allow_duplicate=True),
+    Input("btn-fcst-setup", "n_clicks"),
+    State("results-store", "data"),
+    running=[(Output("btn-fcst-setup", "disabled"), True, False)],
+    prevent_initial_call=True,
+)
+def run_forecast_setup(n_clicks, store_data):
+    """Stage 4 phase A: detect forecast settings from the cleaned parquet. Keeps any
+    existing EDA results — re-detecting suggestions doesn't invalidate them."""
+    if not n_clicks or not store_data:
+        return no_update, no_update
+    run_id = store_data.get("run_id")
+    if not run_id:
+        return no_update, dbc.Alert("No active run found.", color="warning", className="mb-2")
+    try:
+        resp = requests.post(f"{API_URL}/runs/{run_id}/forecast-setup", timeout=300)
+        if resp.status_code == 409:
+            return no_update, dbc.Alert(
+                "This request was cancelled by a newer action. Try again.",
+                color="warning", dismissable=True, className="mb-2",
+            )
+        if not resp.ok:
+            detail = resp.json().get("detail", "Forecast setup failed")
+            return no_update, dbc.Alert(detail, color="danger", dismissable=True, className="mb-2")
+        stage4 = {**(store_data.get("_stage4") or {}), "setup": resp.json().get("setup")}
+        return {**store_data, "_stage4": stage4}, ""
+    except requests.exceptions.ConnectionError:
+        return no_update, dbc.Alert(
+            "Cannot reach API — is run_dev.bat running?", color="danger", dismissable=True, className="mb-2"
+        )
+    except Exception as e:
+        return no_update, dbc.Alert(str(e), color="danger", dismissable=True, className="mb-2")
+
+
+@callback(
+    Output("results-store", "data", allow_duplicate=True),
+    Output("cleaning-status", "children", allow_duplicate=True),
+    Input("btn-run-fcst-eda", "n_clicks"),
+    State("results-store", "data"),
+    State("dropdown-fcst-target", "value"),
+    State("radio-fcst-scope", "value"),
+    State("dropdown-fcst-group", "value"),
+    State("dropdown-fcst-agg", "value"),
+    State("dropdown-fcst-exog", "value"),
+    State("dropdown-fcst-freq", "value"),
+    State("input-fcst-horizon", "value"),
+    running=[(Output("btn-run-fcst-eda", "disabled"), True, False)],
+    prevent_initial_call=True,
+)
+def run_forecast_eda(n_clicks, store_data, target, scope, group_cols, agg, exog, freq, horizon):
+    """Stage 4 phase B: run the full forecasting EDA with the confirmed selections."""
+    if not n_clicks or not store_data:
+        return no_update, no_update
+    run_id = store_data.get("run_id")
+    if not run_id:
+        return no_update, dbc.Alert("No active run found.", color="warning", className="mb-2")
+    if not target:
+        return no_update, dbc.Alert(
+            "Select a target column to forecast.", color="warning", dismissable=True, className="mb-2"
+        )
+    if scope == "per_series" and not group_cols:
+        return no_update, dbc.Alert(
+            "Per-series scope needs at least one series-key column (or switch to Overall).",
+            color="warning", dismissable=True, className="mb-2",
+        )
+    body = {
+        "target_col": target,
+        "scope": scope or "aggregate",
+        "group_cols": group_cols or [],
+        "agg": agg or "sum",
+        "exog_cols": exog or [],
+        "forecast_frequency": freq,
+        "horizon": int(horizon) if horizon else None,
+    }
+    try:
+        resp = requests.post(f"{API_URL}/runs/{run_id}/forecast-eda", json=body, timeout=1800)
+        if resp.status_code == 409:
+            return no_update, dbc.Alert(
+                "This request was cancelled by a newer action. Click Run Forecast EDA again.",
+                color="warning", dismissable=True, className="mb-2",
+            )
+        if not resp.ok:
+            detail = resp.json().get("detail", "Forecast EDA failed")
+            return no_update, dbc.Alert(
+                f"Forecast EDA error: {detail}", color="danger", dismissable=True, className="mb-2"
+            )
+        result = resp.json()
+        stage4 = {
+            **(store_data.get("_stage4") or {}),
+            "selections": result.get("selections"),
+            "eda": {"payload": result.get("payload"), "full": result.get("full")},
+        }
+        return {**store_data, "_stage4": stage4}, ""
+    except requests.exceptions.Timeout:
+        return no_update, dbc.Alert(
+            "Forecast EDA timed out after 30 minutes.", color="danger", dismissable=True, className="mb-2"
+        )
+    except requests.exceptions.ConnectionError:
+        return no_update, dbc.Alert(
+            "Cannot reach API — is run_dev.bat running?", color="danger", dismissable=True, className="mb-2"
+        )
+    except Exception as e:
+        return no_update, dbc.Alert(str(e), color="danger", dismissable=True, className="mb-2")

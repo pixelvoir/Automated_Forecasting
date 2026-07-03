@@ -1,0 +1,668 @@
+"""Forecast EDA tab — pure rendering (no callbacks; those live in callbacks.py).
+
+Builds the Stage 4 pane from ``results-store``'s ``_stage4`` key:
+  setup       — detect()'s suggestions (target/scope/group/frequency + confidence)
+  selections  — what the user last confirmed and ran
+  eda         — {"payload": model_selection_payload, "full": forecasting_eda_full}
+
+Chart styling: dark-surface palette validated against #161b2e (indigo #6366f1 series,
+emerald #059669 trend, amber #d97706 seasonal, red #e66767 residual — all ≥3:1 contrast,
+CVD-checked). Identity never rides on color alone: every component gets its own titled
+panel, and the multi-series overlay carries a legend.
+"""
+import json
+
+import dash_bootstrap_components as dbc
+import plotly.graph_objects as go
+from dash import dcc, html, dash_table
+from plotly.subplots import make_subplots
+
+_TEXT = "var(--bs-body-color)"
+_CHART_BG = "#161b2e"
+_GRID = "rgba(255,255,255,0.06)"
+_INK = "#94a3b8"
+
+_C_SERIES = "#6366f1"
+_C_TREND = "#059669"
+_C_SEASONAL = "#d97706"
+_C_RESID = "#e66767"
+_C_OVERLAY = [_C_SERIES, _C_TREND, _C_SEASONAL, _C_RESID]  # fixed slot order, never cycled
+
+_SH = {"color": "#94a3b8", "fontSize": "0.78rem", "textTransform": "uppercase",
+       "letterSpacing": "0.06em"}
+
+_CONF_BADGE = {
+    "high": ("auto", "success"),
+    "medium": ("suggested", "info"),
+    "low": ("confirm", "warning"),
+}
+
+
+def _cicon(name, **style):
+    return html.I(className=f"bi {name}", style={"marginRight": "5px", **style})
+
+
+def _lbl(text, confidence=None):
+    """Form label with an optional confidence badge from detect()."""
+    kids = [html.Span(text)]
+    if confidence in _CONF_BADGE:
+        word, color = _CONF_BADGE[confidence]
+        kids.append(dbc.Badge(word, color=color, className="ms-2",
+                              style={"fontSize": "0.6rem", "verticalAlign": "middle"}))
+    return html.Label(kids, className="form-label",
+                      style={"fontSize": "0.8rem", "color": "#94a3b8"})
+
+
+def _datatable(rows, columns):
+    # Mirrors callbacks._datatable (kept local — importing callbacks here would be circular).
+    return dash_table.DataTable(
+        data=rows,
+        columns=[{"name": c, "id": c} for c in columns],
+        style_table={"overflowX": "auto", "borderRadius": "10px", "overflow": "hidden"},
+        style_cell={
+            "fontSize": "12px", "padding": "8px 12px", "textAlign": "left",
+            "backgroundColor": "#161b2e", "color": "#e2e8f0", "border": "none",
+            "borderBottom": "1px solid rgba(255,255,255,0.05)",
+            "fontFamily": "Inter, sans-serif", "whiteSpace": "normal", "height": "auto",
+        },
+        style_header={
+            "fontWeight": "600", "backgroundColor": "#1e2235", "color": "#64748b",
+            "fontSize": "10px", "textTransform": "uppercase", "letterSpacing": "0.06em",
+            "border": "none", "borderBottom": "1px solid rgba(255,255,255,0.10)",
+            "fontFamily": "Inter, sans-serif",
+        },
+        style_data_conditional=[{"if": {"row_index": "odd"}, "backgroundColor": "#1a1f30"}],
+        page_size=15,
+    )
+
+
+def _fmt(v, nd=3):
+    if v is None:
+        return "—"
+    if isinstance(v, bool):
+        return "Yes" if v else "No"
+    if isinstance(v, float):
+        return f"{v:,.{nd}f}"
+    return str(v)
+
+
+# ── Plotly figure base ───────────────────────────────────────────────────────
+
+def _style_fig(fig, height=280):
+    fig.update_layout(
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor=_CHART_BG,
+        font=dict(family="Inter, sans-serif", size=11, color=_INK),
+        margin=dict(l=50, r=15, t=30, b=30), height=height,
+        hovermode="x unified",
+        hoverlabel=dict(bgcolor="#1e2235", font=dict(color="#e2e8f0", size=11)),
+    )
+    fig.update_xaxes(gridcolor=_GRID, zeroline=False, linecolor=_GRID, showline=False)
+    fig.update_yaxes(gridcolor=_GRID, zeroline=False, linecolor=_GRID, showline=False)
+    return fig
+
+
+def _graph(fig):
+    return dcc.Graph(figure=fig, config={"displayModeBar": False},
+                     style={"borderRadius": "10px", "overflow": "hidden"})
+
+
+def _chart_card(title, icon, graph, subtitle=None):
+    body = [html.H6([_cicon(icon), title], className="fw-semibold mb-1", style=_SH)]
+    if subtitle:
+        body.append(html.P(subtitle, style={"fontSize": "0.72rem", "color": "#64748b",
+                                            "marginBottom": "6px"}))
+    body.append(graph)
+    return dbc.Card(dbc.CardBody(body), className="mb-3")
+
+
+def _series_fig(plot_series, target, height=280):
+    fig = go.Figure(go.Scatter(
+        x=plot_series["x"], y=plot_series["y"], mode="lines", name=target,
+        line=dict(width=2, color=_C_SERIES),
+    ))
+    fig.update_layout(showlegend=False)  # single series — the card title names it
+    return _style_fig(fig, height)
+
+
+def _decomposition_fig(decomp, series):
+    parts = [
+        ("Observed", series, _C_SERIES),
+        ("Trend", decomp["trend"], _C_TREND),
+        ("Seasonal", decomp["seasonal"], _C_SEASONAL),
+        ("Residual", decomp["resid"], _C_RESID),
+    ]
+    fig = make_subplots(rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.05,
+                        subplot_titles=[p[0] for p in parts])
+    for i, (name, data, color) in enumerate(parts, start=1):
+        fig.add_trace(
+            go.Scatter(x=data["x"], y=data["y"], mode="lines", name=name,
+                       line=dict(width=1.5, color=color)),
+            row=i, col=1,
+        )
+    fig.update_layout(showlegend=False)
+    fig.update_annotations(font=dict(size=11, color=_INK))
+    return _style_fig(fig, height=560)
+
+
+def _acf_fig(values, conf_bound, title):
+    lags = list(range(1, len(values) + 1))
+    fig = go.Figure()
+    if conf_bound:
+        fig.add_hrect(y0=-conf_bound, y1=conf_bound,
+                      fillcolor="rgba(148,163,184,0.12)", line_width=0)
+    fig.add_trace(go.Bar(x=lags, y=values, name=title,
+                         marker=dict(color=_C_SERIES), width=0.5))
+    fig.update_layout(showlegend=False, bargap=0.4)
+    fig.update_xaxes(title_text="lag", title_font=dict(size=10))
+    return _style_fig(fig, height=230)
+
+
+def _overlay_fig(deep_dives, target):
+    fig = go.Figure()
+    for i, d in enumerate(deep_dives[:4]):
+        ps = d["stats"]["plot_data"]["series"]
+        label = d["key"] if len(d["key"]) <= 28 else d["key"][:26] + "…"
+        fig.add_trace(go.Scatter(x=ps["x"], y=ps["y"], mode="lines", name=label,
+                                 line=dict(width=1.5, color=_C_OVERLAY[i])))
+    fig.update_layout(
+        showlegend=True,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, font=dict(size=10)),
+    )
+    return _style_fig(fig, height=300)
+
+
+# ── Stat tiles ───────────────────────────────────────────────────────────────
+
+def _tile(icon, label, value, sub=None, width=3):
+    kids = [
+        html.Div(
+            [html.I(className=f"bi {icon}",
+                    style={"color": "#64748b", "marginRight": "4px", "fontSize": "0.7rem"}),
+             html.Span(label, style={"fontSize": "0.65rem", "color": "#94a3b8",
+                                     "textTransform": "uppercase", "letterSpacing": "0.06em"})],
+            className="d-flex align-items-center mb-1",
+        ),
+        html.Div(value, style={"fontSize": "1rem", "fontWeight": "700",
+                               "letterSpacing": "-0.02em", "color": _TEXT}),
+    ]
+    if sub:
+        kids.append(html.Div(sub, style={"fontSize": "0.68rem", "color": "#64748b"}))
+    return dbc.Col(kids, width=width, className="mb-2")
+
+
+_INTERMITTENCY_COLOR = {"smooth": "success", "intermittent": "warning",
+                        "erratic": "warning", "lumpy": "danger", "no_demand": "secondary"}
+
+
+def _verdict_tiles(payload):
+    fcast = payload.get("forecastability")
+    seas_s = payload.get("seasonality_strength")
+    trend_s = payload.get("trend_strength")
+    icls = payload.get("intermittency_class") or "—"
+    stationary = payload.get("stationarity")
+    tiles = dbc.Row([
+        _tile("bi-magic", "Forecastability",
+              _fmt(fcast, 2), sub="1 − spectral entropy (1 = clean signal)"),
+        _tile("bi-arrow-repeat", "Seasonality",
+              _fmt(seas_s, 2), sub=f"period {payload.get('seasonality_period') or '—'}"),
+        _tile("bi-graph-up-arrow", "Trend",
+              _fmt(trend_s, 2), sub=payload.get("trend_direction", "—")),
+        _tile("bi-activity", "Demand pattern",
+              dbc.Badge(icls, color=_INTERMITTENCY_COLOR.get(icls, "secondary")),
+              sub=f"ADI {_fmt(payload.get('adi'), 2)} · CV² {_fmt(payload.get('cv2'), 2)}"),
+        _tile("bi-align-middle", "Stationary",
+              _fmt(stationary),
+              sub=f"ndiffs {_fmt(payload.get('ndiffs'))} · nsdiffs {_fmt(payload.get('nsdiffs'))}"),
+        _tile("bi-soundwave", "Signal / noise",
+              _fmt(payload.get("snr"), 1), sub="Var(trend+seasonal) / Var(resid)"),
+        _tile("bi-percent", "Coeff. of variation", _fmt(payload.get("cv"), 3),
+              sub="std / mean"),
+        _tile("bi-rulers", "Series length", f"{payload.get('series_length', 0):,}",
+              sub=f"{payload.get('forecast_frequency', '')} · "
+                  f"{_fmt(payload.get('missing_pct'), 1)}% grid gaps"),
+    ])
+    return dbc.Card(dbc.CardBody(tiles), className="mb-3",
+                    style={"borderLeft": "3px solid #6366f1"})
+
+
+# ── Settings form ────────────────────────────────────────────────────────────
+
+def _settings_form(setup, selections, eda_exists):
+    selections = selections or {}
+    target_info = setup.get("target", {})
+    group_info = setup.get("group", {})
+    freq_info = setup.get("frequency", {})
+    is_panel = setup.get("is_panel", False)
+
+    candidates = target_info.get("candidates", [])
+    target_default = selections.get("target_col") or target_info.get("suggested")
+    cand_agg = {c["col"]: c.get("agg_hint", "sum") for c in candidates}
+    target_options = [{"label": c["col"], "value": c["col"]} for c in candidates]
+
+    scope_default = selections.get("scope") or setup.get("scope", {}).get("suggested", "aggregate")
+    group_default = selections.get("group_cols") or group_info.get("suggested", [])
+    col_nunique = group_info.get("column_nunique", {})
+    group_options = [{"label": f"{c}  ({n:,} values)", "value": c}
+                     for c, n in sorted(col_nunique.items(), key=lambda kv: kv[1])]
+    agg_default = selections.get("agg") or cand_agg.get(target_default, "sum")
+
+    exog_cands = setup.get("exogenous", {}).get("candidates", [])
+    exog_default = (selections.get("exog_cols") if selections.get("exog_cols") is not None
+                    else [c for c in exog_cands if c != target_default])
+
+    freq_default = selections.get("forecast_frequency") or freq_info.get("suggested")
+    freq_options = [{"label": f.capitalize(), "value": f} for f in freq_info.get("options", [])]
+    horizon_default = selections.get("horizon") or setup.get("horizon", {}).get("suggested", 12)
+
+    if is_panel:
+        panel_note = (f"Panel data detected: ~{setup.get('rows_per_timestamp', 0):,.0f} rows "
+                      f"per timestamp across {setup.get('n_timestamps', 0):,} timestamps. "
+                      "'Overall' aggregates all series; 'Per-series' also profiles each series.")
+    else:
+        panel_note = "Single continuous series detected — no per-series grouping needed."
+
+    return dbc.Card(
+        dbc.CardBody([
+            html.Div([
+                html.P([_cicon("bi-sliders"), "Confirm Forecast Settings"],
+                       className="fw-semibold mb-0", style={"color": "#c7d2fe"}),
+                dbc.Button([_cicon("bi-arrow-clockwise"), "Re-detect"],
+                           id="btn-fcst-setup", color="link", size="sm",
+                           className="p-0 text-decoration-none"),
+            ], className="d-flex justify-content-between align-items-center mb-2"),
+            html.P(panel_note, style={"fontSize": "0.75rem", "color": "#64748b"},
+                   className="mb-3"),
+
+            dbc.Row([
+                dbc.Col([
+                    _lbl("Target column (what to forecast)", target_info.get("confidence")),
+                    dcc.Dropdown(id="dropdown-fcst-target", options=target_options,
+                                 value=target_default, clearable=False,
+                                 style={"fontSize": "0.85rem"}),
+                ], md=4),
+                dbc.Col([
+                    _lbl("Scope", setup.get("scope", {}).get("confidence")),
+                    dcc.RadioItems(
+                        id="radio-fcst-scope",
+                        options=[
+                            {"label": "  Overall (aggregate)", "value": "aggregate"},
+                            {"label": "  Per-series (panel)", "value": "per_series"},
+                        ],
+                        value=scope_default,
+                        inputStyle={"marginRight": "6px", "accentColor": "#6366f1"},
+                        labelStyle={"display": "block", "marginBottom": "4px",
+                                    "cursor": "pointer", "color": "#94a3b8",
+                                    "fontSize": "0.82rem"},
+                    ),
+                ], md=4),
+                dbc.Col([
+                    _lbl("Aggregation"),
+                    dcc.Dropdown(
+                        id="dropdown-fcst-agg",
+                        options=[{"label": "Sum (totals, demand)", "value": "sum"},
+                                 {"label": "Mean (rates, percentages)", "value": "mean"}],
+                        value=agg_default, clearable=False, style={"fontSize": "0.85rem"},
+                    ),
+                ], md=4),
+            ], className="mb-3"),
+
+            html.Div(id="fcst-group-wrap", children=[
+                _lbl("Series key (what identifies one series)", group_info.get("confidence")),
+                dcc.Dropdown(id="dropdown-fcst-group", options=group_options,
+                             value=group_default, multi=True,
+                             placeholder="Select grouping column(s)…",
+                             style={"fontSize": "0.85rem"}),
+            ], className="mb-3",
+               style={} if scope_default == "per_series" else {"display": "none"}),
+
+            dbc.Row([
+                dbc.Col([
+                    _lbl("Exogenous drivers (optional)"),
+                    dcc.Dropdown(id="dropdown-fcst-exog",
+                                 options=[{"label": c, "value": c} for c in exog_cands],
+                                 value=exog_default, multi=True,
+                                 placeholder="No exogenous columns",
+                                 style={"fontSize": "0.85rem"}),
+                ], md=6),
+                dbc.Col([
+                    _lbl("Forecast frequency", freq_info.get("confidence")),
+                    dcc.Dropdown(id="dropdown-fcst-freq", options=freq_options,
+                                 value=freq_default, clearable=False,
+                                 style={"fontSize": "0.85rem"}),
+                ], md=3),
+                dbc.Col([
+                    _lbl("Horizon (periods)"),
+                    dbc.Input(id="input-fcst-horizon", type="number", min=1, step=1,
+                              value=horizon_default, size="sm"),
+                ], md=3),
+            ], className="mb-3"),
+
+            dcc.Loading(
+                dbc.Button(
+                    [_cicon("bi-graph-up"),
+                     "Re-run Forecast EDA" if eda_exists else "Run Forecast EDA"],
+                    id="btn-run-fcst-eda", color="primary", className="w-100",
+                    disabled=target_default is None,
+                    style={"fontWeight": "600", "letterSpacing": "0.02em"},
+                ),
+                type="circle", color="#6366f1", delay_show=100,
+                target_components={"cleaning-status": "children"},
+            ),
+        ]),
+        className="mb-3",
+        style={"background": "rgba(30, 41, 59, 0.7)",
+               "border": "1px solid rgba(99, 102, 241, 0.3)"},
+    )
+
+
+# ── Results sections ─────────────────────────────────────────────────────────
+
+def _payload_details(payload):
+    return html.Details([
+        html.Summary(
+            [_cicon("bi-filetype-json", color="#6366f1"), "View model selection payload"],
+            style={"cursor": "pointer", "fontSize": "0.78rem", "color": "#94a3b8",
+                   "userSelect": "none"},
+        ),
+        html.Pre(
+            json.dumps(payload, indent=2),
+            style={"backgroundColor": "#161b2e", "color": "#e2e8f0", "fontSize": "0.72rem",
+                   "lineHeight": "1.5", "padding": "10px 14px", "borderRadius": "10px",
+                   "marginTop": "6px", "marginBottom": "0", "maxHeight": "320px",
+                   "overflowY": "auto", "whiteSpace": "pre-wrap",
+                   "border": "1px solid rgba(99, 102, 241, 0.25)"},
+        ),
+    ], className="mb-3")
+
+
+def _seasonality_section(agg_stats):
+    seas = agg_stats.get("seasonality", {})
+    rows = [
+        {"Period": c["period"],
+         "Seasonal strength": _fmt(c.get("seasonal_strength")),
+         "Trend strength": _fmt(c.get("trend_strength")),
+         "SNR": _fmt(c.get("snr"), 1)}
+        for c in seas.get("candidates", [])
+    ]
+    fft_rows = [
+        {"FFT period": p["period"], "Power share": _fmt(p.get("power_share"))}
+        for p in seas.get("fft_peaks", [])
+    ]
+    if not rows and not fft_rows:
+        return []
+    cols = []
+    if rows:
+        cols.append(dbc.Col([
+            html.H6([_cicon("bi-arrow-repeat"), "Seasonal Periods Tested (STL)"],
+                    className="fw-semibold mb-2", style=_SH),
+            _datatable(rows, ["Period", "Seasonal strength", "Trend strength", "SNR"]),
+        ], md=7))
+    if fft_rows:
+        cols.append(dbc.Col([
+            html.H6([_cicon("bi-broadcast"), "FFT Dominant Cycles"],
+                    className="fw-semibold mb-2", style=_SH),
+            _datatable(fft_rows, ["FFT period", "Power share"]),
+        ], md=5))
+    return [dbc.Row(cols, className="mb-3")]
+
+
+def _detail_tables(agg_stats, payload):
+    st = agg_stats.get("stationarity", {})
+    fc = agg_stats.get("forecastability", {})
+    het = agg_stats.get("heteroskedasticity", {})
+    tr = agg_stats.get("trend", {})
+    brk = agg_stats.get("structural_breaks", {})
+    rows = [
+        {"Statistic": "ADF p-value", "Value": _fmt(st.get("adf_p"), 4),
+         "Reading": "< 0.05 rejects unit root (stationary)"},
+        {"Statistic": "KPSS p-value", "Value": _fmt(st.get("kpss_p"), 4),
+         "Reading": "> 0.05 fails to reject stationarity"},
+        {"Statistic": "Differences needed (ADF/KPSS/PP consensus)",
+         "Value": _fmt(st.get("ndiffs")), "Reading": "d for ARIMA"},
+        {"Statistic": "Seasonal differences needed", "Value": _fmt(st.get("nsdiffs")),
+         "Reading": "D for SARIMA"},
+        {"Statistic": "Spectral entropy", "Value": _fmt(fc.get("spectral_entropy")),
+         "Reading": "0 = pure signal, 1 = white noise"},
+        {"Statistic": "Sample entropy", "Value": _fmt(fc.get("sample_entropy")),
+         "Reading": "lower = more regular/predictable"},
+        {"Statistic": "Approximate entropy", "Value": _fmt(fc.get("approx_entropy")),
+         "Reading": "lower = more regular"},
+        {"Statistic": "DFA alpha", "Value": _fmt(fc.get("dfa_alpha")),
+         "Reading": "> 0.5 = persistent / trending memory"},
+        {"Statistic": "Overall slope", "Value": f"{_fmt(tr.get('slope_pct_per_period'))}%/period",
+         "Reading": f"recent (last 20%): {_fmt(tr.get('recent_slope_pct_per_period'))}%/period"},
+        {"Statistic": "Heteroskedastic", "Value": _fmt(het.get("heteroskedastic")),
+         "Reading": f"transform: {het.get('transform_recommendation', 'none')}"},
+        {"Statistic": "Residual Ljung-Box p", "Value": _fmt(payload.get("residual_ljung_box_p"), 4),
+         "Reading": "< 0.05 = structure left for ARMA terms"},
+        {"Statistic": "Structural breaks",
+         "Value": str(len(brk.get("break_dates", []))),
+         "Reading": ("recent break — consider shorter training window"
+                     if brk.get("recent_break") else
+                     ", ".join(brk.get("break_dates", [])[:4]) or "none detected")},
+    ]
+    return [
+        html.H6([_cicon("bi-clipboard-data"), "Statistical Detail"],
+                className="fw-semibold mb-2 mt-1", style=_SH),
+        _datatable(rows, ["Statistic", "Value", "Reading"]),
+    ]
+
+
+def _exog_section(exog):
+    if not exog or not exog.get("has_exogenous"):
+        return []
+    cross_rows = [
+        {"Driver": r["col"], "Corr (same period)": _fmt(r.get("corr_lag0")),
+         "Best lead": f"{r['best_lag']} periods" if r.get("best_lag") else "0 (coincident)",
+         "Corr at best lead": _fmt(r.get("best_corr"))}
+        for r in exog.get("cross_correlation", [])
+    ]
+    vif_rows = [
+        {"Regressor": r["col"], "VIF": _fmt(r.get("vif"), 1),
+         "Collinear": "yes — drop or combine" if (r.get("vif") or 0) > 10 else "no"}
+        for r in exog.get("vif", [])
+    ]
+    out = [
+        html.H6([_cicon("bi-diagram-3"), "Exogenous Drivers"],
+                className="fw-semibold mb-2 mt-3", style=_SH),
+        html.P(exog.get("note") or "", style={"fontSize": "0.72rem", "color": "#64748b",
+                                              "marginBottom": "6px"}),
+    ]
+    cols = []
+    if cross_rows:
+        cols.append(dbc.Col([_datatable(
+            cross_rows, ["Driver", "Corr (same period)", "Best lead", "Corr at best lead"])],
+            md=7))
+    if vif_rows:
+        cols.append(dbc.Col([_datatable(vif_rows, ["Regressor", "VIF", "Collinear"])], md=5))
+    out.append(dbc.Row(cols, className="mb-3"))
+    return out
+
+
+def _panel_section(full):
+    panel = full.get("panel")
+    if not panel:
+        return []
+    mix = panel.get("intermittency_mix", {})
+    mix_badges = [
+        dbc.Badge(f"{cls}: {share * 100:.1f}%",
+                  color=_INTERMITTENCY_COLOR.get(cls, "secondary"), className="me-2 mb-1")
+        for cls, share in sorted(mix.items(), key=lambda kv: -kv[1])
+    ]
+    lengths = panel.get("series_length", {})
+    tiles = dbc.Row([
+        _tile("bi-collection", "Series in panel", f"{panel.get('n_series', 0):,}"),
+        _tile("bi-rulers", "Series length",
+              f"{lengths.get('median', 0):,}",
+              sub=f"min {lengths.get('min', 0):,} · max {lengths.get('max', 0):,}"),
+        _tile("bi-pie-chart", "Top-10 volume share",
+              _fmt(panel.get("top_series_volume_share"), 3),
+              sub="low = demand spread evenly across series"),
+        dbc.Col([
+            html.Div([html.I(className="bi bi-activity",
+                             style={"color": "#64748b", "marginRight": "4px",
+                                    "fontSize": "0.7rem"}),
+                      html.Span("Demand pattern mix",
+                                style={"fontSize": "0.65rem", "color": "#94a3b8",
+                                       "textTransform": "uppercase",
+                                       "letterSpacing": "0.06em"})],
+                     className="d-flex align-items-center mb-1"),
+            html.Div(mix_badges),
+        ], width=3),
+    ])
+
+    deep = full.get("per_series_deep_dive", [])
+    deep_rows = [
+        {"Series": d["key"],
+         "Pattern": d["stats"]["intermittency"]["class"],
+         "Seasonal strength": _fmt(d["stats"].get("seasonal_strength")),
+         "Trend strength": _fmt(d["stats"].get("trend_strength")),
+         "Forecastability": _fmt(d["stats"]["forecastability"].get("score"), 2),
+         "CV": _fmt(d["stats"].get("cv"))}
+        for d in deep
+    ]
+
+    out = [
+        html.Hr(className="my-4"),
+        html.H6([_cicon("bi-collection"), "Panel Profile (per-series scope)"],
+                className="fw-semibold mb-2", style=_SH),
+        dbc.Card(dbc.CardBody(tiles), className="mb-3",
+                 style={"borderLeft": "3px solid #d97706"}),
+    ]
+    if deep:
+        target = full.get("selections", {}).get("target_col", "")
+        out.append(_chart_card(
+            "Top Series by Volume", "bi-graph-up",
+            _graph(_overlay_fig(deep, target)),
+            subtitle="The highest-volume individual series, for comparison against the aggregate.",
+        ))
+        out.append(_datatable(deep_rows, ["Series", "Pattern", "Seasonal strength",
+                                          "Trend strength", "Forecastability", "CV"]))
+    return out
+
+
+def _results_section(stage4):
+    eda = stage4.get("eda") or {}
+    payload = eda.get("payload")
+    full = eda.get("full")
+    if not payload or not full:
+        return []
+
+    agg = full.get("aggregate", {})
+    plot_data = agg.get("plot_data", {})
+    selections = full.get("selections", {})
+    target = selections.get("target_col", "")
+
+    sections = [html.Hr(className="my-4")]
+
+    warns = payload.get("warnings", [])
+    if warns:
+        sections.append(dbc.Alert(
+            [html.Div([_cicon("bi-exclamation-triangle-fill"),
+                       html.Strong("Forecasting risks detected")], className="mb-1")] +
+            [html.Div(w, style={"fontSize": "0.8rem"}) for w in warns],
+            color="warning", className="py-2 mb-3",
+        ))
+
+    sections.append(_verdict_tiles(payload))
+
+    if plot_data.get("series"):
+        scope_label = "aggregate of all series" if selections.get("scope") == "per_series" \
+            or stage4.get("setup", {}).get("is_panel") else "full series"
+        sections.append(_chart_card(
+            f"{target} — Analysis Series", "bi-graph-up",
+            _graph(_series_fig(plot_data["series"], target)),
+            subtitle=f"Regularized to {selections.get('forecast_frequency', '')} grid "
+                     f"({scope_label}).",
+        ))
+
+    if plot_data.get("decomposition"):
+        d = plot_data["decomposition"]
+        sections.append(_chart_card(
+            f"Decomposition (period = {d.get('period')})", "bi-layers",
+            _graph(_decomposition_fig(d, plot_data["series"])),
+            subtitle="Trend + seasonal + residual split behind the strength scores above.",
+        ))
+
+    ac = agg.get("autocorrelation", {})
+    if ac.get("acf"):
+        acf_col = dbc.Col([_graph(_acf_fig(ac["acf"], ac.get("conf_bound"), "ACF"))], md=6)
+        cols = [acf_col]
+        if ac.get("pacf"):
+            cols.append(dbc.Col([_graph(_acf_fig(ac["pacf"], ac.get("conf_bound"), "PACF"))],
+                                md=6))
+        sections.append(_chart_card(
+            "Autocorrelation (ACF / PACF)", "bi-bar-chart-line",
+            dbc.Row(cols),
+            subtitle="Bars outside the gray band are statistically significant lags.",
+        ))
+
+    sections += _seasonality_section(agg)
+    sections += _detail_tables(agg, payload)
+    sections += _exog_section(full.get("exogenous"))
+    sections += _panel_section(full)
+    sections.append(html.Hr(className="my-3"))
+    sections.append(_payload_details(payload))
+    return sections
+
+
+# ── Tab entry point ──────────────────────────────────────────────────────────
+
+def render_fcst_eda_tab(data):
+    if not data or "_stage3" not in data:
+        return html.Div(
+            [_cicon("bi-info-circle", fontSize="2rem", color="#334155",
+                    display="block", marginBottom="12px", marginRight="0"),
+             html.P("Run cleaning on the Cleaning tab first — forecast EDA works on "
+                    "cleaned data only.",
+                    style={"color": "#64748b", "fontSize": "0.9rem"})],
+            className="text-center mt-5 pt-4",
+        )
+
+    stage4 = data.get("_stage4") or {}
+    setup = stage4.get("setup")
+
+    header = html.Div([
+        html.Span([_cicon("bi-graph-up"), "Forecast EDA"],
+                  className="fw-semibold", style={"color": "#c7d2fe"}),
+    ], className="mb-3")
+
+    validation = (data.get("_stage3") or {}).get("_validation", {})
+    val_warn = []
+    if validation and not validation.get("passed", True):
+        val_warn = [dbc.Alert(
+            [_cicon("bi-shield-exclamation"),
+             "The validation gate FAILED for this cleaning run — these statistics may "
+             "not be trustworthy. Consider re-running cleaning first."],
+            color="danger", className="py-2 mb-3",
+        )]
+
+    if not setup:
+        return html.Div([
+            header, *val_warn,
+            dbc.Card(dbc.CardBody([
+                html.P([_cicon("bi-sliders"), "Detect Forecast Settings"],
+                       className="fw-semibold mb-2", style={"color": "#c7d2fe"}),
+                html.P("Scans the cleaned data and suggests the forecast target, "
+                       "series grouping, and horizon — you confirm everything before "
+                       "any analysis runs.",
+                       style={"fontSize": "0.8rem", "color": "#94a3b8"}),
+                dcc.Loading(
+                    dbc.Button([_cicon("bi-search"), "Detect Forecast Settings"],
+                               id="btn-fcst-setup", color="primary",
+                               style={"fontWeight": "600"}),
+                    type="circle", color="#6366f1", delay_show=100,
+                    target_components={"cleaning-status": "children"},
+                ),
+            ]), className="mb-3",
+                style={"background": "rgba(30, 41, 59, 0.7)",
+                       "border": "1px solid rgba(99, 102, 241, 0.3)"}),
+        ])
+
+    eda_exists = bool((stage4.get("eda") or {}).get("payload"))
+    return html.Div([
+        header,
+        *val_warn,
+        _settings_form(setup, stage4.get("selections"), eda_exists),
+        *_results_section(stage4),
+    ])
