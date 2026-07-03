@@ -44,13 +44,16 @@ def validate_task(run_id: str) -> dict:
     return validation_gate.run(run_id)
 
 
-def forecast_setup_task(run_id: str) -> dict:
-    """Stage 4 phase A: scan the cleaned parquet and suggest forecast settings."""
-    from pipeline import forecasting_eda
-    return forecasting_eda.detect(run_id)
+def forecast_intent_task(run_id: str, use_llm: bool = True) -> dict:
+    """Stage 2.5: rule-based intent detection + optional LLM refinement. Suggestion
+    quality degrades gracefully — an LLM failure leaves the rule suggestions standing."""
+    from pipeline import forecast_intent
+    from agents import forecast_intent_agent
+    forecast_intent.detect(run_id)
+    return forecast_intent_agent.refine(run_id, use_llm=use_llm)
 
 
 def forecast_eda_task(run_id: str) -> dict:
-    """Stage 4 phase B: full forecasting EDA on the user-confirmed selections."""
+    """Stage 4: full forecasting EDA on the user-confirmed intent."""
     from pipeline import forecasting_eda
     return forecasting_eda.run(run_id)

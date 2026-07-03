@@ -1,31 +1,24 @@
 """Stage 4: Forecasting EDA — runs on CLEAN data only, answers one question:
 "What forecasting model fits this data?"
 
-Two entry points, both pure Python (no LLM in computation):
+Pure Python statistics (no LLM in computation; Stage 5 will only ever see
+model_selection_payload.json). The user-facing choices — timestamp, target (+aggregation
+including event counts), scope, series key, exogenous, forecast frequency, horizon —
+were confirmed back at Stage 2.5 (pipeline/forecast_intent.py + the Setup & Cleaning
+tab) and are read from runs/{id}/forecast_user_selections.json.
 
-  detect(run_id)  — fast setup pass. Scans the cleaned parquet and *suggests* the
-                    user-facing choices (target column, aggregate vs per-series scope,
-                    group key, aggregation, forecast frequency, horizon) each with a
-                    confidence level. Low confidence → the UI asks the user to confirm.
-                    Writes runs/{run_id}/forecast_setup.json.
+run(run_id) builds the analysis series per the confirmed intent (aggregate / per-series
+panel, sum / mean / distinct-count per period) and computes every model-selection
+statistic: trend, seasonality (STL + FFT + ACF), stationarity (ADF/KPSS/PP diffs),
+forecastability entropies, intermittency (ADI/CV²), SNR, CV, exogenous cross-correlation,
+VIF, heteroskedasticity, structural breaks, Ljung-Box residual whiteness.
 
-  run(run_id)     — heavy analysis pass. Reads forecast_user_selections.json (the
-                    confirmed choices; falls back to detect()'s suggestions), builds the
-                    analysis series (aggregated / per-series panel), and computes every
-                    model-selection statistic: trend, seasonality (STL + FFT + ACF),
-                    stationarity (ADF/KPSS/PP diffs), forecastability entropies,
-                    intermittency (ADI/CV²), SNR, CV, exogenous cross-correlation, VIF,
-                    heteroskedasticity, structural breaks, Ljung-Box residual whiteness.
-                    Writes runs/{run_id}/forecasting_eda_full.json (stats + plot data for
-                    human review) and model_selection_payload.json (compact decision JSON
-                    for the Stage 5 rule engine / LLM).
-
-No raw data leaves the machine — Stage 5 will only ever see model_selection_payload.json.
+Writes:
+  runs/{id}/forecasting_eda_full.json      — all stats + downsampled plot arrays
+  runs/{id}/model_selection_payload.json   — compact decision JSON for Stage 5
 """
 import json
-import re
 import warnings
-from itertools import combinations
 from pathlib import Path
 
 import numpy as np
@@ -49,29 +42,7 @@ _FREQ_PERIODS = {
     "hourly": [24, 168], "daily": [7, 365], "weekly": [52],
     "monthly": [12], "quarterly": [4], "yearly": [],
 }
-# Coarser frequencies the user may forecast at (data can be resampled down, never up).
-_COARSER = {
-    "hourly": ["daily", "weekly", "monthly"],
-    "daily": ["weekly", "monthly"],
-    "weekly": ["monthly", "quarterly"],
-    "monthly": ["quarterly", "yearly"],
-    "quarterly": ["yearly"],
-    "yearly": [],
-}
 _DEFAULT_HORIZON = {"hourly": 48, "daily": 30, "weekly": 13, "monthly": 12, "quarterly": 8, "yearly": 3}
-
-# Name heuristics for target/group suggestion. These only rank suggestions — the user
-# confirms everything in the UI before run() executes, so a miss costs one dropdown click.
-_MEASURE_HINTS = re.compile(
-    r"sales|demand|qty|quantity|volume|revenue|amount|total|litre|liter|kilo|units|sold"
-    r"|consumption|usage|load|orders|count", re.I)
-_RATE_HINTS = re.compile(r"pct|percent|rate|ratio|avg|average|aggregated", re.I)
-_ID_AUDIT_HINTS = re.compile(
-    r"^id$|_id$|^index$|_key$|^key$|code|file_|_file|loaded|created|updated|_at$"
-    r"|^year$|^month$|^day$|_year$|_month$", re.I)
-_GROUP_HINTS = re.compile(
-    r"code|name|nbr|family|category|store|region|society|branch|sku|item|product"
-    r"|location|dept|group|type|segment|channel", re.I)
 
 
 def _load_config() -> dict:
@@ -109,214 +80,43 @@ def _recipe(run_dir: Path) -> dict:
     return json.loads(p.read_text()) if p.exists() else {}
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Phase A — detect(): setup suggestions with confidence
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _score_target(col: str, distinct_pct: float, variance: float) -> float | None:
-    """Rank a numeric column as forecast-target candidate. None = excluded outright."""
-    if variance <= 0:
-        return None  # constant — nothing to forecast
-    score = 0.0
-    if _MEASURE_HINTS.search(col):
-        score += 2
-    if _RATE_HINTS.search(col):
-        score -= 2  # percentages/rates are usually derived, not the business target
-    if _ID_AUDIT_HINTS.search(col):
-        score -= 2
-    if distinct_pct > 95:
-        score -= 3  # per-row-unique → ID-like
-    return score
-
-
-def _group_candidates(df: pd.DataFrame, ts_col: str, nunique: pd.Series,
-                      rows_per_ts: float, cfg: dict) -> list[dict]:
-    """Find column(s) that identify individual series in a panel.
-
-    A perfect group key has ~one row per (group, timestamp): nunique(key) ≈ rows/ts and
-    uniqueness of (key, ts) ≈ 1. Singles are tried first; if none reaches the high bar,
-    pairs of the best singles are tried (e.g. Favorita needs store_nbr × family).
-    """
-    hi = cfg.get("group_uniqueness_high", 0.995)
-    singles = []
-    for col in df.columns:
-        if col == ts_col:
-            continue
-        nu = int(nunique[col])
-        if nu < 2 or nu > rows_per_ts * 5:
-            continue  # more groups than rows-per-timestamp → can't be the series key
-        closeness = abs(np.log(nu / rows_per_ts))  # 0 = exactly one row per group per ts
-        bonus = -0.5 if _GROUP_HINTS.search(col) else 0.0
-        singles.append({"cols": [col], "nunique": nu, "rank": closeness + bonus})
-    singles.sort(key=lambda c: c["rank"])
-
-    candidates = []
-    for cand in singles[:6]:
-        uniq = 1.0 - float(df.duplicated(subset=[*cand["cols"], ts_col]).mean())
-        candidates.append({**cand, "uniqueness": round(uniq, 4)})
-        if uniq >= hi:
-            break  # a single column fully identifies the series — no need to try more
-
-    if not any(c["uniqueness"] >= hi for c in candidates):
-        # No single key — try pairs of the best singles (composite keys like store×family)
-        for a, b in combinations(singles[:4], 2):
-            cols = a["cols"] + b["cols"]
-            uniq = 1.0 - float(df.duplicated(subset=[*cols, ts_col]).mean())
-            candidates.append({
-                "cols": cols, "nunique": int(df.groupby(cols, observed=True).ngroups),
-                "rank": 0.0, "uniqueness": round(uniq, 4),
-            })
-            if uniq >= hi:
-                break
-
-    candidates.sort(key=lambda c: -c["uniqueness"])
-    return [{k: v for k, v in c.items() if k != "rank"} for c in candidates[:5]]
-
-
-def detect(run_id: str) -> dict:
-    """Phase A: suggest forecast settings from the cleaned data, with confidence levels.
-
-    Confidence semantics (drives the UI):
-      high   — pre-selected, safe to run without user attention
-      medium — pre-selected, shown normally
-      low    — pre-selected but flagged "please confirm" in the UI
-    """
-    cfg = _load_config()
-    run_dir, parquet = _paths(run_id)
-    recipe = _recipe(run_dir)
-
-    df = pd.read_parquet(parquet)
-    ts_col = recipe.get("timestamp_col")
-    if not ts_col or ts_col not in df.columns:
-        raise ValueError(f"Timestamp column '{ts_col}' not found in cleaned data.")
-    ts = pd.to_datetime(df[ts_col], errors="coerce")
-    df = df.loc[ts.notna()].copy()
-    df[ts_col] = ts.dropna()
-
-    n_rows = len(df)
-    n_ts = int(df[ts_col].nunique())
-    rows_per_ts = n_rows / max(n_ts, 1)
-    dup_ts_frac = 1.0 - n_ts / max(n_rows, 1)
-    is_panel = dup_ts_frac > cfg.get("panel_dup_ts_threshold", 0.05)
-
-    nunique = df.nunique()
-
-    # ── Target candidates ────────────────────────────────────────────────────
-    numeric_cols = [c for c in df.select_dtypes(include="number").columns if c != ts_col]
-    scored = []
-    for col in numeric_cols:
-        s = df[col]
-        variance = float(s.std()) if s.notna().any() else 0.0
-        distinct_pct = nunique[col] / max(n_rows, 1) * 100
-        score = _score_target(col, distinct_pct, variance)
-        if score is not None:
-            scored.append({"col": col, "score": score, "zero_pct": _f((s == 0).mean() * 100, 2),
-                           "agg_hint": "mean" if _RATE_HINTS.search(col) else "sum"})
-    scored.sort(key=lambda c: -c["score"])
-
-    if not scored:
-        target_conf = "low"
-    elif len(scored) == 1 or scored[0]["score"] - scored[1]["score"] >= 2:
-        target_conf = "high"
-    elif scored[0]["score"] - scored[1]["score"] >= 1:
-        target_conf = "medium"
-    else:
-        target_conf = "low"  # ties (e.g. eight total_* measures) — only the user knows
-
-    # ── Group key (panel only) ───────────────────────────────────────────────
-    group_cands, group_conf = [], "high"  # non-panel: confidently no grouping
-    if is_panel:
-        group_cands = _group_candidates(df, ts_col, nunique, rows_per_ts, cfg)
-        best_u = group_cands[0]["uniqueness"] if group_cands else 0.0
-        if best_u >= cfg.get("group_uniqueness_high", 0.995):
-            group_conf = "high"
-        elif best_u >= cfg.get("group_uniqueness_medium", 0.95):
-            group_conf = "medium"
-        else:
-            group_conf = "low"
-
-    # ── Exogenous candidates: numeric, not ID/audit-like, not the target ────
-    exog_cands = [
-        c for c in numeric_cols
-        if not _ID_AUDIT_HINTS.search(c) and nunique[c] / max(n_rows, 1) * 100 <= 95
-        and float(df[c].std() or 0) > 0
-    ]
-
-    data_freq = recipe.get("frequency", "daily")
-    setup = {
-        "run_id": run_id,
-        "n_rows": n_rows,
-        "n_timestamps": n_ts,
-        "timestamp_col": ts_col,
-        "is_panel": is_panel,
-        "duplicate_ts_fraction": _f(dup_ts_frac, 4),
-        "rows_per_timestamp": _f(rows_per_ts, 1),
-        "target": {
-            "candidates": scored[:10],
-            "suggested": scored[0]["col"] if scored else None,
-            "confidence": target_conf,
-        },
-        "scope": {
-            # Panels default to the aggregate/overall path first (per-series is a
-            # deliberate, costlier choice) — the user flips a radio to change it.
-            "suggested": "aggregate",
-            "confidence": "high" if not is_panel else "medium",
-        },
-        "group": {
-            "candidates": group_cands,
-            "suggested": group_cands[0]["cols"] if group_cands else [],
-            "confidence": group_conf,
-            # every column's cardinality, so the UI can offer ANY column as group key
-            # (the user may prefer societycode over societyname, etc.)
-            "column_nunique": {c: int(nunique[c]) for c in df.columns if c != ts_col},
-        },
-        "exogenous": {"candidates": exog_cands},
-        "frequency": {
-            "data": data_freq,
-            "options": [data_freq] + _COARSER.get(data_freq, []),
-            "suggested": data_freq,
-            "confidence": "high",
-        },
-        "horizon": {"suggested": _DEFAULT_HORIZON.get(data_freq, 12)},
-        "date_range": {
-            "start": str(df[ts_col].min()),
-            "end": str(df[ts_col].max()),
-        },
-    }
-
-    (run_dir / "forecast_setup.json").write_text(json.dumps(setup, indent=2, default=str))
-    return {"run_id": run_id, "status": "completed", "setup": setup}
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Phase B — run(): the heavy statistics pass
-# ══════════════════════════════════════════════════════════════════════════════
-
 def _resolve_selections(run_dir: Path) -> dict:
-    """User-confirmed choices, falling back to detect()'s suggestions per field."""
-    setup_path = run_dir / "forecast_setup.json"
-    setup = json.loads(setup_path.read_text()) if setup_path.exists() else {}
+    """The confirmed forecast intent, with per-field fallbacks for older runs:
+    forecast_user_selections.json → forecast_intent.json suggestions → cleaning recipe
+    (which always carries timestamp_col + data frequency)."""
     sel_path = run_dir / "forecast_user_selections.json"
     sel = json.loads(sel_path.read_text()) if sel_path.exists() else {}
+    intent_path = run_dir / "forecast_intent.json"
+    intent = json.loads(intent_path.read_text()) if intent_path.exists() else {}
+    recipe = _recipe(run_dir)
 
-    target = sel.get("target_col") or setup.get("target", {}).get("suggested")
+    target = sel.get("target_col") or intent.get("target", {}).get("suggested")
     if not target:
-        raise ValueError("No target column selected and none could be suggested.")
-    cands = {c["col"]: c for c in setup.get("target", {}).get("candidates", [])}
-    default_agg = cands.get(target, {}).get("agg_hint", "sum")
-    data_freq = setup.get("frequency", {}).get("data", "daily")
+        raise ValueError(
+            "No forecast target confirmed. Run Stage 2.5 (forecast intent) and confirm "
+            "the settings on the Setup & Cleaning tab first.")
+    ts_col = (sel.get("timestamp_col") or recipe.get("timestamp_col")
+              or intent.get("timestamp", {}).get("suggested"))
+    if not ts_col:
+        raise ValueError("No timestamp column available for this run.")
+    data_freq = (recipe.get("frequency")
+                 or intent.get("frequency", {}).get("data") or "daily")
+    fcst_freq = (sel.get("forecast_frequency")
+                 or intent.get("frequency", {}).get("suggested") or data_freq)
+    exog = sel.get("exog_cols")
+    if exog is None:
+        exog = [c for c in intent.get("exogenous", {}).get("candidates", []) if c != target]
     return {
         "target_col": target,
-        "scope": sel.get("scope") or setup.get("scope", {}).get("suggested", "aggregate"),
-        "group_cols": sel.get("group_cols") or setup.get("group", {}).get("suggested", []),
-        "agg": sel.get("agg") or default_agg,
-        "exog_cols": (sel.get("exog_cols") if sel.get("exog_cols") is not None
-                      else [c for c in setup.get("exogenous", {}).get("candidates", [])
-                            if c != target]),
-        "forecast_frequency": sel.get("forecast_frequency") or data_freq,
-        "horizon": int(sel.get("horizon") or setup.get("horizon", {}).get("suggested", 12)),
+        "agg": sel.get("agg") or intent.get("target", {}).get("suggested_agg") or "sum",
+        "timestamp_col": ts_col,
+        "scope": sel.get("scope") or intent.get("scope", {}).get("suggested", "aggregate"),
+        "group_cols": sel.get("group_cols") or intent.get("group", {}).get("suggested", []),
+        "exog_cols": exog,
+        "forecast_frequency": fcst_freq,
+        "horizon": int(sel.get("horizon") or intent.get("horizon", {}).get("suggested")
+                       or _DEFAULT_HORIZON.get(fcst_freq, 12)),
         "data_frequency": data_freq,
-        "timestamp_col": setup.get("timestamp_col"),
     }
 
 
@@ -334,19 +134,25 @@ def _build_series(frame: pd.DataFrame, ts_col: str, target: str, exog_cols: list
                   agg: str, freq_label: str) -> tuple[pd.Series, pd.DataFrame, dict]:
     """Collapse rows onto a regular time grid at freq_label.
 
-    Returns (target series, exog frame, fill report). Empty grid bins become NaN and are
-    then filled: with 0 when the data is zero-inflated sum-aggregated demand (an absent
-    period IS zero demand — required for honest ADI/intermittency), otherwise by time
-    interpolation (a genuine gap in a continuous measure).
+    agg semantics:
+      sum / mean — aggregate a numeric measure. Empty grid bins become NaN and are then
+        filled: with 0 when the data is zero-inflated sum-aggregated demand (an absent
+        period IS zero demand — required for honest ADI/intermittency), otherwise by
+        time interpolation (a genuine gap in a continuous measure).
+      nunique / count — events per period (distinct IDs / non-null rows). Empty bins are
+        TRUE zeros (no events happened), never missing.
     """
     alias = _pandas_freq(freq_label, frame[ts_col])
     indexed = frame.set_index(ts_col).sort_index()
 
-    aggfunc = "mean" if agg == "mean" else "sum"
-    if aggfunc == "sum":
-        y = indexed[target].resample(alias).sum(min_count=1)  # min_count: empty bin → NaN, not 0
-    else:
+    if agg == "nunique":
+        y = indexed[target].resample(alias).nunique().astype("float64")
+    elif agg == "count":
+        y = indexed[target].resample(alias).count().astype("float64")
+    elif agg == "mean":
         y = indexed[target].resample(alias).mean()
+    else:
+        y = indexed[target].resample(alias).sum(min_count=1)  # min_count: empty bin → NaN, not 0
     exog = indexed[exog_cols].resample(alias).mean() if exog_cols else pd.DataFrame(index=y.index)
 
     n_grid = len(y)
@@ -354,12 +160,15 @@ def _build_series(frame: pd.DataFrame, ts_col: str, target: str, exog_cols: list
     observed = y.dropna()
     zero_pct = float((observed == 0).mean() * 100) if len(observed) else 0.0
 
-    fill_method = "zero" if (agg == "sum" and zero_pct > 10) else "interpolate"
-    if n_missing > 0:
-        if fill_method == "zero":
-            y = y.fillna(0.0)
-        else:
-            y = y.interpolate(method="time", limit_direction="both")
+    if agg in ("nunique", "count"):
+        fill_method = "count_zero"  # empty bins are already honest zeros
+    else:
+        fill_method = "zero" if (agg == "sum" and zero_pct > 10) else "interpolate"
+        if n_missing > 0:
+            if fill_method == "zero":
+                y = y.fillna(0.0)
+            else:
+                y = y.interpolate(method="time", limit_direction="both")
     if not exog.empty:
         exog = exog.interpolate(method="time", limit_direction="both")
 
@@ -367,8 +176,8 @@ def _build_series(frame: pd.DataFrame, ts_col: str, target: str, exog_cols: list
         "grid_points": n_grid,
         "missing_grid_points": n_missing,
         "missing_pct": _f(n_missing / max(n_grid, 1) * 100, 2),
-        "fill_method": fill_method if n_missing else "none",
-        "zero_pct": _f(zero_pct, 2),
+        "fill_method": fill_method if (n_missing or agg in ("nunique", "count")) else "none",
+        "zero_pct": _f(float((y == 0).mean() * 100), 2),
     }
     return y, exog, report
 
@@ -770,19 +579,32 @@ def _exog_analysis(y: pd.Series, exog: pd.DataFrame, period: int, cfg: dict) -> 
 # ── Panel summary (per-series scope) ─────────────────────────────────────────
 
 def _panel_summary(df: pd.DataFrame, ts_col: str, target: str, group_cols: list[str],
-                   freq_label: str) -> dict:
-    """Vectorized per-series profile of the whole panel in one groupby pass — this is
-    what Stage 5 needs to route global-ML vs per-series-classical (per-series classical
-    cost = fit × n_series; see project memory)."""
-    g = df.groupby(group_cols, observed=True)[target]
-    per = g.agg(n="size", total="sum", mean="mean", std="std",
-                nz_count=lambda s: int((s != 0).sum()))
-    nz = df.loc[df[target] != 0].groupby(group_cols, observed=True)[target]
-    per["nz_mean"] = nz.mean()
-    per["nz_std"] = nz.std()
+                   agg: str, alias: str, grid_len: int) -> dict:
+    """Vectorized per-series profile of the whole panel — this is what Stage 5 needs to
+    route global-ML vs per-series-classical (per-series classical cost = fit × n_series).
 
-    per["adi"] = per["n"] / per["nz_count"].replace(0, np.nan)
-    per["cv2"] = (per["nz_std"] / per["nz_mean"]) ** 2
+    For measure targets (sum/mean) the profile is computed on raw row values; for count
+    targets it is computed on per-series events-per-period, which is the actual series
+    being forecast."""
+    if agg in ("nunique", "count"):
+        aggfunc = "nunique" if agg == "nunique" else "count"
+        counts = (df.groupby([*group_cols, pd.Grouper(key=ts_col, freq=alias)],
+                             observed=True)[target].agg(aggfunc))
+        levels = list(range(len(group_cols)))
+        g = counts.groupby(level=levels, observed=True)
+        per = g.agg(n="size", total="sum", mean="mean", std="std")
+        # active periods vs the full grid → honest ADI for event series
+        per["adi"] = grid_len / per["n"].replace(0, np.nan)
+        per["cv2"] = (per["std"] / per["mean"]) ** 2
+    else:
+        g = df.groupby(group_cols, observed=True)[target]
+        per = g.agg(n="size", total="sum", mean="mean", std="std",
+                    nz_count=lambda s: int((s != 0).sum()))
+        nz = df.loc[df[target] != 0].groupby(group_cols, observed=True)[target]
+        per["nz_mean"] = nz.mean()
+        per["nz_std"] = nz.std()
+        per["adi"] = per["n"] / per["nz_count"].replace(0, np.nan)
+        per["cv2"] = (per["nz_std"] / per["nz_mean"]) ** 2
 
     def _cls(row):
         if not np.isfinite(row["adi"]):
@@ -805,6 +627,7 @@ def _panel_summary(df: pd.DataFrame, ts_col: str, target: str, group_cols: list[
             "min": int(per["n"].min()), "median": int(per["n"].median()),
             "max": int(per["n"].max()),
         },
+        "length_unit": "periods" if agg in ("nunique", "count") else "rows",
         "intermittency_mix": mix,
         "top_series_volume_share": _f(float(volumes.head(top_k).sum()) / total_vol, 3),
         "top_series": [
@@ -827,6 +650,7 @@ def _build_payload(stats: dict, selections: dict, exog: dict,
     payload = {
         "scope": selections["scope"],
         "target": selections["target_col"],
+        "agg": selections["agg"],
         "frequency": selections["data_frequency"],
         "forecast_frequency": selections["forecast_frequency"],
         "horizon": selections["horizon"],
@@ -881,11 +705,9 @@ def _build_payload(stats: dict, selections: dict, exog: dict,
 # ── Stage 4 entry point ──────────────────────────────────────────────────────
 
 def run(run_id: str) -> dict:
-    """Phase B entry point. Reads cleaned parquet + confirmed selections; zero DB, zero LLM."""
+    """Stage 4 entry point. Reads cleaned parquet + confirmed intent; zero DB, zero LLM."""
     cfg = _load_config()
     run_dir, parquet = _paths(run_id)
-    if not (run_dir / "forecast_setup.json").exists():
-        detect(run_id)  # manual pipeline use — make sure suggestions exist to fall back on
     selections = _resolve_selections(run_dir)
 
     ts_col = selections["timestamp_col"]
@@ -899,6 +721,12 @@ def run(run_id: str) -> dict:
     df = df.loc[df[ts_col].notna() & df[target].notna()]
     if df.empty:
         raise ValueError(f"No usable rows for target '{target}'.")
+
+    # sum/mean of a non-numeric column is undefined — the intent for such targets is
+    # counting events. Forced here as a backstop; the intent agent normally sets it.
+    if selections["agg"] in ("sum", "mean") and not pd.api.types.is_numeric_dtype(df[target]):
+        selections["agg"] = "nunique"
+        selections["agg_forced"] = True
 
     freq_label = selections["forecast_frequency"]
 
@@ -917,7 +745,9 @@ def run(run_id: str) -> dict:
     panel = None
     per_series_deep = []
     if selections["scope"] == "per_series" and group_cols:
-        panel = _panel_summary(df, ts_col, target, group_cols, freq_label)
+        alias = _pandas_freq(freq_label, df[ts_col])
+        panel = _panel_summary(df, ts_col, target, group_cols,
+                               selections["agg"], alias, grid_len=len(y))
         # Deep-dive the top-K series by volume so the human (and Stage 5) can see whether
         # individual series behave like the aggregate or need intermittent-class models.
         for entry in panel["top_series"][:cfg.get("top_series_deep_dive", 3)]:

@@ -35,6 +35,13 @@ ingest:
   raw_format: parquet
   top_n_categories: 5      # how many top values to include in cardinality stats
 
+# Stage 2.5: forecast intent detection (runs after pre-clean EDA, before cleaning)
+forecast_intent:
+  panel_dup_ts_threshold: 0.05 # duplicate-timestamp fraction above which data is a panel
+  group_uniqueness_high: 0.995 # (group, ts) uniqueness for high-confidence series key
+  group_uniqueness_medium: 0.95
+  dimension_max_cardinality: 10000  # event-log mode: max distinct values for a dimension key
+
 # Stage 4: forecasting EDA settings
 forecast_eda:
   acf_lags: 40                 # ACF/PACF lags computed and plotted
@@ -43,9 +50,6 @@ forecast_eda:
   stl_max_points: 50000        # above this, classical decomposition replaces STL (LOESS too slow)
   plot_max_points: 1500        # downsampling cap for chart arrays saved in the full JSON
   top_series_deep_dive: 3      # per-series scope: full stats battery on top-K series by volume
-  panel_dup_ts_threshold: 0.05 # duplicate-timestamp fraction above which data is a panel
-  group_uniqueness_high: 0.995 # (group, ts) uniqueness for high-confidence group key
-  group_uniqueness_medium: 0.95
 
 # Stage 2: pre-cleaning EDA settings
 pre_clean_eda:

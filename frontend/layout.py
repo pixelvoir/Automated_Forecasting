@@ -27,7 +27,7 @@ from dash import dcc, html
 # "tab-" → "pane-" (see the clientside pane switcher in callbacks.py).
 _TABS = [
     ("Data & Pre-clean EDA", "tab-data",     "bi-search"),
-    ("Cleaning",             "tab-clean",     "bi-scissors"),
+    ("Setup & Cleaning",     "tab-clean",     "bi-scissors"),
     ("Forecast EDA",         "tab-fcst-eda",  "bi-graph-up"),
     ("Model Select",         "tab-model",     "bi-cpu"),
     ("Training",             "tab-training",  "bi-lightning-fill"),

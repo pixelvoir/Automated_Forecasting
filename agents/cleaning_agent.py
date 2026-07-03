@@ -249,7 +249,21 @@ def _is_audit_col(name: str) -> bool:
     return any(t in n for t in _AUDIT_TOKENS)
 
 
-def _sanitize_recipe(recipe: dict, meta: dict, payload: dict | None = None) -> None:
+def _load_intent(run_dir: Path) -> dict | None:
+    """User-confirmed forecast intent (Stage 2.5). The consolidated file supersedes the
+    legacy user_selections.json (timestamp only), which is kept readable for old runs."""
+    p = run_dir / "forecast_user_selections.json"
+    if p.exists():
+        return json.loads(p.read_text())
+    legacy = run_dir / "user_selections.json"
+    if legacy.exists():
+        sel = json.loads(legacy.read_text())
+        return {"timestamp_col": sel.get("timestamp_col")} if sel.get("timestamp_col") else None
+    return None
+
+
+def _sanitize_recipe(recipe: dict, meta: dict, payload: dict | None = None,
+                     intent: dict | None = None) -> None:
     """Recipe safety net applied to BOTH LLM and fallback output (in place).
 
     Fixes strategy/column mismatches that crash or corrupt the cleaner:
@@ -263,6 +277,14 @@ def _sanitize_recipe(recipe: dict, meta: dict, payload: dict | None = None) -> N
       heavy zero-inflation: the clip bounds collapse to a constant and the column's
       real values are destroyed (a 94%-zeros column failed the numeric_variance gate
       this way). Downgrade to "keep" — the gate should never see that again.
+
+    Intent-aware accuracy rules (only when the user confirmed forecast intent):
+    - target / exogenous / series-key / timestamp columns are never droppable
+    - a count-type target (event-ID column, agg "nunique") gets NO value fills and NO
+      outlier treatment — filling fabricates events, clipping an identifier is meaningless
+    - row-dropping (missing "drop_row", outlier "remove") is only allowed on the
+      timestamp and target columns: a null in an irrelevant column must never delete a
+      row that carries target signal (the vet event-log failure mode)
     """
     dtypes = {s["col"]: s.get("dtype_inferred") for s in meta.get("schema", [])}
     raw_dtypes = {s["col"]: s.get("dtype_raw", "") for s in meta.get("schema", [])}
@@ -272,14 +294,40 @@ def _sanitize_recipe(recipe: dict, meta: dict, payload: dict | None = None) -> N
     constant_cols = set((payload or {}).get("constant_cols", []))
     ts_col = recipe.get("timestamp_col")
 
+    target_col = (intent or {}).get("target_col")
+    count_target = target_col if (intent or {}).get("agg") == "nunique" else None
+    protected = {c for c in [
+        target_col, (intent or {}).get("timestamp_col"),
+        *((intent or {}).get("group_cols") or []),
+        *((intent or {}).get("exog_cols") or []),
+    ] if c}
+    row_drop_allowed = {ts_col, target_col} - {None}
+
     _IQR_FAMILY = {"clip_iqr", "rolling_iqr", "stl_residuals", "remove"}
 
     for col, cr in recipe.get("columns", {}).items():
         null_pct = nulls.get(col, {}).get("pct", 0)
-        if null_pct >= 95:
+        if col in protected:
+            # The forecast depends on this column — never droppable, even when a
+            # generic rule (ID-like, 95% null) would drop it. If it's truly unusable
+            # the validation gate fails loudly instead of the data silently vanishing.
+            cr["action"] = "keep"
+        elif null_pct >= 95:
             if cr.get("action") == "keep":
                 cr["action"] = "drop"
             continue
+
+        if count_target and col == count_target:
+            # Counting distinct events: fills would FABRICATE events, outlier logic on
+            # an identifier is meaningless. NaN ids are simply not counted.
+            cr["missing_strategy"] = "none"
+            cr["outlier_strategy"] = "keep"
+
+        if intent and col not in row_drop_allowed:
+            if cr.get("missing_strategy") == "drop_row":
+                cr["missing_strategy"] = "forward_fill"
+            if cr.get("outlier_strategy") == "remove":
+                cr["outlier_strategy"] = "keep"
 
         # Columns whose INFERRED type differs from their STORED type must be cast —
         # dtype_issues alone doesn't cover these (it only flags categorical-inferred
@@ -351,6 +399,7 @@ def run(run_id: str, use_llm: bool = True) -> dict:
     meta = json.loads(meta_path.read_text())
     all_cols = [s["col"] for s in meta.get("schema", [])]
     rows = meta.get("shape", {}).get("rows", 0)
+    intent = _load_intent(run_dir)
 
     recipe_source = "llm"
     recipe_error: str | None = None
@@ -364,6 +413,26 @@ def run(run_id: str, use_llm: bool = True) -> dict:
         recipe_source = "fallback"
         recipe = _rule_based_fallback(payload, all_cols, rows=rows)
     else:
+        # The confirmed forecast intent (when present) tells the model WHAT the cleaning
+        # is for — target/exog/series-key columns must survive, row-dropping is
+        # restricted, and a count-type target must not be filled or clipped. The
+        # sanitizer enforces all of this regardless; the prompt just aligns the model
+        # so its recipe usually passes untouched.
+        intent_block = ""
+        if intent:
+            intent_block = (
+                "\n\nFORECAST INTENT (clean to maximize accuracy of THIS forecast):\n"
+                + json.dumps({k: intent.get(k) for k in (
+                    "target_col", "agg", "timestamp_col", "scope",
+                    "group_cols", "exog_cols", "forecast_frequency")}, indent=2)
+                + "\nIntent rules:\n"
+                "- NEVER set action=drop on the target, exogenous, group, or timestamp columns.\n"
+                "- If agg is 'nunique', the target is an event ID being COUNTED: use "
+                "missing_strategy 'none' and outlier_strategy 'keep' for it.\n"
+                "- Use 'drop_row'/'remove' ONLY on the timestamp or target columns — "
+                "dropping rows for nulls/outliers in an irrelevant column deletes real "
+                "target signal.\n"
+            )
         messages = [
             {"role": "system", "content": _SYSTEM_PROMPT},
             {
@@ -371,6 +440,7 @@ def run(run_id: str, use_llm: bool = True) -> dict:
                 "content": (
                     "Here is the dataset quality report:\n\n"
                     + json.dumps(payload, indent=2)
+                    + intent_block
                     + "\n\nPlease return the cleaning recipe JSON."
                 ),
             },
@@ -425,21 +495,26 @@ def run(run_id: str, use_llm: bool = True) -> dict:
     recipe["frequency"] = freq_str
     recipe["period"] = _FREQ_PERIOD.get(freq_str, 7) if freq_str else 7
 
-    # User-confirmed timestamp always wins over LLM / fallback choice
-    selections_path = run_dir / "user_selections.json"
-    if selections_path.exists():
-        sel = json.loads(selections_path.read_text())
-        user_ts = sel.get("timestamp_col")
-        if user_ts:
-            recipe["timestamp_col"] = user_ts
-            recipe["sort_by_timestamp"] = True
-            # Re-derive frequency/period for the user-selected column
-            user_freq_str = freq_dict.get(user_ts) or freq_str
-            recipe["frequency"] = user_freq_str
-            recipe["period"] = _FREQ_PERIOD.get(user_freq_str, 7) if user_freq_str else 7
+    # User-confirmed timestamp always wins over LLM / fallback choice (from the intent
+    # file when present, else the legacy user_selections.json via _load_intent).
+    user_ts = (intent or {}).get("timestamp_col")
+    if user_ts:
+        recipe["timestamp_col"] = user_ts
+        recipe["sort_by_timestamp"] = True
+        # Re-derive frequency/period for the user-selected column
+        user_freq_str = freq_dict.get(user_ts) or freq_str
+        recipe["frequency"] = user_freq_str
+        recipe["period"] = _FREQ_PERIOD.get(user_freq_str, 7) if user_freq_str else 7
 
     # Runs after the user timestamp override so the ts-col rule targets the final choice.
-    _sanitize_recipe(recipe, meta, payload)
+    _sanitize_recipe(recipe, meta, payload, intent=intent)
+
+    # Thread the intent into the recipe so the executor stays recipe-driven: cleaner.py
+    # uses group_cols to run temporal strategies per series instead of across
+    # interleaved panel rows; target fields ride along for the validation gate/UI.
+    recipe["group_cols"] = (intent or {}).get("group_cols") or []
+    recipe["target_col"] = (intent or {}).get("target_col")
+    recipe["target_agg"] = (intent or {}).get("agg")
 
     (run_dir / "cleaning_recipe.json").write_text(json.dumps(recipe, indent=2))
     # Persist status so a reloaded run (/summary) can show the real source + error,

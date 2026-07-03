@@ -24,11 +24,16 @@ cleaning_agent.run(run_id, use_llm=True)   # LLM or rule-based fallback
 cleaner.run(run_id)
 validation_gate.run(run_id)
 
-from pipeline import forecasting_eda
-forecasting_eda.detect(run_id)   # Stage 4 phase A: suggest target/scope/group/horizon
-# (optionally write runs/{run_id}/forecast_user_selections.json to override suggestions)
-forecasting_eda.run(run_id)      # Stage 4 phase B: full stats + model_selection_payload.json
+from pipeline import forecast_intent, forecasting_eda
+from agents import forecast_intent_agent
+forecast_intent.detect(run_id)               # Stage 2.5: rule suggestions (before cleaning!)
+forecast_intent_agent.refine(run_id)         # optional LLM refinement of the suggestions
+# write runs/{run_id}/forecast_user_selections.json to confirm/override, then:
+cleaning_agent.run(run_id); cleaner.run(run_id); validation_gate.run(run_id)
+forecasting_eda.run(run_id)                  # Stage 4: full stats + model_selection_payload.json
 ```
+Note the order: intent (Stage 2.5) comes BEFORE cleaning — the recipe and the per-series
+execution both consume the confirmed intent.
 
 LLM provider is configured in `config/settings.yaml` — switch between `ollama`, `openai`, `gemini`, `groq` without touching code. Ollama runs locally; cloud providers need their key in `.env`.
 
@@ -84,9 +89,17 @@ Each stage is a standalone Python module in `pipeline/` with a single `run(run_i
 | 1 — Ingestion | `pipeline/ingest.py` | `runs/{id}/metadata.json`, `data/raw/{id}_raw.parquet` |
 | 2 — Pre-clean EDA | `pipeline/pre_clean_eda.py` | `runs/{id}/pre_clean_eda_full.json`, `runs/{id}/cleaning_decision_payload.json` |
 | 3 — Cleaning | `agents/cleaning_agent.py` → `pipeline/cleaner.py` | `cleaning_recipe.json`, `cleaning_status.json`, `data/cleaned/{id}_cleaned.parquet`, `cleaning_report.json`, `cleaned_metadata.json` |
+| 2.5 — Forecast intent | `pipeline/forecast_intent.py` (`detect()`) → `agents/forecast_intent_agent.py` (`refine()`) | `runs/{id}/forecast_intent.json` (suggestions + confidence + LLM rationale) |
 | 3.5 — Validation | `pipeline/validation_gate.py` | `runs/{id}/validation_gate.json` |
-| 4 — Forecast EDA | `pipeline/forecasting_eda.py` (`detect()` + `run()`) | `forecast_setup.json`, `forecast_user_selections.json`, `forecasting_eda_full.json`, `model_selection_payload.json` |
+| 4 — Forecast EDA | `pipeline/forecasting_eda.py` (`run()`) | `forecasting_eda_full.json`, `model_selection_payload.json` |
 | 5–8 | stubs in `pipeline/`, `agents/`, `models_lib/` | not yet implemented (`def run(): pass` / `def process(): pass`) |
+
+**Intent-first flow:** Stage 2.5 suggests every forecast choice (timestamp, target incl.
+count-of-events, scope, series key, exog, frequency, horizon) from Stage 1/2 evidence +
+the RAW parquet; the user confirms once on the Setup & Cleaning tab; `POST /clean` writes
+`forecast_user_selections.json` and the whole chain (clean → validate → forecast EDA)
+consumes it. Frequency/horizon can be adjusted later without re-cleaning
+(`POST /forecast-eda` overrides).
 
 Stage 3 is two-step: the LLM agent decides the recipe (`cleaning_agent.py`), then `cleaner.py` executes it. Both are called sequentially inside `api/tasks.py::clean_task`, which the `/runs/{id}/clean` endpoint runs via the job manager. The LLM only receives `cleaning_decision_payload.json`.
 
@@ -124,28 +137,27 @@ All routes are under `/runs` (defined in `api/routes.py`):
 | `/runs/{id}/pre-clean-eda` | POST | Stage 2 — pre-clean EDA, job-managed |
 | `/runs/{id}/clean` | POST | Stage 3 — cleaning agent + cleaner, job-managed (`use_llm` body flag) |
 | `/runs/{id}/validate` | POST | Stage 3.5 — validation gate only, job-managed |
-| `/runs/{id}/forecast-setup` | POST | Stage 4 phase A — detect forecast settings + confidence, job-managed |
-| `/runs/{id}/forecast-eda` | POST | Stage 4 phase B — full forecast EDA (body = confirmed selections), job-managed |
+| `/runs/{id}/forecast-intent` | POST | Stage 2.5 — detect + LLM-refine intent suggestions (`use_llm` body flag), job-managed |
+| `/runs/{id}/forecast-eda` | POST | Stage 4 — forecast EDA from confirmed intent (body = optional freq/horizon overrides only), job-managed |
 
 Every job-managed endpoint can return **409** (preempted by a newer job) — callers must handle this explicitly, not treat a non-200 as a generic failure.
 
 ### `runs/{run_id}/` Directory
 
-The `/runs/{id}/summary` endpoint reads all accumulated files to reconstruct full run state for the UI. `user_selections.json` is written by the `/clean` endpoint and always overrides the LLM's `timestamp_col` choice.
+The `/runs/{id}/summary` endpoint reads all accumulated files to reconstruct full run state for the UI (`_stage2`, `_intent`, `_stage3`, `_stage4`). `forecast_user_selections.json` is written by the `/clean` endpoint — it is the single confirmed-intent file every downstream stage reads (cleaning recipe, per-series cleaner execution, validation gate, forecast EDA). The legacy `user_selections.json` (timestamp only) is still read as a fallback for pre-refactor runs.
 
 Files in order of creation:
 ```
 metadata.json               # Stage 1
 pre_clean_eda_full.json     # Stage 2 (full stats)
 cleaning_decision_payload.json  # Stage 2 (LLM input)
-user_selections.json        # Stage 3 trigger (user's timestamp_col)
-cleaning_recipe.json        # Stage 3 (LLM or fallback output)
+forecast_intent.json        # Stage 2.5 (suggestions + confidence + LLM rationale)
+forecast_user_selections.json  # confirm trigger (ts/target/agg/scope/group/exog/freq/horizon)
+cleaning_recipe.json        # Stage 3 (LLM or fallback output; carries group_cols/target)
 cleaning_status.json        # Stage 3 (recipe_source + recipe_error, survives reload)
 cleaning_report.json        # Stage 3 (before/after metrics)
 cleaned_metadata.json       # Stage 3 (lightweight snapshot)
 validation_gate.json        # Stage 3.5
-forecast_setup.json         # Stage 4 phase A (detected suggestions + confidence)
-forecast_user_selections.json  # Stage 4 trigger (confirmed target/scope/group/freq/horizon)
 forecasting_eda_full.json   # Stage 4 (all stats + downsampled plot arrays)
 model_selection_payload.json   # Stage 4 (compact decision JSON for Stage 5)
 ```
@@ -156,13 +168,16 @@ model_selection_payload.json   # Stage 4 (compact decision JSON for Stage 5)
 
 1. Drop columns (`action = "drop"`)
 2. Type fixes (`type_fix`)
-3. Outlier handling — rows marked `"remove"` are **collected**, not dropped yet
-4. Missing handling — rows marked `"drop_row"` are **collected**, not dropped yet
-5. All accumulated row-drop masks applied once (prevents double-counting rows that match multiple criteria)
-6. Drop duplicates
-7. Sort by timestamp
+3. **Sort by (series, time)** — `recipe.group_cols` (from the confirmed intent) + timestamp. Temporal strategies and per-series execution both assume time order and contiguous series; the raw parquet guarantees neither
+4. Outlier handling — rows marked `"remove"` are **collected**, not dropped yet
+5. Missing handling — rows marked `"drop_row"` are **collected**, not dropped yet
+6. All accumulated row-drop masks applied once (prevents double-counting rows that match multiple criteria)
+7. Drop duplicates
+8. Sort by timestamp (final output order)
 
 Outlier handling runs *before* missing-value handling — a column can still contain NaN when `_apply_outlier()` runs. This matters for any vectorized outlier math added later (see the rolling-quantile note below).
+
+**Per-series execution:** when `recipe.group_cols` is non-empty, every series-boundary-sensitive operation runs WITHIN each series via groupby: `rolling_iqr`, `stl_residuals`, `interpolate`, `forward_fill`/`backward_fill`, `flag_and_fill`, `mean_fill`/`median_fill` (per-series statistic), and the `remove` strategy's IQR fences (per-series quantile transform). A forward-fill must never carry one society's last value into the next society's first row, and a small series' normal values are outliers only relative to ITS OWN distribution. Global-distribution strategies (`clip_iqr`, `winsorize`, `log_transform`) deliberately stay global. Per-series STL is gated at `_STL_MAX_GROUPS` (20) — past that many series the O(n) classical decomposition runs inside every series instead (statsmodels STL × 1,800 series would take tens of minutes).
 
 ### Outlier Strategies (Stage 3)
 
@@ -177,7 +192,7 @@ The `frequency` and `period` fields in `cleaning_recipe.json` drive these window
 
 ### Validation Gate (Stage 3.5)
 
-Every check has a `severity`: **blocking** checks decide `passed` (they catch data destruction); **warning** checks surface forecasting risks without failing the run (shown with a yellow badge in the UI). Blocking: row_loss (%, configurable), series_length (absolute 30 — statistical floor, deliberately not a percentage), no_null_regression (columns with a `type_fix` are exempt — coercing junk strings to NaN is a repair, not a regression), numeric_variance (relative: only fails if cleaning *destroyed* variance that existed before — an already-constant column isn't cleaning's fault), timestamp_nulls, forecastable_columns (≥ 1 numeric column with variance must survive), timestamp_monotonic (parses to datetime before checking — string-sorted dates pass a naive string comparison while being chronologically wrong). Warnings: future_timestamps, seasonal_history (≥ 2 cycles of the recipe period).
+Every check has a `severity`: **blocking** checks decide `passed` (they catch data destruction); **warning** checks surface forecasting risks without failing the run (shown with a yellow badge in the UI). Blocking: row_loss (%, configurable), series_length (absolute 30 — statistical floor — measured as **distinct periods at the forecast frequency** when a timestamp exists: a 4.5M-row event log spanning 90 days is a 90-point series), no_null_regression (columns with a `type_fix` are exempt — coercing junk strings to NaN is a repair, not a regression), numeric_variance (relative: only fails if cleaning *destroyed* variance that existed before), timestamp_nulls, forecastable_columns (≥ 1 numeric column with variance — **skipped for count-type intents**, where an event log with zero numeric measures is perfectly forecastable), **target_survived** (the confirmed target must exist post-cleaning; measure targets need variance, count targets need non-null IDs), **group_cols_survived** (per-series scope), timestamp_monotonic (parses to datetime before checking — string-sorted dates pass a naive string comparison while being chronologically wrong). Warnings: future_timestamps, seasonal_history, per_series_history (panel median series ≥ 2 cycles).
 
 Thresholds in `config/settings.yaml` under `validation_gate`:
 - `max_row_loss_pct: 15` — fail if cleaning drops > 15% of rows
@@ -187,29 +202,39 @@ Thresholds in `config/settings.yaml` under `validation_gate`:
 
 Deterministic safety net applied to BOTH LLM and fallback recipes, after the user timestamp override. It exists because prompt guidance is not a guarantee — every rule here reverts an observed real failure: ≥95%-null columns → drop; timestamp col → always `drop_row` + never droppable; inferred-vs-stored dtype mismatches → forced `cast_numeric`/`parse_datetime` (dtype_issues alone only covers categorical-inferred columns — without the forced cast the cleaned parquet ships string "numerics" and zero forecast targets); non-numeric fills → `forward_fill`; IQR-family outlier strategies (incl. stl_residuals/remove) on columns with IQR = 0 or ≥50% zeros → `keep` (quartiles collapse and the column gets destroyed — a 94%-zeros column once failed the variance gate this way); unjustified column drops → reverted (an LLM run once dropped the entire `total_*` measure family — the forecast targets; drops must be provably no-signal: constant, ~all-null, per-row ID, or audit-named).
 
+**Intent-aware accuracy rules** (only when `forecast_user_selections.json` exists): target / exogenous / series-key / timestamp columns are **never droppable** (even when a generic rule would drop them — the gate fails loudly instead of data silently vanishing); a count-type target (`agg: nunique`) gets NO fills and NO outlier treatment (filling fabricates events, clipping an identifier is meaningless — nunique simply skips NaN); row-dropping (`drop_row`/`remove`) is only allowed on the timestamp and target columns — a null in an irrelevant column (e.g. `Member Contact`) must never delete a row that carries target signal (the vet event-log failure mode). The recipe also carries `group_cols`/`target_col`/`target_agg` so the cleaner and gate stay recipe-driven.
+
 ### LLM recipe inputs
 
 `cleaning_decision_payload.json` includes `column_profile` (per column: dtype, null_pct, distinct_pct, zero_pct, skew) and `n_rows` — statistics only, never raw values (~900 tokens on a 19-col dataset). This is what lets the model choose strategies from evidence (zero-inflation → no IQR clipping, skew → median over mean fill, distinct_pct ≈ 100 → ID column). LLM `temperature` is configurable in `settings.yaml` (default 0.2 — provider default 1.0 produced wildly inconsistent recipes; the sanitizer guarantees safety regardless).
 
+### Forecast Intent (Stage 2.5)
+
+`pipeline/forecast_intent.py::detect()` runs on Stage 1/2 evidence + the **raw** parquet (cleaning hasn't happened yet) and suggests every intent field with `confidence: high|medium|low` — low renders a yellow "confirm" badge in the UI, it never blocks. Key detection logic:
+- **Timestamps** ranked business-vs-audit (`created/loaded/inserted…` names lose); multiple business timestamps (vet data has 3 event times) → low confidence, the user picks.
+- **Targets** = numeric measures (name-heuristics + variance; ties like eight `total_*` measures → low) **plus count candidates**: high-distinct columns with event-identity names (visit/order/ticket/receipt…), `agg_hint: nunique` — "number of visits per day" is `nunique(VISIT ID)` resampled daily.
+- **Event-log mode** (no convincing measure + a count candidate): group candidates switch from `(key, ts)`-uniqueness scoring (meaningless when every row is one event) to name-ranked categorical *dimensions* (facility/region/category), and hourly event timestamps suggest `daily` forecast frequency.
+- **Panel mode**: group-key scoring by `(key, ts)` uniqueness, trying **pairs** of the best singles when no single reaches 0.995 (Favorita needs `store_nbr × family`); measure/rate-named columns are excluded from keys.
+
+`agents/forecast_intent_agent.py::refine()` is the LLM pass (mirrors the cleaning agent: pydantic enums, statistics + column names only, ~1.5KB payload). Its sanitizer is **field-level**: an invalid field reverts to the rule suggestion for that field only, never rejecting the whole response. LLM confidence is dampened to at most one level above the rule confidence (small models are overconfident on genuine ties). Failure → rule suggestions stand, error recorded in `forecast_intent.json → llm` for the UI banner.
+
 ### Forecast EDA (Stage 4)
 
-`pipeline/forecasting_eda.py` — runs on **cleaned data only**, all statistics computed in Python (no LLM in computation; Stage 5 will only ever see `model_selection_payload.json`). Two-phase because the user must confirm choices before any heavy analysis:
-
-- **`detect()` (phase A, ~5s on 3M rows)** — suggests target column, aggregate-vs-per-series scope, series group key, aggregation, forecast frequency and horizon, each with `confidence: high|medium|low`. Low confidence renders a yellow "confirm" badge in the UI, it never blocks. Panel detection = duplicate-timestamp fraction > 5%; group-key detection scores `(key, ts)` uniqueness and tries **pairs** of the best single columns when no single column reaches 0.995 (Favorita needs `store_nbr × family`). Target ranking is name-heuristics + variance — ties (e.g. eight `total_*` measures) correctly yield `low` confidence.
-- **`run()` (phase B, ~40s aggregate / ~140s per-series on 3M rows)** — reads `forecast_user_selections.json` (falls back to detect()'s suggestions per field). Computes: STL strengths per candidate period (primary period = **max seasonal strength**, not the frequency default — the milk data is annual-365, not weekly-7), FFT peaks, ACF/PACF + significant lags, ADF/KPSS + `ndiffs`/`nsdiffs` (ADF/KPSS/PP consensus via pmdarima), spectral/sample/approx entropy + DFA (antropy), ADI/CV² intermittency quadrant, heteroskedasticity → log-transform recommendation, structural breaks (ruptures), Ljung-Box on STL residuals, exog cross-correlation (positive lags = usable lead) and VIF.
+`pipeline/forecasting_eda.py::run()` — runs on **cleaned data only**, all statistics computed in Python (no LLM in computation; Stage 5 will only ever see `model_selection_payload.json`). Reads the confirmed intent (`_resolve_selections`: selections file → intent suggestions → cleaning recipe for ts/frequency, so pre-refactor runs still resolve). ~40s aggregate / ~140s per-series on 3M rows. Computes: STL strengths per candidate period (primary period = **max seasonal strength**, not the frequency default — the milk data is annual-365, not weekly-7), FFT peaks, ACF/PACF + significant lags, ADF/KPSS + `ndiffs`/`nsdiffs` (ADF/KPSS/PP consensus via pmdarima), spectral/sample/approx entropy + DFA (antropy), ADI/CV² intermittency quadrant, heteroskedasticity → log-transform recommendation, structural breaks (ruptures), Ljung-Box on STL residuals, exog cross-correlation (positive lags = usable lead) and VIF.
 
 Gotchas encoded in the module:
-- **Empty grid bins**: `resample().sum(min_count=1)` so empty bins are NaN, then filled with **0 when zero-inflated sum-aggregated demand** (absent period = zero demand — required for honest ADI) vs time-interpolation otherwise. `fill_report` records which.
-- Per-series scope computes a **vectorized panel summary** (one groupby: per-series length/ADI/CV²/class mix) + deep-dive stats on top-K series by volume — this feeds the global-ML vs per-series-classical routing decision in Stage 5. The aggregate series is *always* analyzed too.
+- **Empty grid bins**: `resample().sum(min_count=1)` so empty bins are NaN, then filled with **0 when zero-inflated sum-aggregated demand** (absent period = zero demand — required for honest ADI) vs time-interpolation otherwise. For **count aggs (`nunique`/`count`) empty bins are TRUE zeros** (no events), never missing. `fill_report` records which.
+- A non-numeric target with `sum`/`mean` is force-switched to `nunique` (recorded as `agg_forced`).
+- Per-series scope computes a **vectorized panel summary** (one groupby: per-series length/ADI/CV²/class mix; computed on per-period counts for count targets) + deep-dive stats on top-K series by volume — this feeds the global-ML vs per-series-classical routing decision in Stage 5. The aggregate series is *always* analyzed too.
 - All O(n²)/slow stats are capped via `config/settings.yaml → forecast_eda` (`entropy_max_points`, `stat_test_max_points`, `stl_max_points` — above which classical `seasonal_decompose` replaces STL).
 - Timestamp column is defensively re-parsed (`pd.to_datetime`) — stale cleaned parquets can carry string dates.
 - Plot arrays in `forecasting_eda_full.json` are downsampled to `plot_max_points` (JSON stays ~150–500KB; it travels through the store).
 
-Frontend: `frontend/fcst_eda_view.py` is **pure rendering** (form + verdict tiles + Plotly charts); the three callbacks (`run_forecast_setup`, `run_forecast_eda`, `toggle_fcst_group`) live in callbacks.py and follow all its rules. `run_cleaning` auto-triggers `/forecast-setup` after validation (same pattern as ingest auto-triggering Stage 2) and **drops any stale `_stage4`** from the store since cleaning rewrote the parquet. Chart colors are dataviz-validated against the `#161b2e` card surface: series `#6366f1`, trend `#059669`, seasonal `#d97706`, residual `#e66767`.
+Frontend split: `frontend/intent_view.py` renders the Setup & Cleaning tab's intent form (confidence badges, LLM rationale banner, always-visible series-key picker — group cols drive per-series *cleaning* even in aggregate scope); `frontend/fcst_eda_view.py` renders the results-only Forecast EDA tab (intent recap + freq/horizon-only re-run + verdict tiles + Plotly charts). Callbacks: `confirm_and_run` (the one chain: `/clean` → `/validate` → `/forecast-eda`, drops stale `_stage4`, lands on the Forecast EDA tab on success), `run_intent_redetect`, `rerun_fcst_eda`; `trigger_run`/`run_eda_retry` auto-chain `/forecast-intent` after Stage 2. Chart colors are dataviz-validated against the `#161b2e` card surface: series `#6366f1`, trend `#059669`, seasonal `#d97706`, residual `#e66767`.
 
 ### Frontend — Tab-based UI (Dash 4.3.0)
 
-The UI is a single-page Dash app with a **static tab bar** (`dcc.Tabs` in `frontend/layout.py`, `_build_tabs()`) — one tab per pipeline stage (Data & Pre-clean EDA, Cleaning, Forecast EDA, Model Select, Training, Results). All state lives in `dcc.Store(id="results-store", storage_type="session")` — session storage matters: the default (`memory`) is wiped on every page refresh, which previously made the UI look randomly broken.
+The UI is a single-page Dash app with a **static tab bar** (`dcc.Tabs` in `frontend/layout.py`, `_build_tabs()`) — one tab per pipeline stage (Data & Pre-clean EDA, Setup & Cleaning, Forecast EDA, Model Select, Training, Results). All state lives in `dcc.Store(id="results-store", storage_type="session")` — session storage matters: the default (`memory`) is wiped on every page refresh, which previously made the UI look randomly broken.
 
 **All tab panes stay mounted; tab switching is clientside-only.** The layout has six always-present pane divs (`pane-data` … `pane-results`) inside `tab-content`; a `clientside_callback` on `stage-tabs.value` toggles their `style.display`. Server callbacks re-render only the data-dependent bodies (`data-tab-results`, `clean-tab-body`, `past-runs-list`, the ingestion form/loaded-state toggle) and only on `results-store` changes — one round trip per store change (`render_data_pane`), zero per tab switch. Do **not** go back to rebuilding tab content on `stage-tabs.value` (the old `render_tab` pattern): constant unmount/remount of components triggered both renderer bugs below on every switch, and pinned the server for pure UI navigation. Keeping the form mounted also preserves typed DB credentials across tab switches.
 
@@ -236,7 +261,7 @@ Verified in this codebase: `running=` works on a plain synchronous `@callback` �
 **Critical Dash 4 patterns used here:**
 - Global `@callback` decorator (not `@app.callback`)
 - `app.py` forces `Cache-Control: no-store` on the index page (and `/_dash-layout`, `/_dash-dependencies`). Inline clientside callback functions ship *inside* the index HTML; a browser-cached stale index combined with live-fetched dependencies crashes any clientside callback added since with "Cannot read properties of undefined (reading 'apply')". Fingerprinted `_dash-component-suites` bundles stay cacheable.
-- `suppress_callback_exceptions=True` — still required for the components rendered dynamically inside the pane bodies (`btn-run-cleaning`, `dropdown-ts-confirm`, `btn-run-eda`, `btn-clear-results`)
+- `suppress_callback_exceptions=True` — still required for the components rendered dynamically inside the pane bodies (`btn-confirm-run`, the `dropdown-intent-*` family, `btn-fcst-rerun`, `btn-run-eda`, `btn-clear-results`)
 - `allow_duplicate=True` on secondary callbacks that share an output with a primary callback
 - `dcc.Loading` with `target_components={"component-id": "prop"}` to show spinners near buttons when the actual output target is elsewhere in the layout (e.g. the root-level `cleaning-status` div, or `results-store.data` for the broad loading overlay wrapping `tab-content`)
 

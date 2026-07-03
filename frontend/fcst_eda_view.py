@@ -1,9 +1,10 @@
 """Forecast EDA tab — pure rendering (no callbacks; those live in callbacks.py).
 
-Builds the Stage 4 pane from ``results-store``'s ``_stage4`` key:
-  setup       — detect()'s suggestions (target/scope/group/frequency + confidence)
-  selections  — what the user last confirmed and ran
-  eda         — {"payload": model_selection_payload, "full": forecasting_eda_full}
+Results-only since the intent-first refactor: every choice (target, scope, series key,
+frequency, horizon, exog) was confirmed on the Setup & Cleaning tab and Stage 4 ran as
+part of the confirm chain. This tab shows the outcome from ``_stage4.eda`` plus a
+compact recap of the confirmed intent, and offers a frequency/horizon-only re-run
+(those two don't affect cleaning, so adjusting them must not force a re-clean).
 
 Chart styling: dark-surface palette validated against #161b2e (indigo #6366f1 series,
 emerald #059669 trend, amber #d97706 seasonal, red #e66767 residual — all ≥3:1 contrast,
@@ -16,6 +17,8 @@ import dash_bootstrap_components as dbc
 import plotly.graph_objects as go
 from dash import dcc, html, dash_table
 from plotly.subplots import make_subplots
+
+from frontend import intent_view
 
 _TEXT = "var(--bs-body-color)"
 _CHART_BG = "#161b2e"
@@ -225,134 +228,44 @@ def _verdict_tiles(payload):
                     style={"borderLeft": "3px solid #6366f1"})
 
 
-# ── Settings form ────────────────────────────────────────────────────────────
+# ── Frequency/horizon adjust mini-form (Stage-4-only re-run) ─────────────────
 
-def _settings_form(setup, selections, eda_exists):
-    selections = selections or {}
-    target_info = setup.get("target", {})
-    group_info = setup.get("group", {})
-    freq_info = setup.get("frequency", {})
-    is_panel = setup.get("is_panel", False)
+def _adjust_form(data, eda_exists):
+    intent = data.get("_intent") or {}
+    selections = intent.get("selections") or {}
+    suggestions = intent.get("suggestions") or {}
+    freq_current = (selections.get("forecast_frequency")
+                    or suggestions.get("frequency", {}).get("suggested"))
+    freq_opts = suggestions.get("frequency", {}).get("options") or (
+        [freq_current] if freq_current else [])
+    horizon_current = selections.get("horizon") or suggestions.get("horizon", {}).get("suggested", 12)
 
-    candidates = target_info.get("candidates", [])
-    target_default = selections.get("target_col") or target_info.get("suggested")
-    cand_agg = {c["col"]: c.get("agg_hint", "sum") for c in candidates}
-    target_options = [{"label": c["col"], "value": c["col"]} for c in candidates]
-
-    scope_default = selections.get("scope") or setup.get("scope", {}).get("suggested", "aggregate")
-    group_default = selections.get("group_cols") or group_info.get("suggested", [])
-    col_nunique = group_info.get("column_nunique", {})
-    group_options = [{"label": f"{c}  ({n:,} values)", "value": c}
-                     for c, n in sorted(col_nunique.items(), key=lambda kv: kv[1])]
-    agg_default = selections.get("agg") or cand_agg.get(target_default, "sum")
-
-    exog_cands = setup.get("exogenous", {}).get("candidates", [])
-    exog_default = (selections.get("exog_cols") if selections.get("exog_cols") is not None
-                    else [c for c in exog_cands if c != target_default])
-
-    freq_default = selections.get("forecast_frequency") or freq_info.get("suggested")
-    freq_options = [{"label": f.capitalize(), "value": f} for f in freq_info.get("options", [])]
-    horizon_default = selections.get("horizon") or setup.get("horizon", {}).get("suggested", 12)
-
-    if is_panel:
-        panel_note = (f"Panel data detected: ~{setup.get('rows_per_timestamp', 0):,.0f} rows "
-                      f"per timestamp across {setup.get('n_timestamps', 0):,} timestamps. "
-                      "'Overall' aggregates all series; 'Per-series' also profiles each series.")
-    else:
-        panel_note = "Single continuous series detected — no per-series grouping needed."
-
-    return dbc.Card(
-        dbc.CardBody([
-            html.Div([
-                html.P([_cicon("bi-sliders"), "Confirm Forecast Settings"],
-                       className="fw-semibold mb-0", style={"color": "#c7d2fe"}),
-                dbc.Button([_cicon("bi-arrow-clockwise"), "Re-detect"],
-                           id="btn-fcst-setup", color="link", size="sm",
-                           className="p-0 text-decoration-none"),
-            ], className="d-flex justify-content-between align-items-center mb-2"),
-            html.P(panel_note, style={"fontSize": "0.75rem", "color": "#64748b"},
-                   className="mb-3"),
-
-            dbc.Row([
-                dbc.Col([
-                    _lbl("Target column (what to forecast)", target_info.get("confidence")),
-                    dcc.Dropdown(id="dropdown-fcst-target", options=target_options,
-                                 value=target_default, clearable=False,
-                                 style={"fontSize": "0.85rem"}),
-                ], md=4),
-                dbc.Col([
-                    _lbl("Scope", setup.get("scope", {}).get("confidence")),
-                    dcc.RadioItems(
-                        id="radio-fcst-scope",
-                        options=[
-                            {"label": "  Overall (aggregate)", "value": "aggregate"},
-                            {"label": "  Per-series (panel)", "value": "per_series"},
-                        ],
-                        value=scope_default,
-                        inputStyle={"marginRight": "6px", "accentColor": "#6366f1"},
-                        labelStyle={"display": "block", "marginBottom": "4px",
-                                    "cursor": "pointer", "color": "#94a3b8",
-                                    "fontSize": "0.82rem"},
-                    ),
-                ], md=4),
-                dbc.Col([
-                    _lbl("Aggregation"),
-                    dcc.Dropdown(
-                        id="dropdown-fcst-agg",
-                        options=[{"label": "Sum (totals, demand)", "value": "sum"},
-                                 {"label": "Mean (rates, percentages)", "value": "mean"}],
-                        value=agg_default, clearable=False, style={"fontSize": "0.85rem"},
-                    ),
-                ], md=4),
-            ], className="mb-3"),
-
-            html.Div(id="fcst-group-wrap", children=[
-                _lbl("Series key (what identifies one series)", group_info.get("confidence")),
-                dcc.Dropdown(id="dropdown-fcst-group", options=group_options,
-                             value=group_default, multi=True,
-                             placeholder="Select grouping column(s)…",
-                             style={"fontSize": "0.85rem"}),
-            ], className="mb-3",
-               style={} if scope_default == "per_series" else {"display": "none"}),
-
-            dbc.Row([
-                dbc.Col([
-                    _lbl("Exogenous drivers (optional)"),
-                    dcc.Dropdown(id="dropdown-fcst-exog",
-                                 options=[{"label": c, "value": c} for c in exog_cands],
-                                 value=exog_default, multi=True,
-                                 placeholder="No exogenous columns",
-                                 style={"fontSize": "0.85rem"}),
-                ], md=6),
-                dbc.Col([
-                    _lbl("Forecast frequency", freq_info.get("confidence")),
-                    dcc.Dropdown(id="dropdown-fcst-freq", options=freq_options,
-                                 value=freq_default, clearable=False,
-                                 style={"fontSize": "0.85rem"}),
-                ], md=3),
-                dbc.Col([
-                    _lbl("Horizon (periods)"),
-                    dbc.Input(id="input-fcst-horizon", type="number", min=1, step=1,
-                              value=horizon_default, size="sm"),
-                ], md=3),
-            ], className="mb-3"),
-
+    return dbc.Card(dbc.CardBody(dbc.Row([
+        dbc.Col([
+            _lbl("Forecast frequency"),
+            dcc.Dropdown(id="dropdown-fcst-freq",
+                         options=[{"label": str(f).capitalize(), "value": f} for f in freq_opts],
+                         value=freq_current, clearable=False,
+                         style={"fontSize": "0.85rem"}),
+        ], md=4),
+        dbc.Col([
+            _lbl("Horizon (periods)"),
+            dbc.Input(id="input-fcst-horizon", type="number", min=1, step=1,
+                      value=horizon_current, size="sm"),
+        ], md=3),
+        dbc.Col([
             dcc.Loading(
                 dbc.Button(
                     [_cicon("bi-graph-up"),
                      "Re-run Forecast EDA" if eda_exists else "Run Forecast EDA"],
-                    id="btn-run-fcst-eda", color="primary", className="w-100",
-                    disabled=target_default is None,
-                    style={"fontWeight": "600", "letterSpacing": "0.02em"},
+                    id="btn-fcst-rerun", color="primary", className="w-100 mt-4",
+                    style={"fontWeight": "600"},
                 ),
                 type="circle", color="#6366f1", delay_show=100,
                 target_components={"cleaning-status": "children"},
             ),
-        ]),
-        className="mb-3",
-        style={"background": "rgba(30, 41, 59, 0.7)",
-               "border": "1px solid rgba(99, 102, 241, 0.3)"},
-    )
+        ], md=5),
+    ])), className="mb-3")
 
 
 # ── Results sections ─────────────────────────────────────────────────────────
@@ -567,12 +480,14 @@ def _results_section(stage4):
     sections.append(_verdict_tiles(payload))
 
     if plot_data.get("series"):
-        scope_label = "aggregate of all series" if selections.get("scope") == "per_series" \
-            or stage4.get("setup", {}).get("is_panel") else "full series"
+        agg_label = {"sum": "sum", "mean": "mean", "nunique": "distinct count",
+                     "count": "count"}.get(selections.get("agg"), "")
+        scope_label = ("aggregate of all series" if selections.get("scope") == "per_series"
+                       else "overall series")
         sections.append(_chart_card(
             f"{target} — Analysis Series", "bi-graph-up",
             _graph(_series_fig(plot_data["series"], target)),
-            subtitle=f"Regularized to {selections.get('forecast_frequency', '')} grid "
+            subtitle=f"{agg_label} per {selections.get('forecast_frequency', '')} period "
                      f"({scope_label}).",
         ))
 
@@ -609,18 +524,29 @@ def _results_section(stage4):
 # ── Tab entry point ──────────────────────────────────────────────────────────
 
 def render_fcst_eda_tab(data):
-    if not data or "_stage3" not in data:
+    if not data:
         return html.Div(
             [_cicon("bi-info-circle", fontSize="2rem", color="#334155",
                     display="block", marginBottom="12px", marginRight="0"),
-             html.P("Run cleaning on the Cleaning tab first — forecast EDA works on "
-                    "cleaned data only.",
+             html.P("Load a dataset on the Data tab first.",
                     style={"color": "#64748b", "fontSize": "0.9rem"})],
             className="text-center mt-5 pt-4",
         )
 
     stage4 = data.get("_stage4") or {}
-    setup = stage4.get("setup")
+    eda_exists = bool((stage4.get("eda") or {}).get("payload"))
+    intent = data.get("_intent") or {}
+    selections = intent.get("selections") or {}
+
+    if not eda_exists and not data.get("_stage3"):
+        return html.Div(
+            [_cicon("bi-info-circle", fontSize="2rem", color="#334155",
+                    display="block", marginBottom="12px", marginRight="0"),
+             html.P("Confirm the forecast setup on the Setup & Cleaning tab — the "
+                    "pipeline runs cleaning, validation and forecast EDA in one go.",
+                    style={"color": "#64748b", "fontSize": "0.9rem"})],
+            className="text-center mt-5 pt-4",
+        )
 
     header = html.Div([
         html.Span([_cicon("bi-graph-up"), "Forecast EDA"],
@@ -637,32 +563,25 @@ def render_fcst_eda_tab(data):
             color="danger", className="py-2 mb-3",
         )]
 
-    if not setup:
+    summary = intent_view.intent_summary_bar(
+        selections or (stage4.get("eda") or {}).get("full", {}).get("selections") or {})
+
+    if not eda_exists:
         return html.Div([
             header, *val_warn,
-            dbc.Card(dbc.CardBody([
-                html.P([_cicon("bi-sliders"), "Detect Forecast Settings"],
-                       className="fw-semibold mb-2", style={"color": "#c7d2fe"}),
-                html.P("Scans the cleaned data and suggests the forecast target, "
-                       "series grouping, and horizon — you confirm everything before "
-                       "any analysis runs.",
-                       style={"fontSize": "0.8rem", "color": "#94a3b8"}),
-                dcc.Loading(
-                    dbc.Button([_cicon("bi-search"), "Detect Forecast Settings"],
-                               id="btn-fcst-setup", color="primary",
-                               style={"fontWeight": "600"}),
-                    type="circle", color="#6366f1", delay_show=100,
-                    target_components={"cleaning-status": "children"},
-                ),
-            ]), className="mb-3",
-                style={"background": "rgba(30, 41, 59, 0.7)",
-                       "border": "1px solid rgba(99, 102, 241, 0.3)"}),
+            *( [summary] if summary else [] ),
+            dbc.Alert(
+                [_cicon("bi-info-circle"),
+                 "Cleaning is done but forecast EDA hasn't produced results yet — "
+                 "run it below."],
+                color="secondary", className="py-2 mb-3"),
+            _adjust_form(data, eda_exists=False),
         ])
 
-    eda_exists = bool((stage4.get("eda") or {}).get("payload"))
     return html.Div([
         header,
         *val_warn,
-        _settings_form(setup, stage4.get("selections"), eda_exists),
+        *( [summary] if summary else [] ),
+        _adjust_form(data, eda_exists=True),
         *_results_section(stage4),
     ])

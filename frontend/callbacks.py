@@ -31,7 +31,7 @@ import requests
 import dash_bootstrap_components as dbc
 from dash import Input, Output, State, dcc, html, dash_table, no_update, callback, ALL, ctx, clientside_callback
 
-from frontend import fcst_eda_view
+from frontend import fcst_eda_view, intent_view
 from frontend.layout import RUNS_LIST_STYLE, RUNS_LIST_STYLE_LOCKED, TAB_VALUES
 
 API_URL = os.environ.get("API_URL", "http://localhost:8000")
@@ -101,6 +101,19 @@ clientside_callback(
     [Output(v.replace("tab-", "pane-"), "style") for v in TAB_VALUES],
     Input("stage-tabs", "value"),
 )
+
+
+def _fetch_intent(run_id: str) -> dict | None:
+    """Stage 2.5 auto-chain: detect + LLM-refine the forecast-intent suggestions right
+    after pre-clean EDA. Failure is non-fatal — the Setup & Cleaning tab has a Detect
+    button as the retry path."""
+    try:
+        resp = requests.post(f"{API_URL}/runs/{run_id}/forecast-intent", timeout=900)
+        if resp.ok:
+            return resp.json().get("intent")
+    except Exception:
+        pass
+    return None
 
 
 def _save_upload(contents: str, filename: str) -> str:
@@ -296,6 +309,11 @@ def trigger_run(n_clicks, source, table, query, host, port, database, user, pass
             eda_resp = requests.post(f"{API_URL}/runs/{run_id}/pre-clean-eda", timeout=600)  # 10 min for large tables
             if eda_resp.ok:
                 full_data["_stage2"] = eda_resp.json()
+                # Auto-chain Stage 2.5: intent suggestions are ready by the time the
+                # user opens the Setup & Cleaning tab.
+                intent = _fetch_intent(run_id)
+                if intent:
+                    full_data["_intent"] = {"suggestions": intent}
             else:
                 detail = eda_resp.json().get("detail", "unknown error")
                 return full_data, dbc.Alert(
@@ -699,6 +717,9 @@ def run_eda_retry(n_clicks, store_data):
             detail = resp.json().get("detail", "Pre-clean EDA failed")
             return no_update, dbc.Alert(detail, color="danger", dismissable=True, className="mb-2")
         new_store = {**store_data, "_stage2": resp.json()}
+        intent = _fetch_intent(run_id)
+        if intent:
+            new_store["_intent"] = {"suggestions": intent}
         return new_store, ""
     except requests.exceptions.ConnectionError:
         return no_update, dbc.Alert(
@@ -823,73 +844,115 @@ def _fmt(v: float) -> str:
     return f"{v:,.4f}" if abs(v) < 1e6 else f"{v:,.2f}"
 
 
-# ── 11. Stage 3: run cleaning ─────────────────────────────────────────────────
-# Outputs to cleaning-status (persistent in layout) instead of btn-run-cleaning
-# or cleaning-alert (both are dynamically rendered), so the store update always
-# reaches the pane renderers regardless of component lifecycle timing in Dash 4.
+# ── 11. Confirm intent → clean → validate → forecast EDA (one chain) ─────────
+# The Setup & Cleaning tab's confirm button drives the whole pipeline through Stage 4.
+# Outputs to cleaning-status (persistent in layout) instead of any dynamically rendered
+# component, so the store update always reaches the pane renderers regardless of
+# component lifecycle timing in Dash 4. On full success the UI lands on Forecast EDA.
 
 @callback(
     Output("results-store", "data", allow_duplicate=True),
     Output("cleaning-status", "children"),
-    Input("btn-run-cleaning", "n_clicks"),
+    Output("stage-tabs", "value", allow_duplicate=True),
+    Input("btn-confirm-run", "n_clicks"),
     State("results-store", "data"),
-    State("dropdown-ts-confirm", "value"),
+    State("dropdown-intent-ts", "value"),
+    State("dropdown-intent-target", "value"),
+    State("dropdown-intent-agg", "value"),
+    State("radio-intent-scope", "value"),
+    State("dropdown-intent-group", "value"),
+    State("dropdown-intent-exog", "value"),
+    State("dropdown-intent-freq", "value"),
+    State("input-intent-horizon", "value"),
     State("switch-use-llm", "value"),
-    running=[(Output("btn-run-cleaning", "disabled"), True, False)],
+    running=[(Output("btn-confirm-run", "disabled"), True, False)],
     prevent_initial_call=True,
 )
-def run_cleaning(n_clicks, store_data, ts_val, use_llm):
+def confirm_and_run(n_clicks, store_data, ts, target, agg, scope, group_cols,
+                    exog, freq, horizon, use_llm):
     if not n_clicks or not store_data:
-        return no_update, no_update
+        return no_update, no_update, no_update
     run_id = store_data.get("run_id")
     if not run_id:
-        return no_update, dbc.Alert("No active run found.", color="warning", className="mb-2")
+        return no_update, dbc.Alert("No active run found.", color="warning", className="mb-2"), no_update
+    if not ts or not target:
+        return no_update, dbc.Alert(
+            "Confirm the timestamp and target columns first.",
+            color="warning", dismissable=True, className="mb-2"), no_update
+    if scope == "per_series" and not group_cols:
+        return no_update, dbc.Alert(
+            "Per-series scope needs at least one series-key column (or switch to Overall).",
+            color="warning", dismissable=True, className="mb-2"), no_update
 
+    body = {
+        "timestamp_col": ts,
+        "target_col": target,
+        "agg": agg or "sum",
+        "scope": scope or "aggregate",
+        "group_cols": group_cols or [],
+        "exog_cols": exog or [],
+        "forecast_frequency": freq,
+        "horizon": int(horizon) if horizon else None,
+        "use_llm": bool(use_llm),
+    }
     try:
-        clean_resp = requests.post(
-            f"{API_URL}/runs/{run_id}/clean",
-            json={"timestamp_col": ts_val, "use_llm": bool(use_llm)},
-            timeout=1800,  # 30 min — large datasets can take time
-        )
+        clean_resp = requests.post(f"{API_URL}/runs/{run_id}/clean", json=body,
+                                   timeout=1800)  # 30 min — large datasets take time
         if clean_resp.status_code == 409:
             return no_update, dbc.Alert(
-                "This request was cancelled by a newer action. Click Run Cleaning again.",
-                color="warning", dismissable=True, className="mb-2",
-            )
+                "This request was cancelled by a newer action. Click the run button again.",
+                color="warning", dismissable=True, className="mb-2"), no_update
         if not clean_resp.ok:
             detail = clean_resp.json().get("detail", "Cleaning failed")
-            return no_update, dbc.Alert(f"Cleaning error: {detail}", color="danger", dismissable=True, className="mb-2")
+            return no_update, dbc.Alert(
+                f"Cleaning error: {detail}", color="danger", dismissable=True,
+                className="mb-2"), no_update
 
         stage3_data = clean_resp.json()
-
-        validate_resp = requests.post(f"{API_URL}/runs/{run_id}/validate", timeout=30)
+        validate_resp = requests.post(f"{API_URL}/runs/{run_id}/validate", timeout=300)
         if validate_resp.ok:
             stage3_data["_validation"] = validate_resp.json()
 
         new_store = {**store_data, "_stage3": stage3_data}
-        # Cleaning rewrote the cleaned parquet — any earlier Stage 4 results describe data
-        # that no longer exists. Drop them, then auto-detect fresh forecast settings (same
-        # pattern as Stage 1 auto-triggering Stage 2). Failure is fine: the Forecast EDA
-        # tab has its own "Detect Forecast Settings" button as the retry path.
+        new_store["_intent"] = {
+            **(store_data.get("_intent") or {}),
+            "selections": {k: v for k, v in body.items() if k != "use_llm"},
+        }
+        # The cleaned parquet was just rewritten — earlier Stage 4 results describe data
+        # that no longer exists.
         new_store.pop("_stage4", None)
-        try:
-            setup_resp = requests.post(f"{API_URL}/runs/{run_id}/forecast-setup", timeout=300)
-            if setup_resp.ok:
-                new_store["_stage4"] = {"setup": setup_resp.json().get("setup")}
-        except Exception:
-            pass
-        return new_store, ""
+
+        eda_resp = requests.post(f"{API_URL}/runs/{run_id}/forecast-eda", json={},
+                                 timeout=1800)
+        if eda_resp.status_code == 409:
+            return new_store, dbc.Alert(
+                "Cleaning + validation finished, but forecast EDA was preempted by a "
+                "newer action — re-run it from the Forecast EDA tab.",
+                color="warning", dismissable=True, className="mb-2"), no_update
+        if not eda_resp.ok:
+            detail = eda_resp.json().get("detail", "Forecast EDA failed")
+            return new_store, dbc.Alert(
+                f"Cleaning + validation finished, but forecast EDA failed: {detail}",
+                color="danger", dismissable=True, className="mb-2"), no_update
+
+        result = eda_resp.json()
+        # run() may refine the selections (e.g. force nunique for a non-numeric target)
+        if result.get("selections"):
+            new_store["_intent"]["selections"] = result["selections"]
+        new_store["_stage4"] = {"eda": {"payload": result.get("payload"),
+                                        "full": result.get("full")}}
+        return new_store, "", "tab-fcst-eda"
 
     except requests.exceptions.Timeout:
         return no_update, dbc.Alert(
-            "Cleaning timed out after 30 minutes.", color="danger", dismissable=True, className="mb-2"
-        )
+            "The pipeline timed out after 30 minutes.", color="danger",
+            dismissable=True, className="mb-2"), no_update
     except requests.exceptions.ConnectionError:
         return no_update, dbc.Alert(
-            "Cannot reach API — is run_dev.bat running?", color="danger", dismissable=True, className="mb-2"
-        )
+            "Cannot reach API — is run_dev.bat running?", color="danger",
+            dismissable=True, className="mb-2"), no_update
     except Exception as e:
-        return no_update, dbc.Alert(str(e), color="danger", dismissable=True, className="mb-2")
+        return no_update, dbc.Alert(str(e), color="danger", dismissable=True, className="mb-2"), no_update
 
 
 # ── Tab 2: Cleaning ────────────────────────────────────────────────────────
@@ -925,13 +988,9 @@ def _llm_response_details(stage3: dict):
 
 
 def _llm_status_banner(stage3: dict):
-    """Surface whether the LLM produced the recipe, or why it fell back."""
+    """Surface whether the LLM produced the cleaning recipe, or why it fell back."""
     if not stage3:
-        return dbc.Alert(
-            [_cicon("bi-info-circle"),
-             "Cleaning has not been run yet. Confirm the timestamp column and run it below."],
-            color="secondary", className="py-2 mb-3",
-        )
+        return None
     src = stage3.get("recipe_source", "unknown")
     err = stage3.get("recipe_error")
     model = stage3.get("llm_model")
@@ -980,6 +1039,9 @@ def _llm_status_banner(stage3: dict):
 
 
 def _render_clean_tab(data):
+    """Setup & Cleaning: the pipeline's single user checkpoint. Intent form (Stage 2.5
+    suggestions, LLM-refined) on top; cleaning recipe/results + validation gate below
+    once the confirm chain has run."""
     if not data or "_stage2" not in data:
         return html.Div(
             [_cicon("bi-info-circle", fontSize="2rem", color="#334155",
@@ -989,63 +1051,30 @@ def _render_clean_tab(data):
             className="text-center mt-5 pt-4",
         )
 
-    datetime_cols = data.get("datetime_cols", [])
+    intent = data.get("_intent") or {}
+    suggestions = intent.get("suggestions")
     stage3 = data.get("_stage3", {})
-    recipe = stage3.get("recipe", {}) if stage3 else {}
-    default_ts = recipe.get("timestamp_col") or (datetime_cols[0] if datetime_cols else None)
-    ts_options = [{"label": c, "value": c} for c in datetime_cols]
-    already_run = bool(stage3)
-
-    controls = dbc.Card(
-        dbc.CardBody([
-            html.P([_cicon("bi-calendar-check"), "Confirm Cleaning Settings"],
-                   className="fw-semibold mb-3", style={"color": "#c7d2fe"}),
-            dbc.Row([
-                dbc.Col([
-                    html.Label("Timestamp Column", className="form-label",
-                               style={"fontSize": "0.8rem", "color": "#94a3b8"}),
-                    dcc.Dropdown(
-                        id="dropdown-ts-confirm",
-                        options=ts_options, value=default_ts,
-                        clearable=False, style={"fontSize": "0.85rem"},
-                    ),
-                ], md=6),
-                dbc.Col([
-                    html.Label("LLM", className="form-label",
-                               style={"fontSize": "0.8rem", "color": "#94a3b8"}),
-                    dbc.Switch(
-                        id="switch-use-llm", value=True,
-                        label="Use LLM (off = rule-based only)",
-                        className="mt-1",
-                    ),
-                ], md=6),
-            ], className="mb-3"),
-            dcc.Loading(
-                dbc.Button(
-                    [_cicon("bi-scissors"),
-                     "Re-run Cleaning" if already_run else "Run Cleaning"],
-                    id="btn-run-cleaning", color="primary", className="w-100",
-                    disabled=default_ts is None,
-                    style={"fontWeight": "600", "letterSpacing": "0.02em"},
-                ),
-                type="circle", color="#6366f1", delay_show=100,
-                target_components={"cleaning-status": "children"},
-            ),
-        ]),
-        className="mb-3",
-        style={"background": "rgba(30, 41, 59, 0.7)",
-               "border": "1px solid rgba(99, 102, 241, 0.3)"},
-    )
 
     header = html.Div([
-        html.Span([_cicon("bi-scissors"), "Cleaning"],
+        html.Span([_cicon("bi-sliders"), "Setup & Cleaning"],
                   className="fw-semibold", style={"color": "#c7d2fe"}),
     ], className="mb-3")
 
+    if not suggestions:
+        # Auto-detection after Stage 2 failed or this is an older run — offer it here.
+        return html.Div([
+            header,
+            intent_view.detect_prompt_card(),
+            _llm_status_banner(stage3),
+            *(_render_stage3(stage3) if stage3 else []),
+        ])
+
     return html.Div([
         header,
+        intent_view.llm_intent_banner(suggestions),
+        intent_view.build_intent_form(suggestions, intent.get("selections"),
+                                      already_run=bool(stage3)),
         _llm_status_banner(stage3),
-        controls,
         *(_render_stage3(stage3) if stage3 else []),
     ])
 
@@ -1165,50 +1194,40 @@ def _render_stage3(stage3: dict) -> list:
     return sections
 
 
-# ── Tab 3: Forecast EDA (Stage 4) ─────────────────────────────────────────────
-# Rendering lives in fcst_eda_view.py; these callbacks handle the interactivity.
-# Same hard-won rules as the rest of this file: every button guards n_clicks (all Stage 4
+# ── Stage 2.5 / Stage 4 auxiliary callbacks ───────────────────────────────────
+# Rendering lives in intent_view.py / fcst_eda_view.py; these handle interactivity.
+# Same hard-won rules as the rest of this file: every button guards n_clicks (all these
 # controls are dynamically rendered), running= uses string ids only, and status output
 # goes to the persistent root-level cleaning-status div.
 
 @callback(
-    Output("fcst-group-wrap", "style"),
-    Input("radio-fcst-scope", "value"),
-)
-def toggle_fcst_group(scope):
-    """Series-key picker is only meaningful in per-series scope. Fires on mount too
-    (dynamic Input) — harmless, it's a pure function of the radio value."""
-    return _SHOW if scope == "per_series" else _HIDE
-
-
-@callback(
     Output("results-store", "data", allow_duplicate=True),
     Output("cleaning-status", "children", allow_duplicate=True),
-    Input("btn-fcst-setup", "n_clicks"),
+    Input("btn-intent-redetect", "n_clicks"),
     State("results-store", "data"),
-    running=[(Output("btn-fcst-setup", "disabled"), True, False)],
+    running=[(Output("btn-intent-redetect", "disabled"), True, False)],
     prevent_initial_call=True,
 )
-def run_forecast_setup(n_clicks, store_data):
-    """Stage 4 phase A: detect forecast settings from the cleaned parquet. Keeps any
-    existing EDA results — re-detecting suggestions doesn't invalidate them."""
+def run_intent_redetect(n_clicks, store_data):
+    """Stage 2.5 on demand: (re-)detect the intent suggestions. Keeps the user's
+    previously confirmed selections — only the suggestions refresh."""
     if not n_clicks or not store_data:
         return no_update, no_update
     run_id = store_data.get("run_id")
     if not run_id:
         return no_update, dbc.Alert("No active run found.", color="warning", className="mb-2")
     try:
-        resp = requests.post(f"{API_URL}/runs/{run_id}/forecast-setup", timeout=300)
+        resp = requests.post(f"{API_URL}/runs/{run_id}/forecast-intent", timeout=900)
         if resp.status_code == 409:
             return no_update, dbc.Alert(
                 "This request was cancelled by a newer action. Try again.",
                 color="warning", dismissable=True, className="mb-2",
             )
         if not resp.ok:
-            detail = resp.json().get("detail", "Forecast setup failed")
+            detail = resp.json().get("detail", "Intent detection failed")
             return no_update, dbc.Alert(detail, color="danger", dismissable=True, className="mb-2")
-        stage4 = {**(store_data.get("_stage4") or {}), "setup": resp.json().get("setup")}
-        return {**store_data, "_stage4": stage4}, ""
+        intent = {**(store_data.get("_intent") or {}), "suggestions": resp.json().get("intent")}
+        return {**store_data, "_intent": intent}, ""
     except requests.exceptions.ConnectionError:
         return no_update, dbc.Alert(
             "Cannot reach API — is run_dev.bat running?", color="danger", dismissable=True, className="mb-2"
@@ -1220,48 +1239,27 @@ def run_forecast_setup(n_clicks, store_data):
 @callback(
     Output("results-store", "data", allow_duplicate=True),
     Output("cleaning-status", "children", allow_duplicate=True),
-    Input("btn-run-fcst-eda", "n_clicks"),
+    Input("btn-fcst-rerun", "n_clicks"),
     State("results-store", "data"),
-    State("dropdown-fcst-target", "value"),
-    State("radio-fcst-scope", "value"),
-    State("dropdown-fcst-group", "value"),
-    State("dropdown-fcst-agg", "value"),
-    State("dropdown-fcst-exog", "value"),
     State("dropdown-fcst-freq", "value"),
     State("input-fcst-horizon", "value"),
-    running=[(Output("btn-run-fcst-eda", "disabled"), True, False)],
+    running=[(Output("btn-fcst-rerun", "disabled"), True, False)],
     prevent_initial_call=True,
 )
-def run_forecast_eda(n_clicks, store_data, target, scope, group_cols, agg, exog, freq, horizon):
-    """Stage 4 phase B: run the full forecasting EDA with the confirmed selections."""
+def rerun_fcst_eda(n_clicks, store_data, freq, horizon):
+    """Stage-4-only re-run with frequency/horizon overrides — these don't affect
+    cleaning, so adjusting them must not force a re-clean."""
     if not n_clicks or not store_data:
         return no_update, no_update
     run_id = store_data.get("run_id")
     if not run_id:
         return no_update, dbc.Alert("No active run found.", color="warning", className="mb-2")
-    if not target:
-        return no_update, dbc.Alert(
-            "Select a target column to forecast.", color="warning", dismissable=True, className="mb-2"
-        )
-    if scope == "per_series" and not group_cols:
-        return no_update, dbc.Alert(
-            "Per-series scope needs at least one series-key column (or switch to Overall).",
-            color="warning", dismissable=True, className="mb-2",
-        )
-    body = {
-        "target_col": target,
-        "scope": scope or "aggregate",
-        "group_cols": group_cols or [],
-        "agg": agg or "sum",
-        "exog_cols": exog or [],
-        "forecast_frequency": freq,
-        "horizon": int(horizon) if horizon else None,
-    }
+    body = {"forecast_frequency": freq, "horizon": int(horizon) if horizon else None}
     try:
         resp = requests.post(f"{API_URL}/runs/{run_id}/forecast-eda", json=body, timeout=1800)
         if resp.status_code == 409:
             return no_update, dbc.Alert(
-                "This request was cancelled by a newer action. Click Run Forecast EDA again.",
+                "This request was cancelled by a newer action. Click Re-run again.",
                 color="warning", dismissable=True, className="mb-2",
             )
         if not resp.ok:
@@ -1270,12 +1268,13 @@ def run_forecast_eda(n_clicks, store_data, target, scope, group_cols, agg, exog,
                 f"Forecast EDA error: {detail}", color="danger", dismissable=True, className="mb-2"
             )
         result = resp.json()
-        stage4 = {
-            **(store_data.get("_stage4") or {}),
-            "selections": result.get("selections"),
-            "eda": {"payload": result.get("payload"), "full": result.get("full")},
-        }
-        return {**store_data, "_stage4": stage4}, ""
+        new_store = {**store_data,
+                     "_stage4": {"eda": {"payload": result.get("payload"),
+                                         "full": result.get("full")}}}
+        if result.get("selections"):
+            new_store["_intent"] = {**(store_data.get("_intent") or {}),
+                                    "selections": result["selections"]}
+        return new_store, ""
     except requests.exceptions.Timeout:
         return no_update, dbc.Alert(
             "Forecast EDA timed out after 30 minutes.", color="danger", dismissable=True, className="mb-2"

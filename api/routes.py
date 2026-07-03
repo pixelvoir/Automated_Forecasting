@@ -209,24 +209,26 @@ def get_run_summary(run_id: str):
             stage3["_validation"] = json.loads(vg_path.read_text())
         data["_stage3"] = stage3
 
-    # Stage 4 — forecast EDA. setup (detection suggestions) and eda (results) are
-    # independent files: a run can have setup confirmed but the EDA not yet executed.
-    setup_path = RUNS_DIR / run_id / "forecast_setup.json"
+    # Stage 2.5 — forecast intent: suggestions (detect + LLM) and the user-confirmed
+    # selections are independent files (a run can have suggestions but no confirmation).
+    intent_path = RUNS_DIR / run_id / "forecast_intent.json"
     fsel_path = RUNS_DIR / run_id / "forecast_user_selections.json"
+    if intent_path.exists() or fsel_path.exists():
+        intent: dict = {}
+        if intent_path.exists():
+            intent["suggestions"] = json.loads(intent_path.read_text())
+        if fsel_path.exists():
+            intent["selections"] = json.loads(fsel_path.read_text())
+        data["_intent"] = intent
+
+    # Stage 4 — forecast EDA results
     feda_path = RUNS_DIR / run_id / "forecasting_eda_full.json"
     payload_path = RUNS_DIR / run_id / "model_selection_payload.json"
-    if setup_path.exists() or feda_path.exists():
-        stage4: dict = {}
-        if setup_path.exists():
-            stage4["setup"] = json.loads(setup_path.read_text())
-        if fsel_path.exists():
-            stage4["selections"] = json.loads(fsel_path.read_text())
-        if feda_path.exists() and payload_path.exists():
-            stage4["eda"] = {
-                "payload": json.loads(payload_path.read_text()),
-                "full": json.loads(feda_path.read_text()),
-            }
-        data["_stage4"] = stage4
+    if feda_path.exists() and payload_path.exists():
+        data["_stage4"] = {"eda": {
+            "payload": json.loads(payload_path.read_text()),
+            "full": json.loads(feda_path.read_text()),
+        }}
 
     return data
 
@@ -265,19 +267,30 @@ def get_metadata(run_id: str):
 
 
 class CleanRequest(BaseModel):
+    """The confirmed forecast intent — the single user checkpoint of the pipeline.
+    Everything downstream (cleaning recipe, per-series execution, validation gate,
+    forecast EDA) consumes this file; only use_llm is a transient flag."""
     timestamp_col: str | None = None
+    target_col: str | None = None
+    agg: str = "sum"                       # "sum" | "mean" | "nunique" (events per period)
+    scope: str = "aggregate"               # "aggregate" | "per_series"
+    group_cols: list[str] = []
+    exog_cols: list[str] = []
+    forecast_frequency: str | None = None
+    horizon: int | None = None
     use_llm: bool = True
 
 
 @router.post("/{run_id}/clean")
 def run_clean(run_id: str, req: CleanRequest = CleanRequest()):
     """Stage 3: call LLM cleaning agent then execute the recipe on the raw parquet.
-    No DB connection. No raw data sent to LLM — only cleaning_decision_payload.json."""
+    No DB connection. No raw data sent to LLM — only cleaning_decision_payload.json
+    plus the confirmed intent (names + choices, no values)."""
     run_dir = RUNS_DIR / run_id
     if not run_dir.exists():
         raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found.")
-    selections = {"timestamp_col": req.timestamp_col}
-    (run_dir / "user_selections.json").write_text(json.dumps(selections, indent=2))
+    selections = {k: v for k, v in req.model_dump().items() if k != "use_llm"}
+    (run_dir / "forecast_user_selections.json").write_text(json.dumps(selections, indent=2))
 
     result = _run_job(tasks.clean_task, run_id, use_llm=req.use_llm, track_id=run_id)
     return {"run_id": run_id, "status": "completed", **result}
@@ -292,34 +305,42 @@ def run_validate(run_id: str):
     return _run_job(tasks.validate_task, run_id, track_id=run_id)
 
 
-@router.post("/{run_id}/forecast-setup")
-def run_forecast_setup(run_id: str):
-    """Stage 4 phase A: detect forecast settings (target/scope/group key/frequency) from
-    the cleaned parquet, each with a confidence level. Fast, but still job-managed so a
-    dataset switch can preempt it. No LLM, no DB."""
+class ForecastIntentRequest(BaseModel):
+    use_llm: bool = True
+
+
+@router.post("/{run_id}/forecast-intent")
+def run_forecast_intent(run_id: str, req: ForecastIntentRequest = ForecastIntentRequest()):
+    """Stage 2.5: detect forecast-intent suggestions (timestamp/target/scope/series key/
+    frequency/horizon) from Stage 1/2 evidence + the RAW parquet, then optionally refine
+    with the LLM (statistics + column names only). Job-managed; auto-triggered by the
+    frontend after pre-clean EDA. The user confirms everything before cleaning runs."""
     run_dir = RUNS_DIR / run_id
     if not run_dir.exists():
         raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found.")
-    return _run_job(tasks.forecast_setup_task, run_id, track_id=run_id)
+    return _run_job(tasks.forecast_intent_task, run_id, use_llm=req.use_llm, track_id=run_id)
 
 
 class ForecastEDARequest(BaseModel):
-    target_col: str
-    scope: str = "aggregate"               # "aggregate" | "per_series"
-    group_cols: list[str] = []
-    agg: str = "sum"                       # "sum" | "mean"
-    exog_cols: list[str] = []
-    forecast_frequency: str | None = None  # None = data frequency
-    horizon: int | None = None             # None = frequency default
+    """Optional overrides for a Stage-4-only re-run. Frequency/horizon don't affect
+    cleaning, so adjusting them must not force a re-clean."""
+    forecast_frequency: str | None = None
+    horizon: int | None = None
 
 
 @router.post("/{run_id}/forecast-eda")
-def run_forecast_eda(run_id: str, req: ForecastEDARequest):
-    """Stage 4 phase B: full forecasting EDA on the confirmed selections. All statistics
-    computed in Python — the LLM only ever sees model_selection_payload.json (Stage 5)."""
+def run_forecast_eda(run_id: str, req: ForecastEDARequest = ForecastEDARequest()):
+    """Stage 4: full forecasting EDA on the confirmed intent. All statistics computed
+    in Python — the LLM only ever sees model_selection_payload.json (Stage 5)."""
     run_dir = RUNS_DIR / run_id
     if not run_dir.exists():
         raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found.")
-    selections = req.model_dump()
-    (run_dir / "forecast_user_selections.json").write_text(json.dumps(selections, indent=2))
+    if req.forecast_frequency or req.horizon:
+        sel_path = run_dir / "forecast_user_selections.json"
+        sel = json.loads(sel_path.read_text()) if sel_path.exists() else {}
+        if req.forecast_frequency:
+            sel["forecast_frequency"] = req.forecast_frequency
+        if req.horizon:
+            sel["horizon"] = req.horizon
+        sel_path.write_text(json.dumps(sel, indent=2))
     return _run_job(tasks.forecast_eda_task, run_id, track_id=run_id)
