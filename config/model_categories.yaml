@@ -1,14 +1,143 @@
-# Note: This gets heavily extended in a later step when transformer models are added.
+# Stage 5 model catalog — the single source of truth for model selection.
+#
+# Consumed by pipeline/rule_engine.py (eligibility + rule picks), the LLM prompt in
+# agents/model_selector_agent.py (when_to_use lines go into the prompt verbatim), and
+# later by the Stage 6/7 feature-engineering + training stages (id -> models_lib class).
+#
+# `available` is NEVER stored here — it is derived at runtime via
+# importlib.util.find_spec(import_check) inside the job subprocess, so installing a
+# library (e.g. prophet) enables its models with zero config changes.
+
 categories:
-  seasonal_stationary:
-    - statistical
-    - prophet
-  trending_univariate:
-    - statistical
-    - prophet
-  multivariate_ml:
-    - xgboost
-    - lightgbm
+  baseline:
+    label: "Baseline"
+    description: "Cheap benchmarks; also the pick when history is too short for anything else."
+  statistical:
+    label: "Statistical"
+    description: "Classical univariate models (ETS / ARIMA / Theta / MSTL / Prophet)."
   intermittent:
-    - intermittent_model_1
-    - intermittent_model_2
+    label: "Intermittent demand"
+    description: "Croston-family for sparse demand with many zero periods."
+  ml:
+    label: "Machine learning"
+    description: "Gradient-boosted trees on lag/date features; handles exogenous drivers and global panel training."
+  deep_learning:
+    label: "Deep learning"
+    description: "Neural forecasters; need long history and an installed neuralforecast."
+
+models:
+  - id: seasonal_naive
+    label: "Seasonal Naive"
+    library: statsforecast          # statsforecast.models.SeasonalNaive
+    import_check: statsforecast
+    categories: [baseline]
+    min_length: 3
+    supports_exog: false
+    when_to_use: >-
+      Benchmark, or when history is shorter than ~2 seasonal cycles; repeats the last
+      seasonal cycle. Period 1 degenerates to a plain naive (last value) forecast.
+
+  - id: auto_ets
+    label: "AutoETS"
+    library: statsforecast          # statsforecast.models.AutoETS
+    import_check: statsforecast
+    categories: [statistical]
+    min_length: 10
+    supports_exog: false
+    when_to_use: >-
+      Exponential smoothing with automatic trend/seasonal selection. Best for trend
+      and/or a single seasonality with smooth demand; the multiplicative variants suit
+      series whose variance grows with the level.
+
+  - id: auto_arima
+    label: "AutoARIMA (SARIMAX)"
+    library: statsforecast          # statsforecast.models.AutoARIMA
+    import_check: statsforecast
+    categories: [statistical]
+    min_length: 20
+    supports_exog: true
+    when_to_use: >-
+      Strong single seasonality with rich autocorrelation structure and a known
+      differencing order; can regress on leading or known-future exogenous drivers
+      (SARIMAX). Infeasible for seasonal periods above ~24.
+
+  - id: auto_theta
+    label: "AutoTheta"
+    library: statsforecast          # statsforecast.models.AutoTheta
+    import_check: statsforecast
+    categories: [statistical]
+    min_length: 10
+    supports_exog: false
+    when_to_use: >-
+      Trend-dominant series; deseasonalizes then extrapolates a damped trend. Very
+      robust default on short-to-medium history (a top performer in the M-competitions).
+
+  - id: mstl
+    label: "MSTL"
+    library: statsforecast          # statsforecast.models.MSTL
+    import_check: statsforecast
+    categories: [statistical]
+    min_length: 24
+    supports_exog: false
+    when_to_use: >-
+      Multiple simultaneous seasonal periods (e.g. daily data with weekly + yearly
+      cycles): decomposes each seasonality, forecasts the deseasonalized trend.
+
+  - id: croston
+    label: "Croston (optimized)"
+    library: statsforecast          # statsforecast.models.CrostonOptimized
+    import_check: statsforecast
+    categories: [intermittent]
+    min_length: 10
+    supports_exog: false
+    when_to_use: >-
+      Intermittent demand: many zero periods with fairly stable non-zero sizes
+      (ADI >= 1.32, CV2 < 0.49). Forecasts demand rate, not individual spikes.
+
+  - id: tsb
+    label: "TSB"
+    library: statsforecast          # statsforecast.models.TSB
+    import_check: statsforecast
+    categories: [intermittent]
+    min_length: 10
+    supports_exog: false
+    when_to_use: >-
+      Lumpy or obsolescent demand: many zeros AND highly variable non-zero sizes
+      (CV2 >= 0.49). Updates its probability estimate every period, so it handles
+      demand that is dying out (obsolescence) better than Croston.
+
+  - id: lightgbm
+    label: "LightGBM"
+    library: lightgbm
+    import_check: lightgbm
+    categories: [ml]
+    min_length: 30
+    supports_exog: true
+    when_to_use: >-
+      Gradient-boosted trees on engineered lag / rolling / calendar / exogenous
+      features. Best with long history and usable exogenous drivers, or trained
+      globally across a many-series panel (shared patterns beat per-series fits).
+
+  - id: prophet
+    label: "Prophet"
+    library: prophet                # conditional — commented out of requirements.txt
+    import_check: prophet
+    categories: [statistical]
+    min_length: 30
+    supports_exog: true
+    when_to_use: >-
+      Additive trend + multiple seasonalities with holiday effects and automatic
+      changepoints; tolerant of missing data. Only selectable when prophet is
+      installed (needs C++ build tools on Windows).
+
+  - id: nhits
+    label: "NHITS"
+    library: neuralforecast         # NOT installed — available=false until it is
+    import_check: neuralforecast
+    categories: [deep_learning]
+    min_length: 200
+    supports_exog: true
+    when_to_use: >-
+      Neural hierarchical interpolation: very long series (hundreds of points) or
+      large panels where a deep global model can outperform trees and classical
+      models. Only selectable when neuralforecast (PyTorch) is installed.

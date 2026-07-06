@@ -1,7 +1,7 @@
 """Forecast EDA tab — pure rendering (no callbacks; those live in callbacks.py).
 
 Results-only since the intent-first refactor: every choice (target, scope, series key,
-frequency, horizon, exog) was confirmed on the Setup & Cleaning tab and Stage 4 ran as
+frequency, horizon, exog) was confirmed on the Pipeline Setup tab and Stage 4 ran as
 part of the confirm chain. This tab shows the outcome from ``_stage4.eda`` plus a
 compact recap of the confirmed intent, and offers a frequency/horizon-only re-run
 (those two don't affect cleaning, so adjusting them must not force a re-clean).
@@ -17,8 +17,6 @@ import dash_bootstrap_components as dbc
 import plotly.graph_objects as go
 from dash import dcc, html, dash_table
 from plotly.subplots import make_subplots
-
-from frontend import intent_view
 
 _TEXT = "var(--bs-body-color)"
 _CHART_BG = "#161b2e"
@@ -226,6 +224,59 @@ def _verdict_tiles(payload):
     ])
     return dbc.Card(dbc.CardBody(tiles), className="mb-3",
                     style={"borderLeft": "3px solid #6366f1"})
+
+
+# ── Confirmed-setup summary ──────────────────────────────────────────────────
+
+_AGG_LABEL = {"sum": "sum per period", "mean": "mean per period",
+              "nunique": "distinct count per period", "count": "count per period"}
+_SCOPE_LABEL = {"aggregate": "Overall (aggregate)", "per_series": "Per-series (panel)"}
+
+
+def _setup_summary(selections):
+    """Read-only recap of the confirmed forecast setup. Frequency/horizon can be
+    adjusted in the form below; everything else changes on Pipeline Setup."""
+    if not selections or not selections.get("target_col"):
+        return None
+    group_cols = selections.get("group_cols") or []
+    exog = selections.get("exog_cols") or []
+    horizon = selections.get("horizon")
+    freq = selections.get("forecast_frequency")
+    agg_sub = _AGG_LABEL.get(selections.get("agg"), selections.get("agg") or "")
+    if selections.get("agg_forced"):
+        agg_sub += " (auto-corrected)"
+
+    exog_row = dbc.Row([dbc.Col([
+        html.Div(
+            [html.I(className="bi bi-diagram-3",
+                    style={"color": "#64748b", "marginRight": "4px", "fontSize": "0.7rem"}),
+             html.Span("Exogenous drivers",
+                       style={"fontSize": "0.65rem", "color": "#94a3b8",
+                              "textTransform": "uppercase", "letterSpacing": "0.06em"})],
+            className="d-flex align-items-center mb-1"),
+        html.Div([dbc.Badge(c, color="secondary", className="me-1 mb-1") for c in exog]
+                 if exog else
+                 html.Span("None", style={"fontSize": "0.85rem", "color": "#64748b"})),
+    ], width=12)], className="mt-1")
+
+    return dbc.Card(dbc.CardBody([
+        html.Div([
+            html.Span([_cicon("bi-sliders"), "Confirmed Forecast Setup"], style=_SH),
+            html.Small("change on the Pipeline Setup tab",
+                       style={"color": "#64748b", "fontSize": "0.68rem"}),
+        ], className="d-flex justify-content-between align-items-center mb-2"),
+        dbc.Row([
+            _tile("bi-bullseye", "Target", selections["target_col"], sub=agg_sub),
+            _tile("bi-clock-history", "Timestamp", selections.get("timestamp_col") or "—"),
+            _tile("bi-collection", "Scope",
+                  _SCOPE_LABEL.get(selections.get("scope"), selections.get("scope") or "—"),
+                  sub=("key: " + " × ".join(group_cols)) if group_cols else "no series key"),
+            _tile("bi-calendar3", "Frequency & horizon",
+                  str(freq).capitalize() if freq else "—",
+                  sub=f"{horizon} periods ahead" if horizon else None),
+        ]),
+        exog_row,
+    ]), className="mb-3", style={"borderLeft": "3px solid #6366f1"})
 
 
 # ── Frequency/horizon adjust mini-form (Stage-4-only re-run) ─────────────────
@@ -542,15 +593,15 @@ def render_fcst_eda_tab(data):
         return html.Div(
             [_cicon("bi-info-circle", fontSize="2rem", color="#334155",
                     display="block", marginBottom="12px", marginRight="0"),
-             html.P("Confirm the forecast setup on the Setup & Cleaning tab — the "
-                    "pipeline runs cleaning, validation and forecast EDA in one go.",
+             html.P("Confirm the forecast setup on the Pipeline Setup tab — the pipeline "
+                    "runs cleaning, validation, forecast EDA and model selection in one go.",
                     style={"color": "#64748b", "fontSize": "0.9rem"})],
             className="text-center mt-5 pt-4",
         )
 
     header = html.Div([
         html.Span([_cicon("bi-graph-up"), "Forecast EDA"],
-                  className="fw-semibold", style={"color": "#c7d2fe"}),
+                  className="fw-semibold section-title"),
     ], className="mb-3")
 
     validation = (data.get("_stage3") or {}).get("_validation", {})
@@ -563,7 +614,7 @@ def render_fcst_eda_tab(data):
             color="danger", className="py-2 mb-3",
         )]
 
-    summary = intent_view.intent_summary_bar(
+    summary = _setup_summary(
         selections or (stage4.get("eda") or {}).get("full", {}).get("selections") or {})
 
     if not eda_exists:

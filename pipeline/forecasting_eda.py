@@ -94,7 +94,7 @@ def _resolve_selections(run_dir: Path) -> dict:
     if not target:
         raise ValueError(
             "No forecast target confirmed. Run Stage 2.5 (forecast intent) and confirm "
-            "the settings on the Setup & Cleaning tab first.")
+            "the settings on the Pipeline Setup tab first.")
     ts_col = (sel.get("timestamp_col") or recipe.get("timestamp_col")
               or intent.get("timestamp", {}).get("suggested"))
     if not ts_col:
@@ -777,6 +777,9 @@ def run(run_id: str) -> dict:
     }
     (run_dir / "forecasting_eda_full.json").write_text(json.dumps(full, indent=2, default=str))
     (run_dir / "model_selection_payload.json").write_text(json.dumps(payload, indent=2, default=str))
+    # Fresh Stage 4 evidence invalidates any earlier Stage 5 decision on disk (covers
+    # the frequency/horizon-only re-run path, where /clean never fires).
+    (run_dir / "model_selection.json").unlink(missing_ok=True)
 
     return {
         "run_id": run_id,

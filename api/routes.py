@@ -100,6 +100,7 @@ def list_runs():
                 "has_stage2": (run_dir / "cleaning_decision_payload.json").exists(),
                 "has_stage3": (run_dir / "cleaning_recipe.json").exists(),
                 "has_stage4": (run_dir / "model_selection_payload.json").exists(),
+                "has_stage5": (run_dir / "model_selection.json").exists(),
             })
         except Exception:
             continue
@@ -230,6 +231,11 @@ def get_run_summary(run_id: str):
             "full": json.loads(feda_path.read_text()),
         }}
 
+    # Stage 5 — model selection decision
+    msel_path = RUNS_DIR / run_id / "model_selection.json"
+    if msel_path.exists():
+        data["_stage5"] = json.loads(msel_path.read_text())
+
     return data
 
 
@@ -291,6 +297,9 @@ def run_clean(run_id: str, req: CleanRequest = CleanRequest()):
         raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found.")
     selections = {k: v for k, v in req.model_dump().items() if k != "use_llm"}
     (run_dir / "forecast_user_selections.json").write_text(json.dumps(selections, indent=2))
+    # A re-clean invalidates any model decision made on the old cleaned data — remove it
+    # so /summary can't resurrect a stale Stage 5 result if the chain aborts early.
+    (run_dir / "model_selection.json").unlink(missing_ok=True)
 
     result = _run_job(tasks.clean_task, run_id, use_llm=req.use_llm, track_id=run_id)
     return {"run_id": run_id, "status": "completed", **result}
@@ -344,3 +353,22 @@ def run_forecast_eda(run_id: str, req: ForecastEDARequest = ForecastEDARequest()
             sel["horizon"] = req.horizon
         sel_path.write_text(json.dumps(sel, indent=2))
     return _run_job(tasks.forecast_eda_task, run_id, track_id=run_id)
+
+
+class ModelSelectRequest(BaseModel):
+    use_llm: bool = True
+
+
+@router.post("/{run_id}/model-select")
+def run_model_select(run_id: str, req: ModelSelectRequest = ModelSelectRequest()):
+    """Stage 5: pick the forecasting model from the Stage 4 evidence. The rule engine
+    always decides first; the LLM (when enabled) may override — statistics and model
+    names only, never raw data. Job-managed like every other stage."""
+    run_dir = RUNS_DIR / run_id
+    if not run_dir.exists():
+        raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found.")
+    if not (run_dir / "model_selection_payload.json").exists():
+        raise HTTPException(
+            status_code=400,
+            detail="Run forecast EDA first — model selection needs its evidence payload.")
+    return _run_job(tasks.model_select_task, run_id, use_llm=req.use_llm, track_id=run_id)

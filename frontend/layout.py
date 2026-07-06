@@ -27,7 +27,7 @@ from dash import dcc, html
 # "tab-" → "pane-" (see the clientside pane switcher in callbacks.py).
 _TABS = [
     ("Data & Pre-clean EDA", "tab-data",     "bi-search"),
-    ("Setup & Cleaning",     "tab-clean",     "bi-scissors"),
+    ("Pipeline Setup",       "tab-clean",     "bi-scissors"),
     ("Forecast EDA",         "tab-fcst-eda",  "bi-graph-up"),
     ("Model Select",         "tab-model",     "bi-cpu"),
     ("Training",             "tab-training",  "bi-lightning-fill"),
@@ -330,7 +330,8 @@ def create_layout():
                              children=html.Div(id="clean-tab-body")),
                     html.Div(id="pane-fcst-eda", style=_HIDDEN,
                              children=html.Div(id="fcst-eda-tab-body")),
-                    html.Div(id="pane-model", style=_HIDDEN, children=_placeholder_pane()),
+                    html.Div(id="pane-model", style=_HIDDEN,
+                             children=html.Div(id="model-tab-body")),
                     html.Div(id="pane-training", style=_HIDDEN, children=_placeholder_pane()),
                     html.Div(id="pane-results", style=_HIDDEN, children=_placeholder_pane()),
                 ]),

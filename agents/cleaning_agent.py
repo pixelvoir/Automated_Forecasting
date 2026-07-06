@@ -50,10 +50,14 @@ class ColumnRecipe(BaseModel):
 
 
 class CleaningRecipe(BaseModel):
+    # Only `columns` is truly required. Some models (qwen via groq) omit the top-level
+    # scalars entirely — default them instead of rejecting the whole recipe: dropping
+    # duplicates is a no-op when there are none, and timestamp_col/sort are force-set
+    # from the confirmed intent by the sanitizer afterwards anyway.
     columns: dict[str, ColumnRecipe]
-    drop_duplicates: bool
-    sort_by_timestamp: bool
-    timestamp_col: str | None
+    drop_duplicates: bool = True
+    sort_by_timestamp: bool = True
+    timestamp_col: str | None = None
     frequency: str | None = None
     period: int | None = None
 

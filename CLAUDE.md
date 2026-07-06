@@ -31,6 +31,9 @@ forecast_intent_agent.refine(run_id)         # optional LLM refinement of the su
 # write runs/{run_id}/forecast_user_selections.json to confirm/override, then:
 cleaning_agent.run(run_id); cleaner.run(run_id); validation_gate.run(run_id)
 forecasting_eda.run(run_id)                  # Stage 4: full stats + model_selection_payload.json
+
+from agents import model_selector_agent
+model_selector_agent.run(run_id, use_llm=True)  # Stage 5: rule engine always runs, LLM may override
 ```
 Note the order: intent (Stage 2.5) comes BEFORE cleaning — the recipe and the per-series
 execution both consume the confirmed intent.
@@ -92,14 +95,15 @@ Each stage is a standalone Python module in `pipeline/` with a single `run(run_i
 | 2.5 — Forecast intent | `pipeline/forecast_intent.py` (`detect()`) → `agents/forecast_intent_agent.py` (`refine()`) | `runs/{id}/forecast_intent.json` (suggestions + confidence + LLM rationale) |
 | 3.5 — Validation | `pipeline/validation_gate.py` | `runs/{id}/validation_gate.json` |
 | 4 — Forecast EDA | `pipeline/forecasting_eda.py` (`run()`) | `forecasting_eda_full.json`, `model_selection_payload.json` |
-| 5–8 | stubs in `pipeline/`, `agents/`, `models_lib/` | not yet implemented (`def run(): pass` / `def process(): pass`) |
+| 5 — Model selection | `pipeline/rule_engine.py` (`decide()`/`run()`) → `agents/model_selector_agent.py` (`run()`) | `runs/{id}/model_selection.json` |
+| 6–8 | stubs in `pipeline/`, `models_lib/`, `agents/` | not yet implemented — **warning: the remaining stub files contain literal PowerShell `` `r`n `` escapes and raise SyntaxError on import; rewrite them fully, never edit** |
 
 **Intent-first flow:** Stage 2.5 suggests every forecast choice (timestamp, target incl.
 count-of-events, scope, series key, exog, frequency, horizon) from Stage 1/2 evidence +
-the RAW parquet; the user confirms once on the Setup & Cleaning tab; `POST /clean` writes
-`forecast_user_selections.json` and the whole chain (clean → validate → forecast EDA)
-consumes it. Frequency/horizon can be adjusted later without re-cleaning
-(`POST /forecast-eda` overrides).
+the RAW parquet; the user confirms once on the Pipeline Setup tab; `POST /clean` writes
+`forecast_user_selections.json` and the whole chain (clean → validate → forecast EDA →
+model select) consumes it. Frequency/horizon can be adjusted later without re-cleaning
+(`POST /forecast-eda` overrides, which re-chains model selection).
 
 Stage 3 is two-step: the LLM agent decides the recipe (`cleaning_agent.py`), then `cleaner.py` executes it. Both are called sequentially inside `api/tasks.py::clean_task`, which the `/runs/{id}/clean` endpoint runs via the job manager. The LLM only receives `cleaning_decision_payload.json`.
 
@@ -139,12 +143,13 @@ All routes are under `/runs` (defined in `api/routes.py`):
 | `/runs/{id}/validate` | POST | Stage 3.5 — validation gate only, job-managed |
 | `/runs/{id}/forecast-intent` | POST | Stage 2.5 — detect + LLM-refine intent suggestions (`use_llm` body flag), job-managed |
 | `/runs/{id}/forecast-eda` | POST | Stage 4 — forecast EDA from confirmed intent (body = optional freq/horizon overrides only), job-managed |
+| `/runs/{id}/model-select` | POST | Stage 5 — rule engine + optional LLM override (`use_llm` body flag); 400 if Stage 4 hasn't produced the payload; job-managed |
 
 Every job-managed endpoint can return **409** (preempted by a newer job) — callers must handle this explicitly, not treat a non-200 as a generic failure.
 
 ### `runs/{run_id}/` Directory
 
-The `/runs/{id}/summary` endpoint reads all accumulated files to reconstruct full run state for the UI (`_stage2`, `_intent`, `_stage3`, `_stage4`). `forecast_user_selections.json` is written by the `/clean` endpoint — it is the single confirmed-intent file every downstream stage reads (cleaning recipe, per-series cleaner execution, validation gate, forecast EDA). The legacy `user_selections.json` (timestamp only) is still read as a fallback for pre-refactor runs.
+The `/runs/{id}/summary` endpoint reads all accumulated files to reconstruct full run state for the UI (`_stage2`, `_intent`, `_stage3`, `_stage4`, `_stage5`). `forecast_user_selections.json` is written by the `/clean` endpoint — it is the single confirmed-intent file every downstream stage reads (cleaning recipe, per-series cleaner execution, validation gate, forecast EDA). The legacy `user_selections.json` (timestamp only) is still read as a fallback for pre-refactor runs.
 
 Files in order of creation:
 ```
@@ -160,7 +165,12 @@ cleaned_metadata.json       # Stage 3 (lightweight snapshot)
 validation_gate.json        # Stage 3.5
 forecasting_eda_full.json   # Stage 4 (all stats + downsampled plot arrays)
 model_selection_payload.json   # Stage 4 (compact decision JSON for Stage 5)
+model_selection.json        # Stage 5 (final pick + rule trace + LLM info + training_hints)
 ```
+
+`model_selection.json` is deleted by `/clean` (re-clean invalidates the decision) and by
+`forecasting_eda.run()` just after writing a fresh payload (covers the freq/horizon-only
+re-run) — otherwise `/summary` would resurrect a decision made on data that no longer exists.
 
 ### Cleaner Execution Order
 
@@ -230,11 +240,23 @@ Gotchas encoded in the module:
 - Timestamp column is defensively re-parsed (`pd.to_datetime`) — stale cleaned parquets can carry string dates.
 - Plot arrays in `forecasting_eda_full.json` are downsampled to `plot_max_points` (JSON stays ~150–500KB; it travels through the store).
 
-Frontend split: `frontend/intent_view.py` renders the Setup & Cleaning tab's intent form (confidence badges, LLM rationale banner, always-visible series-key picker — group cols drive per-series *cleaning* even in aggregate scope); `frontend/fcst_eda_view.py` renders the results-only Forecast EDA tab (intent recap + freq/horizon-only re-run + verdict tiles + Plotly charts). Callbacks: `confirm_and_run` (the one chain: `/clean` → `/validate` → `/forecast-eda`, drops stale `_stage4`, lands on the Forecast EDA tab on success), `run_intent_redetect`, `rerun_fcst_eda`; `trigger_run`/`run_eda_retry` auto-chain `/forecast-intent` after Stage 2. Chart colors are dataviz-validated against the `#161b2e` card surface: series `#6366f1`, trend `#059669`, seasonal `#d97706`, residual `#e66767`.
+Frontend split: `frontend/intent_view.py` renders the Pipeline Setup tab's intent form (confidence badges, LLM rationale banner, always-visible series-key picker — group cols drive per-series *cleaning* even in aggregate scope); `frontend/fcst_eda_view.py` renders the results-only Forecast EDA tab (confirmed-setup summary + freq/horizon-only re-run + verdict tiles + Plotly charts); `frontend/model_select_view.py` renders the Model Select tab (decision hero + provenance banner + training hints + eligibility table + rule trace + Stage-5-only re-run with its own LLM switch). Callbacks: `confirm_and_run` (the one chain: `/clean` → `/validate` → `/forecast-eda` → `/model-select`, drops stale `_stage4`/`_stage5`, lands on the Forecast EDA tab on success; a model-select 409/failure keeps the EDA results and surfaces a visible warning), `run_intent_redetect`, `rerun_fcst_eda` (re-chains `/model-select`; its `switch-use-llm` State can be `None` for pre-refactor runs — treated as `True`), `run_model_select`; `trigger_run`/`run_eda_retry` auto-chain `/forecast-intent` after Stage 2. The one `switch-use-llm` on Pipeline Setup gates the LLM for BOTH the cleaning recipe and model selection. Chart colors are dataviz-validated against the `#161b2e` card surface: series `#6366f1`, trend `#059669`, seasonal `#d97706`, residual `#e66767`.
+
+### Model Selection (Stage 5)
+
+Two-layer, mirroring the intent agent: `pipeline/rule_engine.py` ALWAYS decides first (pure `decide(payload, catalog, cfg)` + thin `run(run_id)` wrapper — writes nothing), then `agents/model_selector_agent.py::run(run_id, use_llm)` optionally lets the LLM override and persists `model_selection.json`. The LLM sees statistics + eligible model cards + the rule pick with its trace (~2KB, never raw data); its answer passes a **field-level sanitizer** (model ∉ eligible → revert to rule pick; valid model in wrong category → fix category from the catalog) and confidence dampening (capped at rule confidence + 1 level; a reverted model → low). Top-level `source` names who actually picked the final model (`"llm"` only when the LLM's model survived the sanitizer) — deliberate deviation from the intent agent's `suggested_by`, because the UI hero card must attribute the decision honestly.
+
+The catalog is `config/model_categories.yaml` (10 models: seasonal_naive/auto_ets/auto_arima/auto_theta/mstl/croston/tsb via statsforecast, lightgbm, prophet + nhits conditional); `available` is derived at runtime via `importlib.util.find_spec` — installing prophet/neuralforecast enables them with zero config changes. Rule thresholds live in `config/settings.yaml → model_selection`.
+
+Rule ladder (first match wins, R1–R9; every rule leaves a trace entry): R1 too-short → seasonal_naive; R2 intermittent/lumpy → croston/tsb; R3 many-series panel → global lightgbm (medium confidence when `panel.length_unit == "rows"` — per-series cycle depth is unverifiable for sum/mean aggs, whose panel lengths are row counts); R4 strong **leading** exog (+ ≥100 points) → lightgbm, otherwise exog stays a hint for SARIMAX; R5 multiple seasonal periods → mstl; R6 strong seasonality + ≥3 cycles → auto_arima (ACF-rich, period ≤ 24) or auto_ets (heteroskedastic-log prefers multiplicative ETS); R7 trend-dominant → auto_theta; R8 near-noise → seasonal_naive + warning; R9 default → auto_ets (low).
+
+Encoded domain guards: **eligibility filter** vetoes croston/tsb on smooth/erratic demand with `zero_pct < 20` (makes an LLM intermittent-pick on smooth data structurally impossible); exog is "usable" only when it **leads** (`best_lag ≥ 1`, |corr| ≥ 0.4) — lag-0 correlation needs future values; a lead within ±2 of the seasonal period is flagged `seasonal_echo` (milk's lag-13 corr on period-12 data); `vif_max > 10` → collinearity warning; SARIMA is infeasible above period 24. `training_hints` (transform / exog_usable / seasonal_periods / policy aggregate-vs-per_series_local-vs-global / metric MASE) is always computed for Stages 6–7 — `transform` copies Stage 4's recommendation, never invents one.
+
+Reference behavior: milk `run_20260630_144854` → R6 auto_arima high (runner-up auto_ets); vet `run_20260703_120826` → R7 auto_theta medium. With the LLM on (groq llama-3.1-8b), the milk pick was observed to be overridden to auto_ets citing exog collinearity — a legal, transparent override (`source: "llm"`, rule pick still shown in the UI).
 
 ### Frontend — Tab-based UI (Dash 4.3.0)
 
-The UI is a single-page Dash app with a **static tab bar** (`dcc.Tabs` in `frontend/layout.py`, `_build_tabs()`) — one tab per pipeline stage (Data & Pre-clean EDA, Setup & Cleaning, Forecast EDA, Model Select, Training, Results). All state lives in `dcc.Store(id="results-store", storage_type="session")` — session storage matters: the default (`memory`) is wiped on every page refresh, which previously made the UI look randomly broken.
+The UI is a single-page Dash app with a **static tab bar** (`dcc.Tabs` in `frontend/layout.py`, `_build_tabs()`) — one tab per pipeline stage (Data & Pre-clean EDA, Pipeline Setup, Forecast EDA, Model Select, Training, Results). The Pipeline Setup tab keeps value `tab-clean` (renamed label only — the value maps to `pane-clean` and persists in browser session storage). All state lives in `dcc.Store(id="results-store", storage_type="session")` — session storage matters: the default (`memory`) is wiped on every page refresh, which previously made the UI look randomly broken.
 
 **All tab panes stay mounted; tab switching is clientside-only.** The layout has six always-present pane divs (`pane-data` … `pane-results`) inside `tab-content`; a `clientside_callback` on `stage-tabs.value` toggles their `style.display`. Server callbacks re-render only the data-dependent bodies (`data-tab-results`, `clean-tab-body`, `past-runs-list`, the ingestion form/loaded-state toggle) and only on `results-store` changes — one round trip per store change (`render_data_pane`), zero per tab switch. Do **not** go back to rebuilding tab content on `stage-tabs.value` (the old `render_tab` pattern): constant unmount/remount of components triggered both renderer bugs below on every switch, and pinned the server for pure UI navigation. Keeping the form mounted also preserves typed DB credentials across tab switches.
 
@@ -261,7 +283,7 @@ Verified in this codebase: `running=` works on a plain synchronous `@callback` �
 **Critical Dash 4 patterns used here:**
 - Global `@callback` decorator (not `@app.callback`)
 - `app.py` forces `Cache-Control: no-store` on the index page (and `/_dash-layout`, `/_dash-dependencies`). Inline clientside callback functions ship *inside* the index HTML; a browser-cached stale index combined with live-fetched dependencies crashes any clientside callback added since with "Cannot read properties of undefined (reading 'apply')". Fingerprinted `_dash-component-suites` bundles stay cacheable.
-- `suppress_callback_exceptions=True` — still required for the components rendered dynamically inside the pane bodies (`btn-confirm-run`, the `dropdown-intent-*` family, `btn-fcst-rerun`, `btn-run-eda`, `btn-clear-results`)
+- `suppress_callback_exceptions=True` — still required for the components rendered dynamically inside the pane bodies (`btn-confirm-run`, the `dropdown-intent-*` family, `btn-fcst-rerun`, `btn-model-rerun`, `switch-model-llm`, `btn-run-eda`, `btn-clear-results`)
 - `allow_duplicate=True` on secondary callbacks that share an output with a primary callback
 - `dcc.Loading` with `target_components={"component-id": "prop"}` to show spinners near buttons when the actual output target is elsewhere in the layout (e.g. the root-level `cleaning-status` div, or `results-store.data` for the broad loading overlay wrapping `tab-content`)
 

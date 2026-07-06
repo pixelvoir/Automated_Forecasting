@@ -31,7 +31,7 @@ import requests
 import dash_bootstrap_components as dbc
 from dash import Input, Output, State, dcc, html, dash_table, no_update, callback, ALL, ctx, clientside_callback
 
-from frontend import fcst_eda_view, intent_view
+from frontend import fcst_eda_view, intent_view, model_select_view
 from frontend.layout import RUNS_LIST_STYLE, RUNS_LIST_STYLE_LOCKED, TAB_VALUES
 
 API_URL = os.environ.get("API_URL", "http://localhost:8000")
@@ -105,7 +105,7 @@ clientside_callback(
 
 def _fetch_intent(run_id: str) -> dict | None:
     """Stage 2.5 auto-chain: detect + LLM-refine the forecast-intent suggestions right
-    after pre-clean EDA. Failure is non-fatal — the Setup & Cleaning tab has a Detect
+    after pre-clean EDA. Failure is non-fatal — the Pipeline Setup tab has a Detect
     button as the retry path."""
     try:
         resp = requests.post(f"{API_URL}/runs/{run_id}/forecast-intent", timeout=900)
@@ -310,7 +310,7 @@ def trigger_run(n_clicks, source, table, query, host, port, database, user, pass
             if eda_resp.ok:
                 full_data["_stage2"] = eda_resp.json()
                 # Auto-chain Stage 2.5: intent suggestions are ready by the time the
-                # user opens the Setup & Cleaning tab.
+                # user opens the Pipeline Setup tab.
                 intent = _fetch_intent(run_id)
                 if intent:
                     full_data["_intent"] = {"suggestions": intent}
@@ -380,6 +380,14 @@ def render_clean_body(data):
 )
 def render_fcst_eda_body(data):
     return fcst_eda_view.render_fcst_eda_tab(data)
+
+
+@callback(
+    Output("model-tab-body", "children"),
+    Input("results-store", "data"),
+)
+def render_model_body(data):
+    return model_select_view.render_model_tab(data)
 
 
 @callback(
@@ -497,7 +505,7 @@ def _render_data_results(data):
     header = html.Div([
         html.H5(
             [_cicon("bi-database-check", color="#10b981", marginRight="7px"), "Dataset"],
-            className="fw-semibold mb-0", style={"color": "#c7d2fe"},
+            className="fw-semibold mb-0 section-title",
         ),
         dbc.Button(
             [html.I(className="bi bi-arrow-counterclockwise", style={"marginRight": "4px"}), "New Run"],
@@ -606,11 +614,12 @@ def _build_runs_list() -> list:
             s2_badge = dbc.Badge("S2", color="success", className="ms-1") if r.get("has_stage2") else None
             s3_badge = dbc.Badge("S3", color="info", className="ms-1") if r.get("has_stage3") else None
             s4_badge = dbc.Badge("S4", color="primary", className="ms-1") if r.get("has_stage4") else None
+            s5_badge = dbc.Badge("S5", color="warning", className="ms-1") if r.get("has_stage5") else None
             items.append(
                 html.Div([
                     dbc.Button(
                         [
-                            html.Div([label, s2_badge, s3_badge, s4_badge],
+                            html.Div([label, s2_badge, s3_badge, s4_badge, s5_badge],
                                      className="small fw-semibold text-truncate"),
                             html.Div(f"{r['rows']:,} rows × {r['cols']} cols",
                                      className="text-muted", style={"fontSize": "11px"}),
@@ -740,7 +749,7 @@ def _render_stage2(stage2: dict) -> list:
         html.Hr(className="my-4"),
         html.H5([html.I(className="bi bi-search", style={"marginRight": "7px", "color": "#10b981"}),
                  "Pre-clean EDA"],
-                className="fw-semibold mb-3", style={"color": "#c7d2fe"}),
+                className="fw-semibold mb-3 section-title"),
     ]
 
     missing = dp.get("missing", {})
@@ -845,7 +854,7 @@ def _fmt(v: float) -> str:
 
 
 # ── 11. Confirm intent → clean → validate → forecast EDA (one chain) ─────────
-# The Setup & Cleaning tab's confirm button drives the whole pipeline through Stage 4.
+# The Pipeline Setup tab's confirm button drives the whole pipeline through Stage 5.
 # Outputs to cleaning-status (persistent in layout) instead of any dynamically rendered
 # component, so the store update always reaches the pane renderers regardless of
 # component lifecycle timing in Dash 4. On full success the UI lands on Forecast EDA.
@@ -918,9 +927,10 @@ def confirm_and_run(n_clicks, store_data, ts, target, agg, scope, group_cols,
             **(store_data.get("_intent") or {}),
             "selections": {k: v for k, v in body.items() if k != "use_llm"},
         }
-        # The cleaned parquet was just rewritten — earlier Stage 4 results describe data
-        # that no longer exists.
+        # The cleaned parquet was just rewritten — earlier Stage 4/5 results describe
+        # data that no longer exists.
         new_store.pop("_stage4", None)
+        new_store.pop("_stage5", None)
 
         eda_resp = requests.post(f"{API_URL}/runs/{run_id}/forecast-eda", json={},
                                  timeout=1800)
@@ -941,7 +951,23 @@ def confirm_and_run(n_clicks, store_data, ts, target, agg, scope, group_cols,
             new_store["_intent"]["selections"] = result["selections"]
         new_store["_stage4"] = {"eda": {"payload": result.get("payload"),
                                         "full": result.get("full")}}
-        return new_store, "", "tab-fcst-eda"
+
+        msel_resp = requests.post(f"{API_URL}/runs/{run_id}/model-select",
+                                  json={"use_llm": bool(use_llm)}, timeout=300)
+        if msel_resp.ok:
+            new_store["_stage5"] = msel_resp.json().get("selection")
+            return new_store, "", "tab-fcst-eda"
+        # EDA succeeded — keep it, but surface the selection failure visibly (house
+        # rule: a 409 must never look like "nothing happened").
+        if msel_resp.status_code == 409:
+            msel_msg = "model selection was preempted by a newer action"
+        else:
+            msel_msg = ("model selection failed: "
+                        + msel_resp.json().get("detail", "unknown error"))
+        return new_store, dbc.Alert(
+            f"Pipeline finished through forecast EDA, but {msel_msg} — "
+            "re-run it from the Model Select tab.",
+            color="warning", dismissable=True, className="mb-2"), "tab-fcst-eda"
 
     except requests.exceptions.Timeout:
         return no_update, dbc.Alert(
@@ -1039,7 +1065,7 @@ def _llm_status_banner(stage3: dict):
 
 
 def _render_clean_tab(data):
-    """Setup & Cleaning: the pipeline's single user checkpoint. Intent form (Stage 2.5
+    """Pipeline Setup: the pipeline's single user checkpoint. Intent form (Stage 2.5
     suggestions, LLM-refined) on top; cleaning recipe/results + validation gate below
     once the confirm chain has run."""
     if not data or "_stage2" not in data:
@@ -1056,8 +1082,8 @@ def _render_clean_tab(data):
     stage3 = data.get("_stage3", {})
 
     header = html.Div([
-        html.Span([_cicon("bi-sliders"), "Setup & Cleaning"],
-                  className="fw-semibold", style={"color": "#c7d2fe"}),
+        html.Span([_cicon("bi-sliders"), "Pipeline Setup"],
+                  className="fw-semibold section-title"),
     ], className="mb-3")
 
     if not suggestions:
@@ -1243,17 +1269,22 @@ def run_intent_redetect(n_clicks, store_data):
     State("results-store", "data"),
     State("dropdown-fcst-freq", "value"),
     State("input-fcst-horizon", "value"),
+    State("switch-use-llm", "value"),
     running=[(Output("btn-fcst-rerun", "disabled"), True, False)],
     prevent_initial_call=True,
 )
-def rerun_fcst_eda(n_clicks, store_data, freq, horizon):
+def rerun_fcst_eda(n_clicks, store_data, freq, horizon, use_llm):
     """Stage-4-only re-run with frequency/horizon overrides — these don't affect
-    cleaning, so adjusting them must not force a re-clean."""
+    cleaning, so adjusting them must not force a re-clean. Model selection is
+    re-chained afterward (fresh evidence invalidates the old decision)."""
     if not n_clicks or not store_data:
         return no_update, no_update
     run_id = store_data.get("run_id")
     if not run_id:
         return no_update, dbc.Alert("No active run found.", color="warning", className="mb-2")
+    # Pre-refactor runs render detect_prompt_card without the LLM switch — treat a
+    # missing switch as "on" rather than silently disabling the LLM.
+    use_llm = True if use_llm is None else bool(use_llm)
     body = {"forecast_frequency": freq, "horizon": int(horizon) if horizon else None}
     try:
         resp = requests.post(f"{API_URL}/runs/{run_id}/forecast-eda", json=body, timeout=1800)
@@ -1274,10 +1305,67 @@ def rerun_fcst_eda(n_clicks, store_data, freq, horizon):
         if result.get("selections"):
             new_store["_intent"] = {**(store_data.get("_intent") or {}),
                                     "selections": result["selections"]}
-        return new_store, ""
+        # Fresh Stage 4 evidence invalidates the old model decision — re-select.
+        new_store.pop("_stage5", None)
+        msel_resp = requests.post(f"{API_URL}/runs/{run_id}/model-select",
+                                  json={"use_llm": use_llm}, timeout=300)
+        if msel_resp.ok:
+            new_store["_stage5"] = msel_resp.json().get("selection")
+            return new_store, ""
+        msel_msg = ("was preempted by a newer action" if msel_resp.status_code == 409
+                    else "failed: " + msel_resp.json().get("detail", "unknown error"))
+        return new_store, dbc.Alert(
+            f"Forecast EDA finished, but model selection {msel_msg} — "
+            "re-run it from the Model Select tab.",
+            color="warning", dismissable=True, className="mb-2")
     except requests.exceptions.Timeout:
         return no_update, dbc.Alert(
             "Forecast EDA timed out after 30 minutes.", color="danger", dismissable=True, className="mb-2"
+        )
+    except requests.exceptions.ConnectionError:
+        return no_update, dbc.Alert(
+            "Cannot reach API — is run_dev.bat running?", color="danger", dismissable=True, className="mb-2"
+        )
+    except Exception as e:
+        return no_update, dbc.Alert(str(e), color="danger", dismissable=True, className="mb-2")
+
+
+@callback(
+    Output("results-store", "data", allow_duplicate=True),
+    Output("cleaning-status", "children", allow_duplicate=True),
+    Input("btn-model-rerun", "n_clicks"),
+    State("results-store", "data"),
+    State("switch-model-llm", "value"),
+    running=[(Output("btn-model-rerun", "disabled"), True, False)],
+    prevent_initial_call=True,
+)
+def run_model_select(n_clicks, store_data, use_llm):
+    """Stage-5-only re-run from the Model Select tab (e.g. to compare the rules-only
+    pick against the LLM's, or after a chain failure). Selection is cheap — one JSON
+    read plus at most one LLM call."""
+    if not n_clicks or not store_data:
+        return no_update, no_update
+    run_id = store_data.get("run_id")
+    if not run_id:
+        return no_update, dbc.Alert("No active run found.", color="warning", className="mb-2")
+    try:
+        resp = requests.post(f"{API_URL}/runs/{run_id}/model-select",
+                             json={"use_llm": bool(use_llm)}, timeout=300)
+        if resp.status_code == 409:
+            return no_update, dbc.Alert(
+                "This request was cancelled by a newer action. Click Re-run Selection again.",
+                color="warning", dismissable=True, className="mb-2",
+            )
+        if not resp.ok:
+            detail = resp.json().get("detail", "Model selection failed")
+            return no_update, dbc.Alert(
+                f"Model selection error: {detail}", color="danger", dismissable=True, className="mb-2"
+            )
+        new_store = {**store_data, "_stage5": resp.json().get("selection")}
+        return new_store, ""
+    except requests.exceptions.Timeout:
+        return no_update, dbc.Alert(
+            "Model selection timed out.", color="danger", dismissable=True, className="mb-2"
         )
     except requests.exceptions.ConnectionError:
         return no_update, dbc.Alert(

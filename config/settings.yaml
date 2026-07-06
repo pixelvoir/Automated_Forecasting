@@ -11,8 +11,8 @@
 # Only computed statistics (~200 tokens) are sent — no raw data, no row values.
 # Column names ARE included in the payload (unavoidable for recipe keying).
 llm:
-  provider: "groq"
-  model: "llama-3.1-8b-instant"
+  provider: "gemini"
+  model: "gemini-2.5-flash"
   base_url: "http://localhost:11434/v1"   # only used for ollama (custom endpoint)
   timeout_seconds: 60
   max_retries: 2
@@ -50,6 +50,23 @@ forecast_eda:
   stl_max_points: 50000        # above this, classical decomposition replaces STL (LOESS too slow)
   plot_max_points: 1500        # downsampling cap for chart arrays saved in the full JSON
   top_series_deep_dive: 3      # per-series scope: full stats battery on top-K series by volume
+
+# Stage 5: model selection rule thresholds (catalog lives in model_categories.yaml)
+model_selection:
+  short_series_length: 20        # R1: below this -> baseline
+  low_forecastability: 0.2       # R8: below this (and weak seasonality) -> baseline + warning
+  seasonality_strong: 0.6
+  seasonality_moderate: 0.3
+  trend_strong: 0.6
+  min_cycles_for_seasonal: 3     # R6: full seasonal cycles needed before trusting SARIMA/ETS-seasonal
+  sarima_max_period: 24          # SARIMA infeasible above this (weekly-52 / daily-365 -> ETS/MSTL path)
+  exog_min_abs_corr: 0.4         # lag>=1 |corr| for an exog to enter training_hints.exog_usable
+  exog_route_min_abs_corr: 0.5   # stronger bar for exog to ROUTE the decision to ML (R4)
+  exog_route_min_length: 100     # below this exog never routes the model choice, only hints
+  vif_collinear: 10              # vif_max above this -> collinearity warning
+  panel_global_min_series: 30    # R3: panels at/above this route to a global ML model
+  panel_global_min_cycles: 2     # R3: median series length (in periods) needed to verify global routing
+  intermittent_veto_zero_pct: 20 # croston/tsb INELIGIBLE when class=smooth and zero_pct below this
 
 # Stage 2: pre-cleaning EDA settings
 pre_clean_eda:

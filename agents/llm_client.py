@@ -62,8 +62,7 @@ def call(messages: list[dict], *, require_json: bool = True) -> dict:
         )
 
     defaults = _PROVIDER_DEFAULTS[provider]
-    # base_url in settings only overrides for ollama / custom endpoints; ignored for cloud providers
-    base_url = (cfg.get("base_url") if provider == "ollama" else None) or defaults["base_url"]
+    
 
     if provider == "ollama":
         api_key = "ollama"  # Ollama's OpenAI-compat endpoint accepts any non-empty string
@@ -76,6 +75,13 @@ def call(messages: list[dict], *, require_json: bool = True) -> dict:
                 f"Set '{key_env}' in your .env file."
             )
 
+    # base_url in settings only overrides for ollama / custom endpoints; ignored for cloud providers
+    base_url = (cfg.get("base_url") if provider == "ollama" else None) or defaults["base_url"]
+
+    # Gemini's OpenAI-compat endpoint takes the key as a normal Bearer header like the
+    # others. Do NOT append it as a ?key= URL parameter — the OpenAI client joins the
+    # request path AFTER the query string (".../openai/?key=X/chat/completions"), which
+    # 404s on every call.
     client = OpenAI(
         api_key=api_key,
         base_url=base_url,

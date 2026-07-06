@@ -8,7 +8,10 @@ the child does at startup) stays cheap.
 from dotenv import load_dotenv
 
 # The child process is spawned fresh, so it must load .env itself for LLM credentials.
-load_dotenv()
+# override=True: the child inherits the parent server's env, which holds whatever the
+# .env said at SERVER startup — without override, editing .env (e.g. rotating an API
+# key) silently keeps the stale key until the server restarts.
+load_dotenv(override=True)
 
 
 def ingest_task(table=None, query=None, credentials=None, file_path=None) -> dict:
@@ -57,3 +60,10 @@ def forecast_eda_task(run_id: str) -> dict:
     """Stage 4: full forecasting EDA on the user-confirmed intent."""
     from pipeline import forecasting_eda
     return forecasting_eda.run(run_id)
+
+
+def model_select_task(run_id: str, use_llm: bool = True) -> dict:
+    """Stage 5: the rule engine always decides first; the LLM (when enabled) may
+    override it. An LLM failure leaves the rule-engine pick standing."""
+    from agents import model_selector_agent
+    return model_selector_agent.run(run_id, use_llm=use_llm)

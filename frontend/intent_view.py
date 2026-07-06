@@ -1,4 +1,4 @@
-"""Setup & Cleaning tab — the intent form (pure rendering; callbacks live in callbacks.py).
+"""Pipeline Setup tab — the intent form (pure rendering; callbacks live in callbacks.py).
 
 This is the pipeline's single user checkpoint: timestamp, target (+aggregation including
 event counts), scope, series key, exogenous drivers, forecast frequency and horizon —
@@ -121,7 +121,7 @@ def build_intent_form(suggestions: dict, selections: dict | None, already_run: b
         dbc.CardBody([
             html.Div([
                 html.P([_cicon("bi-sliders"), "Confirm Forecast Setup"],
-                       className="fw-semibold mb-0", style={"color": "#c7d2fe"}),
+                       className="fw-semibold mb-0 section-title"),
                 dbc.Button([_cicon("bi-arrow-clockwise"), "Re-detect"],
                            id="btn-intent-redetect", color="link", size="sm",
                            className="p-0 text-decoration-none"),
@@ -211,7 +211,7 @@ def build_intent_form(suggestions: dict, selections: dict | None, already_run: b
             dbc.Row([
                 dbc.Col([
                     dbc.Switch(id="switch-use-llm", value=True,
-                               label="Use LLM for the cleaning recipe",
+                               label="Use LLM for pipeline (cleaning recipe + model selection)",
                                className="mt-1",
                                style={"fontSize": "0.82rem", "color": "#94a3b8"}),
                 ], md=6),
@@ -220,8 +220,7 @@ def build_intent_form(suggestions: dict, selections: dict | None, already_run: b
             dcc.Loading(
                 dbc.Button(
                     [_cicon("bi-play-fill"),
-                     "Re-run Pipeline (Clean → Validate → Forecast EDA)" if already_run
-                     else "Confirm & Run Pipeline (Clean → Validate → Forecast EDA)"],
+                     "Re-Run Pipeline" if already_run else "Run Pipeline"],
                     id="btn-confirm-run", color="primary", className="w-100",
                     disabled=not (ts_default and target_default),
                     style={"fontWeight": "600", "letterSpacing": "0.02em"},
@@ -229,6 +228,9 @@ def build_intent_form(suggestions: dict, selections: dict | None, already_run: b
                 type="circle", color="#6366f1", delay_show=100,
                 target_components={"cleaning-status": "children"},
             ),
+            html.Small("Runs the full pipeline: clean → validate → forecast EDA → model selection.",
+                       className="d-block text-center mt-1",
+                       style={"color": "#64748b", "fontSize": "0.7rem"}),
         ]),
         className="mb-3",
         style={"background": "rgba(30, 41, 59, 0.7)",
@@ -240,7 +242,7 @@ def detect_prompt_card():
     """Shown when suggestions haven't been produced yet (auto-detect failed or old run)."""
     return dbc.Card(dbc.CardBody([
         html.P([_cicon("bi-sliders"), "Detect Forecast Setup"],
-               className="fw-semibold mb-2", style={"color": "#c7d2fe"}),
+               className="fw-semibold mb-2 section-title"),
         html.P("Scans the data and suggests the forecast target, timestamp, series "
                "grouping and horizon (LLM-assisted) — you confirm everything before "
                "cleaning runs.",
@@ -257,30 +259,3 @@ def detect_prompt_card():
                "border": "1px solid rgba(99, 102, 241, 0.3)"})
 
 
-def intent_summary_bar(selections: dict):
-    """Compact read-only recap of the confirmed intent (shown on the Forecast EDA tab)."""
-    if not selections:
-        return None
-    agg_label = {"sum": "sum", "mean": "mean", "nunique": "count of distinct"}.get(
-        selections.get("agg"), selections.get("agg"))
-    parts = [
-        ("Target", f"{agg_label} {selections.get('target_col')}"),
-        ("Timestamp", selections.get("timestamp_col")),
-        ("Scope", selections.get("scope")),
-        ("Series key", ", ".join(selections.get("group_cols") or []) or "—"),
-        ("Frequency", selections.get("forecast_frequency")),
-        ("Horizon", selections.get("horizon")),
-    ]
-    return dbc.Card(dbc.CardBody(
-        html.Div([
-            html.Span([
-                html.Span(f"{label}: ", style={"color": "#64748b", "fontSize": "0.72rem",
-                                               "textTransform": "uppercase",
-                                               "letterSpacing": "0.05em"}),
-                html.Span(str(value), style={"color": "var(--bs-body-color)",
-                                             "fontSize": "0.82rem", "fontWeight": "600",
-                                             "marginRight": "18px"}),
-            ]) for label, value in parts
-        ], className="d-flex flex-wrap align-items-center"),
-        className="py-2",
-    ), className="mb-3", style={"borderLeft": "3px solid #6366f1"})
