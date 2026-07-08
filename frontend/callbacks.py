@@ -31,7 +31,7 @@ import requests
 import dash_bootstrap_components as dbc
 from dash import Input, Output, State, dcc, html, dash_table, no_update, callback, ALL, ctx, clientside_callback
 
-from frontend import fcst_eda_view, intent_view, model_select_view
+from frontend import fcst_eda_view, intent_view, model_select_view, training_view
 from frontend.layout import RUNS_LIST_STYLE, RUNS_LIST_STYLE_LOCKED, TAB_VALUES
 
 API_URL = os.environ.get("API_URL", "http://localhost:8000")
@@ -388,6 +388,14 @@ def render_fcst_eda_body(data):
 )
 def render_model_body(data):
     return model_select_view.render_model_tab(data)
+
+
+@callback(
+    Output("training-tab-body", "children"),
+    Input("results-store", "data"),
+)
+def render_training_body(data):
+    return training_view.render_training_tab(data)
 
 
 @callback(
@@ -1269,14 +1277,16 @@ def run_intent_redetect(n_clicks, store_data):
     State("results-store", "data"),
     State("dropdown-fcst-freq", "value"),
     State("input-fcst-horizon", "value"),
+    State("radio-fcst-scope", "value"),
     State("switch-use-llm", "value"),
     running=[(Output("btn-fcst-rerun", "disabled"), True, False)],
     prevent_initial_call=True,
 )
-def rerun_fcst_eda(n_clicks, store_data, freq, horizon, use_llm):
-    """Stage-4-only re-run with frequency/horizon overrides — these don't affect
-    cleaning, so adjusting them must not force a re-clean. Model selection is
-    re-chained afterward (fresh evidence invalidates the old decision)."""
+def rerun_fcst_eda(n_clicks, store_data, freq, horizon, scope, use_llm):
+    """Stage-4-only re-run with scope / frequency / horizon overrides — none of these
+    affect cleaning (cleaner.py never reads them), so adjusting them must NOT force a
+    re-clean. Model selection is re-chained afterward (fresh evidence invalidates the old
+    decision), and the now-stale Stage 6/7 features+training are dropped."""
     if not n_clicks or not store_data:
         return no_update, no_update
     run_id = store_data.get("run_id")
@@ -1285,7 +1295,8 @@ def rerun_fcst_eda(n_clicks, store_data, freq, horizon, use_llm):
     # Pre-refactor runs render detect_prompt_card without the LLM switch — treat a
     # missing switch as "on" rather than silently disabling the LLM.
     use_llm = True if use_llm is None else bool(use_llm)
-    body = {"forecast_frequency": freq, "horizon": int(horizon) if horizon else None}
+    body = {"forecast_frequency": freq, "horizon": int(horizon) if horizon else None,
+            "scope": scope or None}
     try:
         resp = requests.post(f"{API_URL}/runs/{run_id}/forecast-eda", json=body, timeout=1800)
         if resp.status_code == 409:
@@ -1305,8 +1316,10 @@ def rerun_fcst_eda(n_clicks, store_data, freq, horizon, use_llm):
         if result.get("selections"):
             new_store["_intent"] = {**(store_data.get("_intent") or {}),
                                     "selections": result["selections"]}
-        # Fresh Stage 4 evidence invalidates the old model decision — re-select.
-        new_store.pop("_stage5", None)
+        # Fresh Stage 4 evidence invalidates the old model decision + features + training
+        # (the backend purged them on disk) — drop them from the store, re-select below.
+        for k in ("_stage5", "_stage6", "_stage7"):
+            new_store.pop(k, None)
         msel_resp = requests.post(f"{API_URL}/runs/{run_id}/model-select",
                                   json={"use_llm": use_llm}, timeout=300)
         if msel_resp.ok:
@@ -1373,3 +1386,85 @@ def run_model_select(n_clicks, store_data, use_llm):
         )
     except Exception as e:
         return no_update, dbc.Alert(str(e), color="danger", dismissable=True, className="mb-2")
+
+
+# ── Tab 5: Training (Stage 6 + 7) ────────────────────────────────────────────
+# The user picks one or more eligible models; the Stage 5 pick is only the default. The
+# estimate banner updates live as the selection changes; training itself is job-managed
+# (cancellable) with a heavy-cost confirm gate.
+
+@callback(
+    Output("train-estimate-banner", "children"),
+    Input("dropdown-train-models", "value"),
+    State("results-store", "data"),
+    prevent_initial_call=True,
+)
+def update_train_estimate(models, store_data):
+    if not store_data:
+        return no_update
+    return training_view.build_estimate_banner(store_data, models or [])
+
+
+@callback(
+    Output("results-store", "data", allow_duplicate=True),
+    Output("cleaning-status", "children", allow_duplicate=True),
+    Output("stage-tabs", "value", allow_duplicate=True),
+    Input("btn-train", "n_clicks"),
+    State("results-store", "data"),
+    State("dropdown-train-models", "value"),
+    State("switch-train-confirm", "value"),
+    running=[(Output("btn-train", "disabled"), True, False)],
+    prevent_initial_call=True,
+)
+def run_training(n_clicks, store_data, models, confirm):
+    """Stages 6+7 for the user-selected models. Lands on the Training tab on success; a
+    heavy-cost 400 tells the user to enable the confirm switch and retry."""
+    if not n_clicks or not store_data:
+        return no_update, no_update, no_update
+    run_id = store_data.get("run_id")
+    if not run_id:
+        return no_update, dbc.Alert("No active run found.", color="warning", className="mb-2"), no_update
+    if not models:
+        return no_update, dbc.Alert(
+            "Select at least one model to train.", color="warning",
+            dismissable=True, className="mb-2"), no_update
+    body = {"models": models, "confirm_heavy": bool(confirm)}
+    try:
+        resp = requests.post(f"{API_URL}/runs/{run_id}/train", json=body, timeout=3600)
+        if resp.status_code == 409:
+            return no_update, dbc.Alert(
+                "This request was cancelled by a newer action. Click Train again.",
+                color="warning", dismissable=True, className="mb-2"), no_update
+        if resp.status_code == 400:
+            detail = resp.json().get("detail")
+            # The heavy-cost gate returns a dict detail carrying the estimate.
+            if isinstance(detail, dict) and detail.get("needs_confirm"):
+                est = detail.get("estimate", {})
+                return no_update, dbc.Alert(
+                    [_cicon("bi-exclamation-triangle"),
+                     f"{detail.get('message', 'Heavy training request.')} "
+                     f"(~{est.get('units')} units across {est.get('n_series')} series). "
+                     "Enable “Confirm — train anyway” and click Train again."],
+                    color="warning", dismissable=True, className="mb-2"), no_update
+            msg = detail if isinstance(detail, str) else "Training request rejected."
+            return no_update, dbc.Alert(msg, color="danger", dismissable=True, className="mb-2"), no_update
+        if not resp.ok:
+            detail = resp.json().get("detail", "Training failed")
+            return no_update, dbc.Alert(
+                f"Training error: {detail}", color="danger", dismissable=True,
+                className="mb-2"), no_update
+        payload = resp.json()
+        new_store = {**store_data, "_stage7": payload.get("report")}
+        if payload.get("feature_report"):
+            new_store["_stage6"] = payload["feature_report"]
+        return new_store, "", "tab-training"
+    except requests.exceptions.Timeout:
+        return no_update, dbc.Alert(
+            "Training timed out after 60 minutes.", color="danger",
+            dismissable=True, className="mb-2"), no_update
+    except requests.exceptions.ConnectionError:
+        return no_update, dbc.Alert(
+            "Cannot reach API — is run_dev.bat running?", color="danger",
+            dismissable=True, className="mb-2"), no_update
+    except Exception as e:
+        return no_update, dbc.Alert(str(e), color="danger", dismissable=True, className="mb-2"), no_update

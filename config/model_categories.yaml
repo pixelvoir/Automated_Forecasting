@@ -37,30 +37,6 @@ models:
       Benchmark, or when history is shorter than ~2 seasonal cycles; repeats the last
       seasonal cycle. Period 1 degenerates to a plain naive (last value) forecast.
 
-  - id: auto_ets
-    label: "AutoETS"
-    library: statsforecast          # statsforecast.models.AutoETS
-    import_check: statsforecast
-    categories: [statistical]
-    min_length: 10
-    supports_exog: false
-    when_to_use: >-
-      Exponential smoothing with automatic trend/seasonal selection. Best for trend
-      and/or a single seasonality with smooth demand; the multiplicative variants suit
-      series whose variance grows with the level.
-
-  - id: auto_arima
-    label: "AutoARIMA (SARIMAX)"
-    library: statsforecast          # statsforecast.models.AutoARIMA
-    import_check: statsforecast
-    categories: [statistical]
-    min_length: 20
-    supports_exog: true
-    when_to_use: >-
-      Strong single seasonality with rich autocorrelation structure and a known
-      differencing order; can regress on leading or known-future exogenous drivers
-      (SARIMAX). Infeasible for seasonal periods above ~24.
-
   - id: auto_theta
     label: "AutoTheta"
     library: statsforecast          # statsforecast.models.AutoTheta
@@ -71,17 +47,6 @@ models:
     when_to_use: >-
       Trend-dominant series; deseasonalizes then extrapolates a damped trend. Very
       robust default on short-to-medium history (a top performer in the M-competitions).
-
-  - id: mstl
-    label: "MSTL"
-    library: statsforecast          # statsforecast.models.MSTL
-    import_check: statsforecast
-    categories: [statistical]
-    min_length: 24
-    supports_exog: false
-    when_to_use: >-
-      Multiple simultaneous seasonal periods (e.g. daily data with weekly + yearly
-      cycles): decomposes each seasonality, forecasts the deseasonalized trend.
 
   - id: croston
     label: "Croston (optimized)"
@@ -118,26 +83,28 @@ models:
       features. Best with long history and usable exogenous drivers, or trained
       globally across a many-series panel (shared patterns beat per-series fits).
 
-  - id: prophet
-    label: "Prophet"
-    library: prophet                # conditional — commented out of requirements.txt
-    import_check: prophet
-    categories: [statistical]
+  - id: xgboost
+    label: "XGBoost"
+    library: xgboost
+    import_check: xgboost
+    categories: [ml]
     min_length: 30
     supports_exog: true
     when_to_use: >-
-      Additive trend + multiple seasonalities with holiday effects and automatic
-      changepoints; tolerant of missing data. Only selectable when prophet is
-      installed (needs C++ build tools on Windows).
+      Gradient-boosted trees on the same engineered lag / rolling / calendar / exogenous
+      features as LightGBM. An alternative ML learner for long history or a many-series
+      panel; the rule ladder only ever picks lightgbm, but the user (or LLM) may train
+      xgboost instead.
 
   - id: nhits
     label: "NHITS"
-    library: neuralforecast         # NOT installed — available=false until it is
-    import_check: neuralforecast
+    library: torch                  # pure-torch backend (models_lib/nhits_model.py);
+    import_check: torch             # neuralforecast is unusable here (coreforecast segfault)
     categories: [deep_learning]
     min_length: 200
-    supports_exog: true
+    supports_exog: false
     when_to_use: >-
-      Neural hierarchical interpolation: very long series (hundreds of points) or
-      large panels where a deep global model can outperform trees and classical
-      models. Only selectable when neuralforecast (PyTorch) is installed.
+      Neural hierarchical interpolation: long series (hundreds of points) or large
+      panels trained globally — for per-series scope the TOTAL observations across
+      all series count toward min_length, so a 1,800-series monthly panel qualifies
+      even when each series is short. Needs PyTorch installed.

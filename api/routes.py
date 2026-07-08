@@ -25,6 +25,19 @@ def _run_job(func, *args, track_id=None, **kwargs):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def _purge_downstream(run_id: str):
+    """Remove Stage 5/6/7 artifacts that describe data about to be replaced (re-clean or a
+    fresh forecast EDA) so /summary can never resurrect a decision/training made on data
+    that no longer exists."""
+    run_dir = RUNS_DIR / run_id
+    for name in ("model_selection.json", "feature_report.json", "training_report.json"):
+        (run_dir / name).unlink(missing_ok=True)
+    feat = ROOT / "data" / "features"
+    for p in (feat / f"{run_id}_model_frame.parquet", feat / f"{run_id}_features.parquet"):
+        p.unlink(missing_ok=True)
+    shutil.rmtree(ROOT / "models" / run_id, ignore_errors=True)
+
+
 # ── Shared credential model ─────────────────────────────────────────────────
 # Credentials are accepted in the request body only.
 # They are NEVER logged, stored to disk, or forwarded to any external service.
@@ -101,6 +114,8 @@ def list_runs():
                 "has_stage3": (run_dir / "cleaning_recipe.json").exists(),
                 "has_stage4": (run_dir / "model_selection_payload.json").exists(),
                 "has_stage5": (run_dir / "model_selection.json").exists(),
+                "has_stage6": (run_dir / "feature_report.json").exists(),
+                "has_stage7": (run_dir / "training_report.json").exists(),
             })
         except Exception:
             continue
@@ -236,6 +251,16 @@ def get_run_summary(run_id: str):
     if msel_path.exists():
         data["_stage5"] = json.loads(msel_path.read_text())
 
+    # Stage 6 — feature engineering recipe/report
+    fr_path = RUNS_DIR / run_id / "feature_report.json"
+    if fr_path.exists():
+        data["_stage6"] = json.loads(fr_path.read_text())
+
+    # Stage 7 — training results
+    tr_path = RUNS_DIR / run_id / "training_report.json"
+    if tr_path.exists():
+        data["_stage7"] = json.loads(tr_path.read_text())
+
     return data
 
 
@@ -297,9 +322,10 @@ def run_clean(run_id: str, req: CleanRequest = CleanRequest()):
         raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found.")
     selections = {k: v for k, v in req.model_dump().items() if k != "use_llm"}
     (run_dir / "forecast_user_selections.json").write_text(json.dumps(selections, indent=2))
-    # A re-clean invalidates any model decision made on the old cleaned data — remove it
-    # so /summary can't resurrect a stale Stage 5 result if the chain aborts early.
-    (run_dir / "model_selection.json").unlink(missing_ok=True)
+    # A re-clean invalidates every decision made on the old cleaned data (model selection,
+    # features, training) — remove them so /summary can't resurrect a stale result if the
+    # chain aborts early.
+    _purge_downstream(run_id)
 
     result = _run_job(tasks.clean_task, run_id, use_llm=req.use_llm, track_id=run_id)
     return {"run_id": run_id, "status": "completed", **result}
@@ -331,26 +357,40 @@ def run_forecast_intent(run_id: str, req: ForecastIntentRequest = ForecastIntent
 
 
 class ForecastEDARequest(BaseModel):
-    """Optional overrides for a Stage-4-only re-run. Frequency/horizon don't affect
-    cleaning, so adjusting them must not force a re-clean."""
+    """Optional overrides for a Stage-4-only re-run. None of these affect cleaning
+    (cleaner.py never reads scope/frequency/horizon — only the series key / target / agg
+    do), so adjusting them must NOT force a re-clean. `scope` toggles overall-vs-per-series
+    forecasting; changing the series key still requires a re-clean and stays on Pipeline
+    Setup."""
     forecast_frequency: str | None = None
     horizon: int | None = None
+    scope: str | None = None               # "aggregate" | "per_series"
 
 
 @router.post("/{run_id}/forecast-eda")
 def run_forecast_eda(run_id: str, req: ForecastEDARequest = ForecastEDARequest()):
     """Stage 4: full forecasting EDA on the confirmed intent. All statistics computed
-    in Python — the LLM only ever sees model_selection_payload.json (Stage 5)."""
+    in Python — the LLM only ever sees model_selection_payload.json (Stage 5). Frequency,
+    horizon and scope can be re-run here without re-cleaning (they're Stage-4+ concerns)."""
     run_dir = RUNS_DIR / run_id
     if not run_dir.exists():
         raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found.")
-    if req.forecast_frequency or req.horizon:
+    if req.forecast_frequency or req.horizon or req.scope:
         sel_path = run_dir / "forecast_user_selections.json"
         sel = json.loads(sel_path.read_text()) if sel_path.exists() else {}
+        # Per-series forecasting needs a series key; if none was ever confirmed, per-series
+        # cleaning never ran, so this genuinely requires a re-clean on Pipeline Setup.
+        if req.scope == "per_series" and not (sel.get("group_cols")):
+            raise HTTPException(
+                status_code=400,
+                detail="Per-series forecasting needs a series key. Set one on the Pipeline "
+                       "Setup tab and confirm (that choice affects cleaning, so it re-cleans).")
         if req.forecast_frequency:
             sel["forecast_frequency"] = req.forecast_frequency
         if req.horizon:
             sel["horizon"] = req.horizon
+        if req.scope:
+            sel["scope"] = req.scope
         sel_path.write_text(json.dumps(sel, indent=2))
     return _run_job(tasks.forecast_eda_task, run_id, track_id=run_id)
 
@@ -372,3 +412,67 @@ def run_model_select(run_id: str, req: ModelSelectRequest = ModelSelectRequest()
             status_code=400,
             detail="Run forecast EDA first — model selection needs its evidence payload.")
     return _run_job(tasks.model_select_task, run_id, use_llm=req.use_llm, track_id=run_id)
+
+
+class TrainRequest(BaseModel):
+    """The user's model choice for Stage 7. The Stage 5 pick is only the default; the user
+    may train one or more of the ELIGIBLE models (capped in trainer). `confirm_heavy`
+    acknowledges a 'heavy' cost estimate for a big per-series panel."""
+    models: list[str] = []
+    confirm_heavy: bool = False
+
+
+@router.post("/{run_id}/train")
+def run_train(run_id: str, req: TrainRequest = TrainRequest()):
+    """Stages 6+7: feature engineering + training of the user-selected models. The rule
+    engine's pick is a default, not a mandate. Job-managed (cancellable). Returns 400 if
+    model selection hasn't run, if no trainable model was chosen, or — for a big per-series
+    panel — if the estimate is 'heavy' and `confirm_heavy` is false (the response carries
+    the estimate so the UI can prompt for confirmation)."""
+    run_dir = RUNS_DIR / run_id
+    if not run_dir.exists():
+        raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found.")
+    msel_path = run_dir / "model_selection.json"
+    if not msel_path.exists():
+        raise HTTPException(
+            status_code=400,
+            detail="Run model selection (Stage 5) first — training reads its hints and "
+                   "eligibility.")
+
+    from pipeline import trainer  # lazy — keeps API startup light
+
+    msel = json.loads(msel_path.read_text())
+    hints = msel.get("training_hints") or {}
+    policy = hints.get("policy") or "aggregate"
+    eligible = {m["id"]: m for m in (msel.get("eligible_models") or [])}
+
+    def _trainable(mid):
+        m = eligible.get(mid)
+        return (mid in trainer.registry.KNOWN_IDS and m is not None
+                and m.get("available", True) and not m.get("excluded_reason"))
+
+    valid = [m for m in dict.fromkeys(req.models) if _trainable(m)]
+    if not valid:
+        sug = msel.get("model")
+        if sug and sug in trainer.registry.KNOWN_IDS:
+            valid = [sug]
+        else:
+            raise HTTPException(status_code=400,
+                                detail="No trainable model selected. Pick at least one "
+                                       "eligible model.")
+
+    n_series = 1
+    payload_path = run_dir / "model_selection_payload.json"
+    if payload_path.exists():
+        panel = (json.loads(payload_path.read_text()).get("panel") or {})
+        n_series = panel.get("n_series") or 1
+
+    estimate = trainer.estimate_cost(n_series, policy, valid, trainer._load_config())
+    if estimate["tier"] == "heavy" and not req.confirm_heavy:
+        raise HTTPException(status_code=400, detail={
+            "message": "Training this many series/models is heavy — confirm to proceed.",
+            "estimate": estimate, "needs_confirm": True})
+
+    result = _run_job(tasks.train_task, run_id, valid, confirm_heavy=req.confirm_heavy,
+                      track_id=run_id)
+    return {"run_id": run_id, "status": "completed", **result}

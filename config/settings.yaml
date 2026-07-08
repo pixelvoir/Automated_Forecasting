@@ -34,6 +34,8 @@ ingest:
   row_limit: null          # null = fetch all rows; set an integer to cap rows (useful for large tables during dev)
   raw_format: parquet
   top_n_categories: 5      # how many top values to include in cardinality stats
+  csv_block_size_mb: 64    # CSV→Parquet is streamed in blocks of this size (bounds peak RAM;
+                           # a large CSV never lives fully in memory). Lower it on a tight box.
 
 # Stage 2.5: forecast intent detection (runs after pre-clean EDA, before cleaning)
 forecast_intent:
@@ -67,6 +69,40 @@ model_selection:
   panel_global_min_series: 30    # R3: panels at/above this route to a global ML model
   panel_global_min_cycles: 2     # R3: median series length (in periods) needed to verify global routing
   intermittent_veto_zero_pct: 20 # croston/tsb INELIGIBLE when class=smooth and zero_pct below this
+
+# Stage 6: feature engineering (deterministic, EDA-seeded — no LLM). Only the ML models
+# (lightgbm/xgboost) actually consume the engineered matrix; the classical/statsforecast
+# models train on the raw series. The recipe is derived from the Stage 4 EDA output.
+feature_engineering:
+  max_lags: 12                 # cap on lag features taken from significant ACF lags
+  fourier_order: 3             # sin/cos harmonics per seasonal period
+  rolling_windows_extra: []    # extra rolling windows beyond the primary period (e.g. [3])
+  holiday_country: null        # ISO code (e.g. "IN") for is_holiday; needs the optional `holidays` pkg
+
+# Stage 7: model training. Walk-forward CV window count adapts to series length; large
+# panels shrink the window count and Optuna budget so training stays bounded.
+training:
+  cv_windows: 3                # rolling-origin windows on a normal-length series
+  cv_windows_large_panel: 1    # windows once n_series >= large_panel_series
+  min_train_multiple: 2        # min train length floor = this * seasonal period
+  test_holdout_fraction: 0.15  # single-holdout fallback when the series is too short for CV
+  interval_levels: [80, 95]    # prediction-interval coverage levels (ML quantile / conformal)
+  # Accuracy vs time budget — the user accepted longer training for better results.
+  # fast: no tuning, small budgets; balanced: default; max: 1-3h-class training.
+  accuracy_profile: balanced
+  profiles:
+    fast:     {optuna_trials: 0,   early_stopping_rounds: 50, nhits_max_epochs: 60}
+    balanced: {optuna_trials: 30,  early_stopping_rounds: 80, nhits_max_epochs: 200}
+    max:      {optuna_trials: 100, early_stopping_rounds: 120, nhits_max_epochs: 500}
+  optuna_trials_large: 8       # override once n_series >= large_panel_series (any profile)
+  max_train_rows: 1500000      # stratified (series, horizon) subsample cap for huge panels
+  max_models_per_run: 4        # hard cap on models trained simultaneously (baseline excluded)
+  per_series_cap: 200          # per_series_local: model top-K series individually, tail -> aggregate
+  large_panel_series: 500      # n_series at/above this triggers the large-data reductions
+  # Cost tiers (units = policy_multiplier * n_series_effective * n_models):
+  moderate_tier_units: 200     # units above this -> "moderate"
+  heavy_tier_units: 2000       # units above this -> "heavy" (requires confirm_heavy)
+  plot_max_points: 1500        # downsample cap for backtest/forecast arrays in the report
 
 # Stage 2: pre-cleaning EDA settings
 pre_clean_eda:

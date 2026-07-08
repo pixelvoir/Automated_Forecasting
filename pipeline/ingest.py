@@ -14,6 +14,13 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import URL
 from sqlalchemy.pool import NullPool
 
+try:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+except Exception:  # pragma: no cover - optional dependency
+    pa = None
+    pq = None
+
 ROOT = Path(__file__).resolve().parent.parent
 RUNS_DIR = ROOT / "runs"
 RAW_DIR = ROOT / "data" / "raw"
@@ -153,6 +160,146 @@ def _read_file(file_path: str, row_limit: int = None) -> pd.DataFrame:
     raise ValueError(f"Unsupported file type '{suffix}'. Supported: .csv, .xlsx, .xls, .parquet")
 
 
+def _write_csv_parquet(file_path, raw_path: Path, block_bytes: int,
+                       convert_options, row_limit: int = None) -> int:
+    """Stream a CSV to Parquet block-by-block. pyarrow's streaming reader infers ONE schema
+    for the whole file and applies it to every block (unlike pandas' per-chunk inference,
+    which diverges across chunk boundaries and made the old ParquetWriter crash). Peak memory
+    is one block, not the whole file. Returns the rows written."""
+    import pyarrow.csv as pacsv
+    read_options = pacsv.ReadOptions(block_size=block_bytes)
+    convert_options = convert_options or pacsv.ConvertOptions()
+    reader = pacsv.open_csv(file_path, read_options=read_options, convert_options=convert_options)
+    writer = None
+    total = 0
+    try:
+        for batch in reader:
+            if row_limit is not None:
+                if total >= row_limit:
+                    break
+                if total + batch.num_rows > row_limit:
+                    batch = batch.slice(0, row_limit - total)
+            if writer is None:
+                writer = pq.ParquetWriter(raw_path, batch.schema, compression="snappy")
+            writer.write_table(pa.Table.from_batches([batch]))
+            total += batch.num_rows
+    finally:
+        if writer is not None:
+            writer.close()
+    if writer is None:
+        raise ValueError(f"CSV file is empty: {file_path}")
+    return total
+
+
+def _stream_csv_to_parquet(
+    file_path: str,
+    raw_path: Path,
+    row_limit: int = None,
+    block_size_mb: int = 64,
+    top_n: int = 5,
+) -> dict:
+    """Convert a (potentially large) CSV to Parquet with bounded memory, then compute EXACT
+    metadata from the columnar Parquet — one column at a time — so a 254MB CSV never has to
+    live in RAM as a pandas DataFrame (which is what OOM-crashed the old path).
+
+    Type handling: pyarrow infers proper column types for clean CSVs; if a column's values
+    conflict under inference (pure-int early, a real string later), we retry reading every
+    column as string. That's safe here — Stage 1 re-classifies numeric-as-string columns and
+    Stage 2/3 re-coerce them (the pipeline is built for string-typed input, see CLAUDE.md)."""
+    if pa is None or pq is None:
+        raise RuntimeError(
+            "CSV streaming requires 'pyarrow'. Install it to enable large file uploads.")
+
+    import pyarrow.csv as pacsv
+    block_bytes = max(int(block_size_mb), 1) * 1024 * 1024
+    try:
+        row_count = _write_csv_parquet(file_path, raw_path, block_bytes, None, row_limit)
+    except (pa.ArrowInvalid, pa.ArrowTypeError, pa.ArrowNotImplementedError):
+        # Inference conflict across blocks — fall back to reading everything as string.
+        Path(raw_path).unlink(missing_ok=True)
+        cols = pd.read_csv(file_path, nrows=0).columns.tolist()
+        convert = pacsv.ConvertOptions(column_types={c: pa.string() for c in cols})
+        row_count = _write_csv_parquet(file_path, raw_path, block_bytes, convert, row_limit)
+
+    return {"metadata": extract_metadata_from_parquet(
+        raw_path, source_bytes=Path(file_path).stat().st_size, top_n=top_n)}
+
+
+def _count_duplicates_parquet(pf, batch_rows: int = 131_072) -> int:
+    """Exact duplicate-row count with bounded memory: hash each row (batched) and keep only
+    the uint64 hashes (8 bytes/row), not the rows themselves. 64-bit collisions are
+    negligible, so this is effectively exact without ever materializing the full frame."""
+    hashes = []
+    for batch in pf.iter_batches(batch_size=batch_rows):
+        dfb = batch.to_pandas()
+        hashes.append(pd.util.hash_pandas_object(dfb, index=False).to_numpy())
+    if not hashes:
+        return 0
+    allh = np.concatenate(hashes)
+    return int(len(allh) - len(np.unique(allh)))
+
+
+def extract_metadata_from_parquet(raw_path: Path, source_bytes: int, top_n: int = 5) -> dict:
+    """Stage 1 statistics read column-by-column from a Parquet file, so peak memory is one
+    column (not the whole dataset). Same output shape as extract_metadata(). No raw values."""
+    pf = pq.ParquetFile(raw_path)
+    try:
+        cols = list(pf.schema_arrow.names)
+        n_rows = pf.metadata.num_rows
+        dup_count = _count_duplicates_parquet(pf)
+
+        schema_rows, nulls, cardinality, numeric_stats = [], {}, {}, {}
+        datetime_cols, frequency = [], {}
+        for col in cols:
+            s = pf.read(columns=[col]).column(0).to_pandas()
+            dt = _infer_dtype(s)
+            schema_rows.append({"col": col, "dtype_raw": str(s.dtype), "dtype_inferred": dt})
+            null_count = int(s.isna().sum())
+            nulls[col] = {"count": null_count,
+                          "pct": round(null_count / max(n_rows, 1) * 100, 2)}
+            if dt == "datetime":
+                datetime_cols.append(col)
+                frequency[col] = _infer_frequency(s)
+            elif dt == "categorical":
+                vc = s.value_counts(dropna=False).head(top_n)
+                cardinality[col] = {
+                    "unique_count": int(s.nunique()),
+                    f"top_{top_n}": [{"value": str(v), "freq": int(c)} for v, c in vc.items()],
+                }
+            elif dt == "numeric":
+                sn = pd.to_numeric(s, errors="coerce").dropna()
+                if len(sn):
+                    q1, q3 = float(np.percentile(sn, 25)), float(np.percentile(sn, 75))
+                    numeric_stats[col] = {
+                        "min": float(sn.min()), "max": float(sn.max()),
+                        "mean": float(sn.mean()), "median": float(sn.median()),
+                        "std": float(sn.std()), "skew": float(sn.skew()),
+                        "kurtosis": float(sn.kurtosis()),
+                        "q1": q1, "q3": q3, "iqr": round(q3 - q1, 6),
+                    }
+            del s
+
+        return {
+            "shape": {
+                "rows": int(n_rows),
+                "cols": int(len(cols)),
+                "memory_mb": round(float(source_bytes) / 1e6, 3),
+            },
+            "schema": schema_rows,
+            "nulls": nulls,
+            "cardinality": cardinality,
+            "numeric_stats": numeric_stats,
+            "datetime_cols": datetime_cols,
+            "frequency": frequency,
+            "duplicates": {"row_count": dup_count},
+        }
+    finally:
+        try:
+            pf.close()
+        except Exception:
+            pass
+
+
 # ── Metadata extraction ─────────────────────────────────────────────────────
 
 def _infer_dtype(series: pd.Series) -> str:
@@ -288,14 +435,34 @@ def run(
     File mode: file_path to a local .csv / .xlsx / .parquet file.
     """
     cfg = _load_config()
+    top_n = int(cfg.get("top_n_categories", 5) or 5)
 
     if file_path:
-        df = _read_file(file_path, row_limit=cfg.get("row_limit"))
-        source_info = {"file": str(file_path)}
+        path = Path(file_path)
+        if not path.exists():
+            raise FileNotFoundError(f"File not found: {file_path}")
+        suffix = path.suffix.lower()
+        if suffix == ".csv":
+            RAW_DIR.mkdir(parents=True, exist_ok=True)  # the pending parquet is written now
+            streamed = _stream_csv_to_parquet(
+                file_path=file_path,
+                raw_path=RAW_DIR / "_pending_raw.parquet",
+                row_limit=cfg.get("row_limit"),
+                block_size_mb=int(cfg.get("csv_block_size_mb", 64) or 64),
+                top_n=top_n,
+            )
+            metadata = streamed["metadata"]
+            source_info = {"file": str(file_path)}
+            df = None
+        else:
+            df = _read_file(file_path, row_limit=cfg.get("row_limit"))
+            metadata = extract_metadata(df, top_n=top_n)
+            source_info = {"file": str(file_path)}
     else:
         creds = credentials if credentials is not None else _credentials()
         conn_str = _build_conn_str(**creds)
         df = fetch_data(conn_str, table=table, query=query, row_limit=cfg.get("row_limit"))
+        metadata = extract_metadata(df, top_n=top_n)
         source_info = {"table": table, "query": query}
 
     run_id = f"run_{datetime.now():%Y%m%d_%H%M%S}"
@@ -304,9 +471,13 @@ def run(
     RAW_DIR.mkdir(parents=True, exist_ok=True)
 
     raw_path = RAW_DIR / f"{run_id}_raw.parquet"
-    df.to_parquet(raw_path, index=False)
+    if file_path and Path(file_path).suffix.lower() == ".csv":
+        pending_path = RAW_DIR / "_pending_raw.parquet"
+        if pending_path.exists():
+            pending_path.replace(raw_path)
+    elif df is not None:
+        df.to_parquet(raw_path, index=False)
 
-    metadata = extract_metadata(df, top_n=cfg.get("top_n_categories", 5))
     metadata["run_id"] = run_id
     metadata["source"] = source_info
 

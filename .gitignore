@@ -8,11 +8,17 @@ env/
 .idea/
 .vscode/
 
+# Data files are never committed, wherever they end up (a stray root-level parquet
+# once blew GitHub's 100MB limit and forced a history rewrite).
+*.parquet
+
 data/raw/*
 !data/raw/.gitkeep
 data/cleaned/*
 !data/cleaned/.gitkeep
 data/features/*
 !data/features/.gitkeep
+# Stage 7 serialized models (best_model.pkl / preprocessor.pkl per run)
+models/*/
 runs/*/
 !runs/.gitkeep

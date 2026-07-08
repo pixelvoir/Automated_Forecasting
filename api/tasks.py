@@ -67,3 +67,16 @@ def model_select_task(run_id: str, use_llm: bool = True) -> dict:
     override it. An LLM failure leaves the rule-engine pick standing."""
     from agents import model_selector_agent
     return model_selector_agent.run(run_id, use_llm=use_llm)
+
+
+def train_task(run_id: str, models: list, confirm_heavy: bool = False) -> dict:
+    """Stages 6+7: build the EDA-seeded features (materialize the ML matrix only when an
+    ML model was selected), then train + backtest the chosen models. No LLM, no DB.
+    The 'heavy' cost gate is enforced in the route before this launches, and again here
+    (defense in depth)."""
+    from pipeline import feature_builder, trainer
+    build_ml = any(m in trainer.registry.ML_IDS for m in (models or []))
+    fr = feature_builder.run(run_id, build_ml_matrix=build_ml)
+    result = trainer.run(run_id, models=models, confirm_heavy=confirm_heavy)
+    result["feature_report"] = fr.get("report")
+    return result

@@ -34,6 +34,10 @@ forecasting_eda.run(run_id)                  # Stage 4: full stats + model_selec
 
 from agents import model_selector_agent
 model_selector_agent.run(run_id, use_llm=True)  # Stage 5: rule engine always runs, LLM may override
+
+from pipeline import feature_builder, trainer
+feature_builder.run(run_id, build_ml_matrix=True)          # Stage 6: EDA-seeded features (no LLM)
+trainer.run(run_id, models=["auto_arima", "auto_ets"])     # Stage 7: train + backtest chosen models
 ```
 Note the order: intent (Stage 2.5) comes BEFORE cleaning — the recipe and the per-series
 execution both consume the confirmed intent.
@@ -96,14 +100,22 @@ Each stage is a standalone Python module in `pipeline/` with a single `run(run_i
 | 3.5 — Validation | `pipeline/validation_gate.py` | `runs/{id}/validation_gate.json` |
 | 4 — Forecast EDA | `pipeline/forecasting_eda.py` (`run()`) | `forecasting_eda_full.json`, `model_selection_payload.json` |
 | 5 — Model selection | `pipeline/rule_engine.py` (`decide()`/`run()`) → `agents/model_selector_agent.py` (`run()`) | `runs/{id}/model_selection.json` |
-| 6–8 | stubs in `pipeline/`, `models_lib/`, `agents/` | not yet implemented — **warning: the remaining stub files contain literal PowerShell `` `r`n `` escapes and raise SyntaxError on import; rewrite them fully, never edit** |
+| 6 — Feature engineering | `pipeline/feature_builder.py` (`run()`) | `data/features/{id}_model_frame.parquet` (+ `_features.parquet` when ML), `runs/{id}/feature_report.json` |
+| 7 — Training | `pipeline/trainer.py` (`run()`) → `models_lib/*` via `models_lib/registry.py`; metrics in `pipeline/evaluator.py` | `runs/{id}/training_report.json`, `models/{id}/best_model.pkl` + `preprocessor.pkl` |
+| 8 — Results | not yet implemented (`pane-results` placeholder) — reads `training_report.json` | — |
+
+**Still-corrupt stubs** (out of scope, nothing imports them): `pipeline/decision_extractor.py`, `agents/orchestrator.py`, `agents/results_agent.py` — literal PowerShell `` `r`n `` escapes that raise SyntaxError on import; **rewrite fully, never edit**.
 
 **Intent-first flow:** Stage 2.5 suggests every forecast choice (timestamp, target incl.
 count-of-events, scope, series key, exog, frequency, horizon) from Stage 1/2 evidence +
 the RAW parquet; the user confirms once on the Pipeline Setup tab; `POST /clean` writes
 `forecast_user_selections.json` and the whole chain (clean → validate → forecast EDA →
-model select) consumes it. Frequency/horizon can be adjusted later without re-cleaning
-(`POST /forecast-eda` overrides, which re-chains model selection).
+model select) consumes it. **Scope, frequency and horizon can be adjusted later without
+re-cleaning** (`POST /forecast-eda` overrides, which re-chains model selection) — cleaner.py
+never reads any of the three; only the series key / target / agg affect cleaning, so those
+stay on Pipeline Setup. The Forecast EDA tab's re-run row carries the scope/freq/horizon
+controls (per-series is disabled there when no series key was confirmed — that needs a
+re-clean); Pipeline Setup notes the split.
 
 Stage 3 is two-step: the LLM agent decides the recipe (`cleaning_agent.py`), then `cleaner.py` executes it. Both are called sequentially inside `api/tasks.py::clean_task`, which the `/runs/{id}/clean` endpoint runs via the job manager. The LLM only receives `cleaning_decision_payload.json`.
 
@@ -116,6 +128,8 @@ Stage 3 is two-step: the LLM agent decides the recipe (`cleaning_agent.py`), the
 ### Dtype Inference (Stage 1) — numeric-as-string columns
 
 `pipeline/ingest.py::_infer_dtype()` checks numeric coercion *before* datetime for object-dtype columns (`pd.to_numeric(sample, errors="coerce").notna().mean() > 0.8`). This matters: CSV/DB columns are routinely read as strings even when the values are numeric, and if Stage 1 misclassifies them as `"categorical"`, Stage 2's outlier detection (`pre_clean_eda.py::_outlier_counts()`, which only loops over columns Stage 1 called `"numeric"`) silently skips them entirely — producing a cleaning recipe that says `"keep"` for every outlier strategy with no real signal behind it. `extract_metadata()`'s numeric_stats and `_outlier_counts()` both re-coerce with `pd.to_numeric(df[col], errors="coerce")` (no-op for already-numeric columns) rather than trusting the raw dtype.
+
+**CSV ingest is streamed, never fully loaded** (`_stream_csv_to_parquet`): `pd.read_csv` on a large CSV (e.g. 254MB) builds a ~1GB+ DataFrame and OOM-crashes the box. Instead pyarrow's `csv.open_csv` streams the file to Parquet block-by-block (peak = one `csv_block_size_mb` block, default 64MB) — and crucially pyarrow infers **one** schema for the whole file and applies it to every block, unlike pandas' `chunksize` which infers per-chunk and diverges across chunk boundaries (a real ParquetWriter-crash bug a prior attempt hit). If inferred typing conflicts across blocks (a column pure-int early, a real string later → `ArrowInvalid`), it retries reading every column as string (downstream re-coerces, per the numeric-as-string note above). Metadata is then computed **column-by-column from the Parquet** (`extract_metadata_from_parquet` — peak = one column, exact stats incl. a bounded-memory duplicate count via row hashes) rather than materializing the frame. DB and non-CSV file paths still go through pandas `extract_metadata()`.
 
 ### LLM Client
 
@@ -142,14 +156,15 @@ All routes are under `/runs` (defined in `api/routes.py`):
 | `/runs/{id}/clean` | POST | Stage 3 — cleaning agent + cleaner, job-managed (`use_llm` body flag) |
 | `/runs/{id}/validate` | POST | Stage 3.5 — validation gate only, job-managed |
 | `/runs/{id}/forecast-intent` | POST | Stage 2.5 — detect + LLM-refine intent suggestions (`use_llm` body flag), job-managed |
-| `/runs/{id}/forecast-eda` | POST | Stage 4 — forecast EDA from confirmed intent (body = optional freq/horizon overrides only), job-managed |
+| `/runs/{id}/forecast-eda` | POST | Stage 4 — forecast EDA from confirmed intent (body = optional `scope`/`forecast_frequency`/`horizon` overrides — none re-clean; per-series without a confirmed series key → 400), job-managed |
 | `/runs/{id}/model-select` | POST | Stage 5 — rule engine + optional LLM override (`use_llm` body flag); 400 if Stage 4 hasn't produced the payload; job-managed |
+| `/runs/{id}/train` | POST | Stages 6+7 — feature engineering + training of the user-selected `models` (body list; Stage 5 pick is only the default). 400 if Stage 5 hasn't run, if no trainable model, or — for a heavy per-series panel — if the estimate is `heavy` and `confirm_heavy` is false (the 400 detail is a dict carrying the estimate). Job-managed |
 
 Every job-managed endpoint can return **409** (preempted by a newer job) — callers must handle this explicitly, not treat a non-200 as a generic failure.
 
 ### `runs/{run_id}/` Directory
 
-The `/runs/{id}/summary` endpoint reads all accumulated files to reconstruct full run state for the UI (`_stage2`, `_intent`, `_stage3`, `_stage4`, `_stage5`). `forecast_user_selections.json` is written by the `/clean` endpoint — it is the single confirmed-intent file every downstream stage reads (cleaning recipe, per-series cleaner execution, validation gate, forecast EDA). The legacy `user_selections.json` (timestamp only) is still read as a fallback for pre-refactor runs.
+The `/runs/{id}/summary` endpoint reads all accumulated files to reconstruct full run state for the UI (`_stage2`, `_intent`, `_stage3`, `_stage4`, `_stage5`, `_stage6`, `_stage7`). `forecast_user_selections.json` is written by the `/clean` endpoint — it is the single confirmed-intent file every downstream stage reads (cleaning recipe, per-series cleaner execution, validation gate, forecast EDA). The legacy `user_selections.json` (timestamp only) is still read as a fallback for pre-refactor runs.
 
 Files in order of creation:
 ```
@@ -166,7 +181,13 @@ validation_gate.json        # Stage 3.5
 forecasting_eda_full.json   # Stage 4 (all stats + downsampled plot arrays)
 model_selection_payload.json   # Stage 4 (compact decision JSON for Stage 5)
 model_selection.json        # Stage 5 (final pick + rule trace + LLM info + training_hints)
+feature_report.json         # Stage 6 (EDA-seeded feature recipe + rationale)
+training_report.json        # Stage 7 (per-model metrics, params, backtest+forecast arrays)
 ```
+`model_selection.json` + `feature_report.json` + `training_report.json` (and the
+`data/features/{id}_*.parquet` + `models/{id}/`) are all purged on re-clean
+(`routes._purge_downstream`) and on a fresh `forecasting_eda.run()`, so `/summary` can't
+resurrect a decision/training made on data that no longer exists.
 
 `model_selection.json` is deleted by `/clean` (re-clean invalidates the decision) and by
 `forecasting_eda.run()` just after writing a fresh payload (covers the freq/horizon-only
@@ -240,7 +261,7 @@ Gotchas encoded in the module:
 - Timestamp column is defensively re-parsed (`pd.to_datetime`) — stale cleaned parquets can carry string dates.
 - Plot arrays in `forecasting_eda_full.json` are downsampled to `plot_max_points` (JSON stays ~150–500KB; it travels through the store).
 
-Frontend split: `frontend/intent_view.py` renders the Pipeline Setup tab's intent form (confidence badges, LLM rationale banner, always-visible series-key picker — group cols drive per-series *cleaning* even in aggregate scope); `frontend/fcst_eda_view.py` renders the results-only Forecast EDA tab (confirmed-setup summary + freq/horizon-only re-run + verdict tiles + Plotly charts); `frontend/model_select_view.py` renders the Model Select tab (decision hero + provenance banner + training hints + eligibility table + rule trace + Stage-5-only re-run with its own LLM switch). Callbacks: `confirm_and_run` (the one chain: `/clean` → `/validate` → `/forecast-eda` → `/model-select`, drops stale `_stage4`/`_stage5`, lands on the Forecast EDA tab on success; a model-select 409/failure keeps the EDA results and surfaces a visible warning), `run_intent_redetect`, `rerun_fcst_eda` (re-chains `/model-select`; its `switch-use-llm` State can be `None` for pre-refactor runs — treated as `True`), `run_model_select`; `trigger_run`/`run_eda_retry` auto-chain `/forecast-intent` after Stage 2. The one `switch-use-llm` on Pipeline Setup gates the LLM for BOTH the cleaning recipe and model selection. Chart colors are dataviz-validated against the `#161b2e` card surface: series `#6366f1`, trend `#059669`, seasonal `#d97706`, residual `#e66767`.
+Frontend split: `frontend/intent_view.py` renders the Pipeline Setup tab's intent form (confidence badges, LLM rationale banner, always-visible series-key picker — group cols drive per-series *cleaning* even in aggregate scope); `frontend/fcst_eda_view.py` renders the results-only Forecast EDA tab (confirmed-setup summary + a **scope/freq/horizon re-run** that skips cleaning + verdict tiles + Plotly charts); `frontend/model_select_view.py` renders the Model Select tab (decision hero + provenance banner + training hints + eligibility table + rule trace + Stage-5-only re-run with its own LLM switch). Callbacks: `confirm_and_run` (the one chain: `/clean` → `/validate` → `/forecast-eda` → `/model-select`, drops stale `_stage4`/`_stage5`, lands on the Forecast EDA tab on success; a model-select 409/failure keeps the EDA results and surfaces a visible warning), `run_intent_redetect`, `rerun_fcst_eda` (sends `scope`/`forecast_frequency`/`horizon` to `/forecast-eda` — no re-clean — then re-chains `/model-select` and drops stale `_stage5`/`_stage6`/`_stage7`; its `switch-use-llm` State can be `None` for pre-refactor runs — treated as `True`), `run_model_select`; `trigger_run`/`run_eda_retry` auto-chain `/forecast-intent` after Stage 2. `frontend/training_view.py` renders the **Training tab** (Stage 6+7): a multi-select of eligible models (default = Stage 5 pick + runner-up, cap 4; seasonal-naive baseline always trained), a live cost-estimate banner (`build_estimate_banner`, a client-side mirror of `trainer.estimate_cost`) with a heavy-case confirm switch, then a MASE leaderboard + a history/backtest/forecast Plotly chart + collapsible feature-recipe/params. Callbacks: `render_training_body`, `update_train_estimate` (banner follows the model multiselect), `run_training` (`/train` → store `_stage7`+`_stage6`, lands on the Training tab; a 400 with a dict detail is the heavy-cost confirm prompt). The one `switch-use-llm` on Pipeline Setup gates the LLM for BOTH the cleaning recipe and model selection (training uses no LLM). Chart colors are dataviz-validated against the `#161b2e` card surface: series `#6366f1`, trend `#059669`, seasonal `#d97706`, residual `#e66767`.
 
 ### Model Selection (Stage 5)
 
@@ -253,6 +274,26 @@ Rule ladder (first match wins, R1–R9; every rule leaves a trace entry): R1 too
 Encoded domain guards: **eligibility filter** vetoes croston/tsb on smooth/erratic demand with `zero_pct < 20` (makes an LLM intermittent-pick on smooth data structurally impossible); exog is "usable" only when it **leads** (`best_lag ≥ 1`, |corr| ≥ 0.4) — lag-0 correlation needs future values; a lead within ±2 of the seasonal period is flagged `seasonal_echo` (milk's lag-13 corr on period-12 data); `vif_max > 10` → collinearity warning; SARIMA is infeasible above period 24. `training_hints` (transform / exog_usable / seasonal_periods / policy aggregate-vs-per_series_local-vs-global / metric MASE) is always computed for Stages 6–7 — `transform` copies Stage 4's recommendation, never invents one.
 
 Reference behavior: milk `run_20260630_144854` → R6 auto_arima high (runner-up auto_ets); vet `run_20260703_120826` → R7 auto_theta medium. With the LLM on (groq llama-3.1-8b), the milk pick was observed to be overridden to auto_ets citing exog collinearity — a legal, transparent override (`source: "llm"`, rule pick still shown in the UI).
+
+### ⚠ statsforecast is UNUSABLE in this environment
+
+statsforecast 2.0.3 is installed and Stage 5's catalog lists its models, but its compiled kernel `coreforecast 0.0.17` **segfaults (access violation 0xC0000005) under this venv's numpy 2.4.6** — and 0.0.17 is already the latest, so there's no upgrade. Stage 5 never triggered it because it only does an `importlib.util.find_spec` *presence* check. **Never `import statsforecast` in a code path that executes** — it crashes the whole job subprocess. Consequently Stage 7's classical models are built on **statsmodels + pmdarima** (the libraries Stage 4 already uses successfully here), and the intermittent ones are hand-rolled. The catalog `library` field still says `statsforecast` for those ids (harmless — it's only a `find_spec` key + a UI label); `models_lib/registry.py` is the real dispatch and routes them to statsmodels/pmdarima.
+
+### Feature Engineering (Stage 6)
+
+`pipeline/feature_builder.py::run(run_id, build_ml_matrix)` — deterministic, EDA-seeded, **no LLM**. Reuses `forecasting_eda._resolve_selections` / `_build_series` / `_pandas_freq` so the training series is *identical* to what Stages 4/5 analyzed. Two products:
+- **Modeling frame** (`data/features/{id}_model_frame.parquet`, long `unique_id, ds, y[, exog]`) — the universal training input every model reads. Aggregate scope = one series via `_build_series`; per-series = `_build_panel_frame` (one vectorized `groupby([*group_cols, pd.Grouper(freq)])`, same empty-bin rules as Stage 4: count/nunique→0, zero-inflated sum→0, else per-series interpolate).
+- **Feature recipe** (in `feature_report.json`) seeded straight off `forecasting_eda_full.json`: lags = significant ACF lags (∪ {1, period}, capped `max_lags`), rolling mean/std over the seasonal period, Fourier for `seasonal_periods`, momentum diffs when ndiffs/nsdiffs ≥ 1, exog **leading**-lags (only cols the user actually selected as exog), `log1p` transform when Stage 4 flagged heteroskedastic+skew. Only the ML models consume the materialized matrix (`_features.parquet`, built only when `build_ml_matrix`); the classical models train on raw `y`.
+
+`build_supervised(frame, recipe)` is **shared** with `models_lib/ml_models.py` so training and the recursive multi-step forecast use the SAME leakage-free features (every feature is a function of PAST values only, so the forecast row whose own `y` is unknown is still fully featurizable). **Gotcha:** JSON round-trips the `fourier` dict's int keys to strings (`{12:3}`→`{"12":3}`) — `add_fourier_terms` re-casts `int(period)` before the divide, or a numeric-vs-string `ufunc 'divide'` TypeError surfaces only when the recipe is reloaded from disk (not in-memory).
+
+### Model Training (Stage 7)
+
+`pipeline/trainer.py::run(run_id, models, confirm_heavy)` — hardcoded, **no LLM**. The Stage 5 pick is a *default*; the user trains one or more **eligible** models (a `seasonal_naive` baseline is always added for the MASE floor). ONE walk-forward CV harness (`_walk_forward` / `_run_per_series`) backtests every model family through a uniform `models_lib/base_model.Forecaster` interface (`fit(hist, period)` / `predict(h, future_ds, future_exog)`); the log transform round-trip lives in the base class. Metrics (`pipeline/evaluator.py`: MAE/RMSE/MAPE/sMAPE/**MASE**/R², zero-safe) rank the leaderboard by MASE (< 1 beats the naive baseline). Prediction intervals are **conformal from CV residuals** (`base_model.conformal_intervals`, per-horizon-step), NOT per-model analytic — uniform across families and robust on short series. Final = refit on all history → horizon forecast; best model pickled to `models/{id}/best_model.pkl` (+ recipe as `preprocessor.pkl`).
+
+Backends dispatch off the catalog `library` via `models_lib/registry.py`: `statistical.py` (statsmodels ETSModel/ThetaModel/MSTL + pmdarima.auto_arima + hand-rolled seasonal_naive), `intermittent.py` (hand-rolled Croston/TSB), `ml_models.py` (lightgbm/xgboost — recursive multi-step, Optuna tune on a chronological tail, `run_global` for the panel `global` policy = one model with a `series_id` categorical), `prophet_model.py` (guarded — prophet not installed). Classical models are **univariate**; exog is exploited only by the ML backends (leading-lag features).
+
+Adaptive CV (`_cv_plan`): `n_windows` sized so `n_windows·h ≤ len − min_train`, capped at `training.cv_windows` (shrinks to `cv_windows_large_panel` on big panels); too short → single holdout → else fit-only. **Cost guardrails** (`estimate_cost`, tiers fast/moderate/heavy from `policy × n_series × models`): the `/train` route computes the estimate up-front and returns a 400 with the estimate dict when `heavy` and `confirm_heavy` is false; the trainer also caps per-series-local fan-out to the top-K series by volume (`per_series_cap`) and caps simultaneous models (`max_models_per_run`). Thresholds in `config/settings.yaml → feature_engineering` / `→ training`. Reference: milk → auto_arima best (MASE 0.85), vet → auto_theta best (MASE 0.59) — both match their Stage 5 suggestion and beat the baseline; on a milk sub-panel global LightGBM (0.69) beat per-series auto_ets (1.19), matching R3.
 
 ### Frontend — Tab-based UI (Dash 4.3.0)
 

@@ -777,9 +777,17 @@ def run(run_id: str) -> dict:
     }
     (run_dir / "forecasting_eda_full.json").write_text(json.dumps(full, indent=2, default=str))
     (run_dir / "model_selection_payload.json").write_text(json.dumps(payload, indent=2, default=str))
-    # Fresh Stage 4 evidence invalidates any earlier Stage 5 decision on disk (covers
-    # the frequency/horizon-only re-run path, where /clean never fires).
-    (run_dir / "model_selection.json").unlink(missing_ok=True)
+    # Fresh Stage 4 evidence invalidates every downstream decision on disk — Stage 5 model
+    # selection AND Stage 6/7 features+training (covers the frequency/horizon-only re-run
+    # path, where /clean never fires).
+    for name in ("model_selection.json", "feature_report.json", "training_report.json"):
+        (run_dir / name).unlink(missing_ok=True)
+    features_dir = ROOT / "data" / "features"
+    for p in (features_dir / f"{run_id}_model_frame.parquet",
+              features_dir / f"{run_id}_features.parquet"):
+        p.unlink(missing_ok=True)
+    import shutil
+    shutil.rmtree(ROOT / "models" / run_id, ignore_errors=True)
 
     return {
         "run_id": run_id,

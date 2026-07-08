@@ -17,6 +17,10 @@ statsmodels>=0.14.0
 ruptures>=1.1.8
 antropy>=0.1.6
 pmdarima>=2.0.3
+# statsforecast: installed for Stage 5's find_spec catalog check ONLY. Its compiled
+# coreforecast kernel SEGFAULTS under numpy 2.4.x on this machine, so Stage 7 does NOT
+# execute statsforecast models — classical models run on statsmodels + pmdarima instead
+# (see CLAUDE.md "statsforecast is UNUSABLE"). Never import it in an executing path.
 statsforecast>=1.6.0
 # prophet requires C++ build tools (pystan) — excluded until installable on this machine.
 # Option A: install Visual C++ Build Tools, then: pip install prophet>=1.1.4

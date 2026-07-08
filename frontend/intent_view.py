@@ -206,7 +206,14 @@ def build_intent_form(suggestions: dict, selections: dict | None, already_run: b
                     dbc.Input(id="input-intent-horizon", type="number", min=1, step=1,
                               value=horizon_default, size="sm"),
                 ], md=3),
-            ], className="mb-3"),
+            ], className="mb-2"),
+
+            html.Small(
+                [_cicon("bi-info-circle", fontSize="0.7rem"),
+                 "Scope, frequency and horizon can be changed later on the Forecast EDA tab "
+                 "without re-cleaning. The series key, target and aggregation affect cleaning, "
+                 "so changing those re-runs the pipeline from here."],
+                className="d-block mb-3", style={"color": "#64748b", "fontSize": "0.72rem"}),
 
             dbc.Row([
                 dbc.Col([

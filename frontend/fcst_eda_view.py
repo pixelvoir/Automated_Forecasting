@@ -282,6 +282,10 @@ def _setup_summary(selections):
 # ── Frequency/horizon adjust mini-form (Stage-4-only re-run) ─────────────────
 
 def _adjust_form(data, eda_exists):
+    """Stage-4-only re-run controls. Scope / frequency / horizon don't affect cleaning, so
+    changing them here re-runs from forecast EDA onward (re-chaining model selection)
+    WITHOUT the expensive re-clean. The series key / target / agg — which DO affect cleaning
+    — stay on the Pipeline Setup tab."""
     intent = data.get("_intent") or {}
     selections = intent.get("selections") or {}
     suggestions = intent.get("suggestions") or {}
@@ -290,33 +294,59 @@ def _adjust_form(data, eda_exists):
     freq_opts = suggestions.get("frequency", {}).get("options") or (
         [freq_current] if freq_current else [])
     horizon_current = selections.get("horizon") or suggestions.get("horizon", {}).get("suggested", 12)
+    scope_current = (selections.get("scope")
+                     or suggestions.get("scope", {}).get("suggested", "aggregate"))
+    group_cols = selections.get("group_cols") or suggestions.get("group", {}).get("suggested") or []
+    has_key = bool(group_cols)
 
-    return dbc.Card(dbc.CardBody(dbc.Row([
-        dbc.Col([
-            _lbl("Forecast frequency"),
-            dcc.Dropdown(id="dropdown-fcst-freq",
-                         options=[{"label": str(f).capitalize(), "value": f} for f in freq_opts],
-                         value=freq_current, clearable=False,
-                         style={"fontSize": "0.85rem"}),
-        ], md=4),
-        dbc.Col([
-            _lbl("Horizon (periods)"),
-            dbc.Input(id="input-fcst-horizon", type="number", min=1, step=1,
-                      value=horizon_current, size="sm"),
-        ], md=3),
-        dbc.Col([
-            dcc.Loading(
-                dbc.Button(
-                    [_cicon("bi-graph-up"),
-                     "Re-run Forecast EDA" if eda_exists else "Run Forecast EDA"],
-                    id="btn-fcst-rerun", color="primary", className="w-100 mt-4",
-                    style={"fontWeight": "600"},
-                ),
-                type="circle", color="#6366f1", delay_show=100,
-                target_components={"cleaning-status": "children"},
+    _radio_lbl = {"display": "block", "marginBottom": "4px", "cursor": "pointer",
+                  "color": "#94a3b8", "fontSize": "0.82rem"}
+    key_hint = None
+    if not has_key:
+        key_hint = html.Div(
+            "Per-series needs a series key — set one on the Pipeline Setup tab (that re-cleans).",
+            style={"fontSize": "0.72rem", "color": "#d97706", "marginTop": "2px"})
+
+    return dbc.Card(dbc.CardBody([
+        html.P("Scope, frequency and horizon re-run from here without re-cleaning.",
+               style={"fontSize": "0.72rem", "color": "#64748b", "marginBottom": "8px"}),
+        dbc.Row([
+            dbc.Col([
+                _lbl("Scope"),
+                dcc.RadioItems(
+                    id="radio-fcst-scope",
+                    options=[{"label": "  Overall (aggregate)", "value": "aggregate"},
+                             {"label": "  Per-series (panel)", "value": "per_series",
+                              "disabled": not has_key}],
+                    value=scope_current,
+                    inputStyle={"marginRight": "6px", "accentColor": "#6366f1"},
+                    labelStyle=_radio_lbl),
+                key_hint,
+            ], md=5),
+            dbc.Col([
+                _lbl("Forecast frequency"),
+                dcc.Dropdown(id="dropdown-fcst-freq",
+                             options=[{"label": str(f).capitalize(), "value": f} for f in freq_opts],
+                             value=freq_current, clearable=False,
+                             style={"fontSize": "0.85rem"}),
+            ], md=4),
+            dbc.Col([
+                _lbl("Horizon"),
+                dbc.Input(id="input-fcst-horizon", type="number", min=1, step=1,
+                          value=horizon_current, size="sm"),
+            ], md=3),
+        ]),
+        dcc.Loading(
+            dbc.Button(
+                [_cicon("bi-graph-up"),
+                 "Re-run Forecast EDA" if eda_exists else "Run Forecast EDA"],
+                id="btn-fcst-rerun", color="primary", className="w-100 mt-3",
+                style={"fontWeight": "600"},
             ),
-        ], md=5),
-    ])), className="mb-3")
+            type="circle", color="#6366f1", delay_show=100,
+            target_components={"cleaning-status": "children"},
+        ),
+    ]), className="mb-3")
 
 
 # ── Results sections ─────────────────────────────────────────────────────────

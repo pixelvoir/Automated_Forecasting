@@ -39,7 +39,9 @@ _DEFAULT_CFG = {
 }
 
 # Preference order when a rule's pick turns out ineligible (e.g. library missing).
-_FALLBACK_ORDER = ["auto_ets", "auto_theta", "seasonal_naive"]
+# ML-first since the 2026-07 catalog trim: gradient boosting almost always outperformed
+# the classical models in practice, so it is also the safest degradation target.
+_FALLBACK_ORDER = ["lightgbm", "auto_theta", "seasonal_naive"]
 
 _RANK = {"low": 0, "medium": 1, "high": 2}
 _NAME = {0: "low", 1: "medium", 2: "high"}
@@ -155,12 +157,26 @@ def _eligible(payload: dict, derived: dict, catalog: dict, cfg: dict) -> tuple[l
     icls = payload.get("intermittency_class")
     zero_pct = payload.get("zero_pct") or 0
 
+    # Per-series scope: global models (ML/DL) train across the whole panel, so the TOTAL
+    # observations count toward min_length — a 1,800-series × 60-month panel is 108k
+    # training points for NHITS/LightGBM, not 60.
+    total_obs = length
+    panel = payload.get("panel") or None
+    if payload.get("scope") == "per_series" and panel:
+        n_series = panel.get("n_series") or 1
+        median_len = (panel.get("series_length") or {}).get("median") or length
+        total_obs = max(length, int(n_series * median_len))
+
     eligible, excluded = [], {}
     for mid, card in catalog["models"].items():
+        # Global-capable categories are gated on the panel total; per-series/local models
+        # still need each series (proxied by the aggregate grid) to be long enough.
+        is_global_capable = any(c in ("ml", "deep_learning") for c in card["categories"])
+        eff_length = total_obs if is_global_capable else length
         if not card["available"]:
             excluded[mid] = f"library '{card['import_check']}' not installed"
-        elif length < card["min_length"]:
-            excluded[mid] = f"series too short ({length} < {card['min_length']} points)"
+        elif eff_length < card["min_length"]:
+            excluded[mid] = f"series too short ({eff_length} < {card['min_length']} points)"
         elif (mid in ("croston", "tsb") and icls in ("smooth", "erratic")
               and zero_pct < cfg["intermittent_veto_zero_pct"]):
             excluded[mid] = (f"demand is {icls} (zero_pct {zero_pct}%) — "
@@ -239,12 +255,12 @@ def decide(payload: dict, catalog: dict, cfg: dict | None = None) -> dict:
             elif derived["panel_cycles"] is not None and derived["panel_cycles"] >= cfg["panel_global_min_cycles"]:
                 _fire("R3", f"panel of {n_series} series with median {derived['panel_cycles']} "
                             "cycles of history — one global ML model learns shared patterns",
-                      category="ml", model="lightgbm", runner_up="auto_ets",
+                      category="ml", model="lightgbm", runner_up="nhits",
                       confidence="high", policy="global")
             else:
                 _fire("R3", f"panel of {n_series} series — global ML routing, but per-series "
                             "history is measured in rows (not periods) so cycle depth is unverified",
-                      category="ml", model="lightgbm", runner_up="auto_ets",
+                      category="ml", model="lightgbm", runner_up="nhits",
                       confidence="medium", policy="global")
         else:
             _skip("R3", "not a many-series panel"
@@ -259,49 +275,38 @@ def decide(payload: dict, catalog: dict, cfg: dict | None = None) -> dict:
             _fire("R4", f"leading exogenous driver {best['col']} (lag {best['best_lag']}, "
                         f"corr {best['best_corr']}) with {length} points — "
                         "gradient boosting exploits driver features best",
-                  category="ml", model="lightgbm", runner_up="auto_arima",
+                  category="ml", model="lightgbm", runner_up="xgboost",
                   confidence="high" if abs(best["best_corr"]) >= 0.7 else "medium")
         else:
             detail = "no strong leading exog"
             if strong_exog:
                 detail = (f"leading exog exists but only {length} points "
-                          f"(< {cfg['exog_route_min_length']}) — kept as a hint for SARIMAX")
+                          f"(< {cfg['exog_route_min_length']}) — kept as a training hint")
             _skip("R4", detail)
 
-    # R5 — multiple seasonal periods
+    # R5 — multiple seasonal periods (catalog trim 2026-07: MSTL removed — gradient
+    # boosting on deseasonalized targets + calendar/Fourier features covers this case)
     if pick is None:
         secondary = payload.get("secondary_seasonality_periods") or []
         if secondary:
             _fire("R5", f"multiple seasonal periods ({period} + {secondary}) — "
-                        "MSTL decomposes each separately",
-                  category="statistical", model="mstl", runner_up="auto_ets",
+                        "gradient boosting with per-period Fourier/calendar features",
+                  category="ml", model="lightgbm", runner_up="auto_theta",
                   confidence="high" if seas >= cfg["seasonality_strong"] else "medium")
         else:
             _skip("R5", "single seasonal period")
 
-    # R6 — strong single seasonality with enough cycles
+    # R6 — strong single seasonality with enough cycles (was seasonal ARIMA/ETS — both
+    # removed after being consistently outperformed; the ML backend deseasonalizes via
+    # per-series seasonal indices, so seasonality is handled explicitly)
     if pick is None:
         if seas >= cfg["seasonality_strong"] and n_cycles is not None \
                 and n_cycles >= cfg["min_cycles_for_seasonal"]:
-            acf_rich = len(payload.get("significant_acf_lags") or []) >= 3
-            arima_evidence = derived["sarima_feasible"] and (acf_rich or derived["residual_structure"])
             conf = "high" if seas >= 0.75 else "medium"
-            if payload.get("heteroskedastic") and payload.get("transform_recommendation") == "log":
-                _fire("R6", f"seasonality {seas} over {n_cycles} cycles with level-dependent "
-                            "variance — multiplicative exponential smoothing",
-                      category="statistical", model="auto_ets", runner_up="auto_arima",
-                      confidence=conf)
-            elif arima_evidence:
-                _fire("R6", f"seasonality {seas} over {n_cycles} cycles with rich autocorrelation "
-                            f"(period {period} is SARIMA-feasible) — seasonal ARIMA",
-                      category="statistical", model="auto_arima", runner_up="auto_ets",
-                      confidence=conf)
-            else:
-                detail = f"seasonality {seas} over {n_cycles} cycles — exponential smoothing"
-                if not derived["sarima_feasible"]:
-                    detail += f" (period {period} too long for SARIMA)"
-                _fire("R6", detail, category="statistical", model="auto_ets",
-                      runner_up="seasonal_naive", confidence=conf)
+            _fire("R6", f"seasonality {seas} over {n_cycles} cycles — gradient boosting on "
+                        "the seasonally-indexed target",
+                  category="ml", model="lightgbm", runner_up="auto_theta",
+                  confidence=conf)
         else:
             _skip("R6", f"seasonality {seas} / {n_cycles if n_cycles is not None else 'n/a'} cycles — "
                         "not a strong-seasonal case")
@@ -311,7 +316,7 @@ def decide(payload: dict, catalog: dict, cfg: dict | None = None) -> dict:
         if trend >= cfg["trend_strong"] and trend > seas:
             _fire("R7", f"trend {trend} dominates seasonality {seas} — "
                         "Theta deseasonalizes and extrapolates the trend robustly",
-                  category="statistical", model="auto_theta", runner_up="auto_ets",
+                  category="statistical", model="auto_theta", runner_up="lightgbm",
                   confidence="high" if seas < cfg["seasonality_moderate"] else "medium")
         else:
             _skip("R7", f"trend {trend} not dominant")
@@ -328,11 +333,11 @@ def decide(payload: dict, catalog: dict, cfg: dict | None = None) -> dict:
         else:
             _skip("R8", f"forecastability {fcast} — signal exists")
 
-    # R9 — default
+    # R9 — default (was auto_ets; ML-first since the catalog trim)
     if pick is None:
-        _fire("R9", "no rule matched decisively — exponential smoothing is the safest "
-                    "general-purpose default",
-              category="statistical", model="auto_ets", runner_up="auto_theta",
+        _fire("R9", "no rule matched decisively — gradient boosting is the strongest "
+                    "general-purpose default in this catalog",
+              category="ml", model="lightgbm", runner_up="auto_theta",
               confidence="low")
 
     # The pick must be eligible; degrade along the fallback order if not.
