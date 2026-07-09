@@ -297,6 +297,49 @@ def get_metadata(run_id: str):
     return json.loads(meta_path.read_text())
 
 
+@router.get("/{run_id}/series-forecast")
+def get_series_forecast(run_id: str, model: str, series: str):
+    """One series' backtest + forecast arrays for one trained model (the per-series
+    viewer on the Training tab). Reads models/{id}/series_forecasts.parquet written by
+    the trainer — sub-second, deliberately NOT job-managed. Intervals are per-series
+    conformal from that series' own backtest residuals."""
+    import numpy as np
+    import pandas as pd
+    from models_lib.base_model import conformal_intervals
+
+    pq = ROOT / "models" / run_id / "series_forecasts.parquet"
+    if not pq.exists():
+        raise HTTPException(status_code=404,
+                            detail="No per-series forecasts for this run — train first "
+                                   "(per-series scope only).")
+    df = pd.read_parquet(pq)
+    sub = df[(df["model"] == model) & (df["unique_id"].astype(str) == series)]
+    if sub.empty:
+        raise HTTPException(status_code=404,
+                            detail=f"No rows for model '{model}' / series '{series}'.")
+    bt = sub[sub["kind"] == "backtest"].sort_values("ds")
+    fc = sub[sub["kind"] == "forecast"].sort_values("ds")
+
+    out = {
+        "model": model, "series": series,
+        "backtest": {"ds": [str(d) for d in bt["ds"]],
+                     "actual": [float(v) if np.isfinite(v) else None for v in bt["actual"]],
+                     "predicted": [float(v) if np.isfinite(v) else None for v in bt["predicted"]]},
+        "forecast": {"ds": [str(d) for d in fc["ds"]],
+                     "yhat": [float(v) if np.isfinite(v) else None for v in fc["predicted"]]},
+    }
+    if len(bt) and len(fc):
+        resid = (bt["actual"] - bt["predicted"]).to_numpy(dtype=float)
+        resid = resid[np.isfinite(resid)]
+        point = fc["predicted"].to_numpy(dtype=float)
+        if len(resid) >= 2:
+            iv = conformal_intervals(point, {k + 1: resid for k in range(len(point))}, [95])
+            lo, hi = iv[95]
+            out["forecast"]["lo95"] = [round(float(v), 4) for v in lo]
+            out["forecast"]["hi95"] = [round(float(v), 4) for v in hi]
+    return out
+
+
 class CleanRequest(BaseModel):
     """The confirmed forecast intent — the single user checkpoint of the pipeline.
     Everything downstream (cleaning recipe, per-series execution, validation gate,
@@ -358,24 +401,27 @@ def run_forecast_intent(run_id: str, req: ForecastIntentRequest = ForecastIntent
 
 class ForecastEDARequest(BaseModel):
     """Optional overrides for a Stage-4-only re-run. None of these affect cleaning
-    (cleaner.py never reads scope/frequency/horizon — only the series key / target / agg
-    do), so adjusting them must NOT force a re-clean. `scope` toggles overall-vs-per-series
-    forecasting; changing the series key still requires a re-clean and stays on Pipeline
-    Setup."""
+    (cleaner.py never reads scope/frequency/horizon/exog — only the series key / target /
+    agg do), so adjusting them must NOT force a re-clean. `scope` toggles
+    overall-vs-per-series forecasting; changing the series key still requires a re-clean
+    and stays on Pipeline Setup. `exog_cols` re-selects drivers from columns that
+    SURVIVED cleaning (the sanitizer never drops columns silently, so most survive)."""
     forecast_frequency: str | None = None
     horizon: int | None = None
     scope: str | None = None               # "aggregate" | "per_series"
+    exog_cols: list[str] | None = None     # None = keep current; [] = clear
 
 
 @router.post("/{run_id}/forecast-eda")
 def run_forecast_eda(run_id: str, req: ForecastEDARequest = ForecastEDARequest()):
     """Stage 4: full forecasting EDA on the confirmed intent. All statistics computed
     in Python — the LLM only ever sees model_selection_payload.json (Stage 5). Frequency,
-    horizon and scope can be re-run here without re-cleaning (they're Stage-4+ concerns)."""
+    horizon, scope and exogenous drivers can be re-run here without re-cleaning
+    (they're Stage-4+ concerns)."""
     run_dir = RUNS_DIR / run_id
     if not run_dir.exists():
         raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found.")
-    if req.forecast_frequency or req.horizon or req.scope:
+    if req.forecast_frequency or req.horizon or req.scope or req.exog_cols is not None:
         sel_path = run_dir / "forecast_user_selections.json"
         sel = json.loads(sel_path.read_text()) if sel_path.exists() else {}
         # Per-series forecasting needs a series key; if none was ever confirmed, per-series
@@ -385,6 +431,18 @@ def run_forecast_eda(run_id: str, req: ForecastEDARequest = ForecastEDARequest()
                 status_code=400,
                 detail="Per-series forecasting needs a series key. Set one on the Pipeline "
                        "Setup tab and confirm (that choice affects cleaning, so it re-cleans).")
+        if req.exog_cols is not None:
+            # exog columns must exist in the CLEANED data (Stage 4 reads only that)
+            cm_path = run_dir / "cleaned_metadata.json"
+            cleaned_cols = set((json.loads(cm_path.read_text()).get("nulls") or {})
+                               if cm_path.exists() else {})
+            missing = [c for c in req.exog_cols if cleaned_cols and c not in cleaned_cols]
+            if missing:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Exogenous column(s) not in the cleaned data: {missing}. "
+                           "Columns dropped by cleaning need a re-clean on Pipeline Setup.")
+            sel["exog_cols"] = [c for c in req.exog_cols if c != sel.get("target_col")]
         if req.forecast_frequency:
             sel["forecast_frequency"] = req.forecast_frequency
         if req.horizon:

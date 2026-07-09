@@ -28,6 +28,9 @@ confidence_threshold: 0.85
 validation_gate:
   max_row_loss_pct: 15
   min_series_length: 30
+  max_target_sum_drift_pct: 5   # blocking: cleaned target total may drift at most this
+                                # far beyond what row loss explains (catches recipes that
+                                # clip/winsorize the target and shrink every aggregate)
 
 # Stage 1: ingestion settings
 ingest:
@@ -43,6 +46,7 @@ forecast_intent:
   group_uniqueness_high: 0.995 # (group, ts) uniqueness for high-confidence series key
   group_uniqueness_medium: 0.95
   dimension_max_cardinality: 10000  # event-log mode: max distinct values for a dimension key
+  max_target_candidates: 30    # target-dropdown cap (generous — a real measure must never fall off)
 
 # Stage 4: forecasting EDA settings
 forecast_eda:
@@ -96,7 +100,8 @@ training:
     max:      {optuna_trials: 100, early_stopping_rounds: 120, nhits_max_epochs: 500}
   optuna_trials_large: 8       # override once n_series >= large_panel_series (any profile)
   max_train_rows: 1500000      # stratified (series, horizon) subsample cap for huge panels
-  max_models_per_run: 4        # hard cap on models trained simultaneously (baseline excluded)
+  max_models_per_run: 5        # hard cap on models trained simultaneously (baseline excluded)
+  chronos_variant: "amazon/chronos-bolt-small"  # HF model id for the zero-shot chronos backend
   per_series_cap: 200          # per_series_local: model top-K series individually, tail -> aggregate
   large_panel_series: 500      # n_series at/above this triggers the large-data reductions
   # Cost tiers (units = policy_multiplier * n_series_effective * n_models):

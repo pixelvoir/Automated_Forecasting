@@ -15,6 +15,18 @@ app = dash.Dash(
 )
 app.layout = create_layout()
 
+# Backstop for the 100 MB dcc.Upload cap: werkzeug rejects an oversized POST on its
+# Content-Length header BEFORE buffering the body, so the Dash process can never OOM on
+# a huge upload again (a 254 MB CSV once base64-inflated to ~930 MB of transient copies
+# here). 150 MB = 100 MB file × ~1.37 base64 inflation + the JSON envelope.
+app.server.config["MAX_CONTENT_LENGTH"] = 150 * 1024 * 1024
+
+
+@app.server.errorhandler(413)
+def _too_large(_e):
+    return {"error": "Upload too large — uploads are capped at 100 MB. Paste the local "
+                     "file path in the ingestion form instead (no size limit)."}, 413
+
 
 @app.server.after_request
 def _no_cache_html(resp):

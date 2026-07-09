@@ -243,23 +243,40 @@ def toggle_query(n_clicks, is_open):
     State("input-password", "value"),
     State("upload-file", "contents"),
     State("upload-file", "filename"),
+    State("input-file-path", "value"),
     running=[(Output("btn-run", "disabled"), True, False)],
     prevent_initial_call=True,
 )
 def trigger_run(n_clicks, source, table, query, host, port, database, user, password,
-                upload_contents, upload_filename):
+                upload_contents, upload_filename, file_path):
     if not n_clicks:
         return no_update, no_update
     if source == "file":
-        if not upload_contents:
+        # A pasted local path wins: zero copies — the API streams straight from disk
+        # (the upload route base64-inflates the whole file through browser + Dash RAM,
+        # which is why it is capped at 100 MB).
+        path = (file_path or "").strip().strip('"').strip("'")
+        if path:
+            p = Path(path)
+            if not p.is_file():
+                return no_update, dbc.Alert(
+                    f"File not found: {path} — the path must exist on the machine "
+                    "running this app.", color="warning", dismissable=True)
+            if p.suffix.lower() not in (".csv", ".xlsx", ".xls", ".parquet"):
+                return no_update, dbc.Alert(
+                    "Unsupported file type — use .csv, .xlsx, .xls or .parquet.",
+                    color="warning", dismissable=True)
+            payload = {"source": "file", "file_path": str(p)}
+        elif upload_contents:
+            try:
+                tmp_path = _save_upload(upload_contents, upload_filename)
+            except Exception as e:
+                return no_update, dbc.Alert(f"Could not process upload: {e}", color="danger", dismissable=True)
+            payload = {"source": "file", "file_path": tmp_path}
+        else:
             return no_update, dbc.Alert(
-                "Upload a file first — drag & drop or click Browse.", color="warning", dismissable=True
-            )
-        try:
-            tmp_path = _save_upload(upload_contents, upload_filename)
-        except Exception as e:
-            return no_update, dbc.Alert(f"Could not process upload: {e}", color="danger", dismissable=True)
-        payload = {"source": "file", "file_path": tmp_path}
+                "Provide a file: paste a local path (any size), or upload one up to "
+                "100 MB.", color="warning", dismissable=True)
 
     else:  # database
         if not all([host, database, user, password]):
@@ -1167,6 +1184,28 @@ def _render_stage3(stage3: dict) -> list:
         ])), className="mb-3", style={"borderLeft": "3px solid #6366f1"}),
     )
 
+    # Target-total preservation — a level-mutating recipe (clipping a sum-target) shows
+    # up here as a large drift, red-highlighted. Only rendered when the cleaner tracked
+    # a target (intent-aware runs).
+    drift = stage3.get("target_total_drift_pct")
+    if stage3.get("target_total_before") is not None and drift is not None:
+        drift_bad = abs(drift) > 5
+        drift_color = "#e66767" if drift_bad else "#059669"
+        sections.append(dbc.Card(dbc.CardBody(html.Div([
+            html.Span(f"Target '{stage3.get('target_col')}' total: ",
+                      style={"fontSize": "0.8rem", "color": "#94a3b8"}),
+            html.Span(f"{stage3['target_total_before']:,.0f} → "
+                      f"{(stage3.get('target_total_after') or 0):,.0f} ",
+                      style={"fontSize": "0.85rem", "fontWeight": "600", "color": _TEXT}),
+            html.Span(f"({drift:+}%)", style={"fontSize": "0.85rem", "fontWeight": "700",
+                                              "color": drift_color}),
+            html.Div("Cleaning shifted the target's total significantly — check the "
+                     "outlier strategy on the target column.",
+                     style={"fontSize": "0.72rem", "color": "#e66767", "marginTop": "3px"})
+            if drift_bad else None,
+        ])), className="mb-3",
+            style={"borderLeft": f"3px solid {drift_color}"}))
+
     # Cleaning recipe table
     col_recipes = recipe.get("columns", {})
     if col_recipes:
@@ -1278,15 +1317,16 @@ def run_intent_redetect(n_clicks, store_data):
     State("dropdown-fcst-freq", "value"),
     State("input-fcst-horizon", "value"),
     State("radio-fcst-scope", "value"),
+    State("dropdown-fcst-exog", "value"),
     State("switch-use-llm", "value"),
     running=[(Output("btn-fcst-rerun", "disabled"), True, False)],
     prevent_initial_call=True,
 )
-def rerun_fcst_eda(n_clicks, store_data, freq, horizon, scope, use_llm):
-    """Stage-4-only re-run with scope / frequency / horizon overrides — none of these
-    affect cleaning (cleaner.py never reads them), so adjusting them must NOT force a
-    re-clean. Model selection is re-chained afterward (fresh evidence invalidates the old
-    decision), and the now-stale Stage 6/7 features+training are dropped."""
+def rerun_fcst_eda(n_clicks, store_data, freq, horizon, scope, exog, use_llm):
+    """Stage-4-only re-run with scope / frequency / horizon / exog overrides — none of
+    these affect cleaning (cleaner.py never reads them), so adjusting them must NOT force
+    a re-clean. Model selection is re-chained afterward (fresh evidence invalidates the
+    old decision), and the now-stale Stage 6/7 features+training are dropped."""
     if not n_clicks or not store_data:
         return no_update, no_update
     run_id = store_data.get("run_id")
@@ -1296,7 +1336,8 @@ def rerun_fcst_eda(n_clicks, store_data, freq, horizon, scope, use_llm):
     # missing switch as "on" rather than silently disabling the LLM.
     use_llm = True if use_llm is None else bool(use_llm)
     body = {"forecast_frequency": freq, "horizon": int(horizon) if horizon else None,
-            "scope": scope or None}
+            "scope": scope or None,
+            "exog_cols": list(exog) if exog is not None else None}
     try:
         resp = requests.post(f"{API_URL}/runs/{run_id}/forecast-eda", json=body, timeout=1800)
         if resp.status_code == 409:
@@ -1403,6 +1444,40 @@ def update_train_estimate(models, store_data):
     if not store_data:
         return no_update
     return training_view.build_estimate_banner(store_data, models or [])
+
+
+@callback(
+    Output("graph-train-chart", "figure"),
+    Input("dropdown-train-chart-model", "value"),
+    Input("dropdown-train-chart-series", "value"),
+    State("results-store", "data"),
+    prevent_initial_call=True,
+)
+def update_train_chart(model_id, series, store_data):
+    """Chart any trained model (not just the best); with a series selected on a
+    per-series run, fetch that single series' backtest+forecast from the API."""
+    store_data = store_data or {}
+    report = store_data.get("_stage7") or {}
+    if not model_id or not report:
+        return no_update
+
+    if series:
+        run_id = report.get("run_id") or store_data.get("run_id")
+        try:
+            resp = requests.get(f"{API_URL}/runs/{run_id}/series-forecast",
+                                params={"model": model_id, "series": series}, timeout=60)
+            if resp.ok:
+                js = resp.json()
+                return training_view.forecast_figure(
+                    {"backtest": js.get("backtest"), "forecast": js.get("forecast")}, None)
+        except requests.RequestException:
+            pass
+        return no_update
+
+    entry = next((e for e in report.get("results") or [] if e["model"] == model_id), None)
+    if not entry:
+        return no_update
+    return training_view.forecast_figure(entry, training_view.history_for(store_data, report))
 
 
 @callback(

@@ -307,8 +307,18 @@ def _adjust_form(data, eda_exists):
             "Per-series needs a series key — set one on the Pipeline Setup tab (that re-cleans).",
             style={"fontSize": "0.72rem", "color": "#d97706", "marginTop": "2px"})
 
+    # Exogenous re-selection: also a Stage-4-only concern (cleaning never reads exog
+    # for row decisions; the sanitizer merely protects selected exog from mutation).
+    # Options = the intent detector's exog candidates ∪ whatever is currently selected;
+    # the API validates against the cleaned columns.
+    target_col = selections.get("target_col") or suggestions.get("target", {}).get("suggested")
+    exog_current = selections.get("exog_cols") or []
+    exog_opts = sorted({*(suggestions.get("exogenous", {}).get("candidates") or []),
+                        *exog_current} - {target_col, None})
+
     return dbc.Card(dbc.CardBody([
-        html.P("Scope, frequency and horizon re-run from here without re-cleaning.",
+        html.P("Scope, frequency, horizon and exogenous drivers re-run from here "
+               "without re-cleaning.",
                style={"fontSize": "0.72rem", "color": "#64748b", "marginBottom": "8px"}),
         dbc.Row([
             dbc.Col([
@@ -336,6 +346,14 @@ def _adjust_form(data, eda_exists):
                           value=horizon_current, size="sm"),
             ], md=3),
         ]),
+        dbc.Row([dbc.Col([
+            _lbl("Exogenous drivers (optional)"),
+            dcc.Dropdown(id="dropdown-fcst-exog", multi=True,
+                         options=[{"label": c, "value": c} for c in exog_opts],
+                         value=exog_current,
+                         placeholder="No exogenous drivers",
+                         style={"fontSize": "0.85rem"}),
+        ])], className="mt-2"),
         dcc.Loading(
             dbc.Button(
                 [_cicon("bi-graph-up"),

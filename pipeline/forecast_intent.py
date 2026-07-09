@@ -50,7 +50,8 @@ _FREQ_GRANULARITY = {"hourly": 0, "daily": 1, "weekly": 2, "monthly": 3, "quarte
 # anything heavy runs, so a miss costs one dropdown click.
 _MEASURE_HINTS = re.compile(
     r"sales|demand|qty|quantity|volume|revenue|amount|total|litre|liter|kilo|units|sold"
-    r"|consumption|usage|load|orders|count", re.I)
+    r"|consumption|usage|load|orders|count|weight|\bkg\b|tonne|\bton\b|gallon|\bwt\b"
+    r"|price|cost|value|spend", re.I)
 _RATE_HINTS = re.compile(r"pct|percent|rate|ratio|avg|average|aggregated", re.I)
 _ID_AUDIT_HINTS = re.compile(
     r"^id$|_id$|^index$|_key$|^key$|code|file_|_file|loaded|created|updated|_at$"
@@ -132,6 +133,21 @@ def _timestamp_candidates(meta: dict) -> tuple[list[dict], str | None, str]:
 
 # ── Target candidates (measures + event counts) ──────────────────────────────
 
+def _is_float_like(item: dict, stats: dict) -> bool:
+    """Fractional values mark a continuous quantity (volume/weight) rather than an
+    integer attribute/headcount. Covers object-stored numerics via the quartiles."""
+    if "float" in str(item.get("dtype_raw", "")).lower():
+        return True
+    for k in ("median", "q1", "q3"):
+        v = stats.get(k)
+        try:
+            if v is not None and float(v) % 1 != 0:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
 def _measure_candidates(meta: dict, nunique: pd.Series, n_rows: int,
                         ts_cols: set[str]) -> list[dict]:
     numeric_stats = meta.get("numeric_stats", {})
@@ -140,10 +156,15 @@ def _measure_candidates(meta: dict, nunique: pd.Series, n_rows: int,
         col = item["col"]
         if col in ts_cols or item.get("dtype_inferred") != "numeric":
             continue
-        std = numeric_stats.get(col, {}).get("std", 0) or 0
+        stats = numeric_stats.get(col, {})
+        std = stats.get("std", 0) or 0
         if std <= 0:
             continue  # constant — nothing to forecast
-        distinct_pct = float(nunique.get(col, 0)) / max(n_rows, 1) * 100
+        mean = stats.get("mean")
+        cv = abs(std / mean) if mean else None  # scale-free variation
+        nu = float(nunique.get(col, 0))
+        distinct_pct = nu / max(n_rows, 1) * 100
+
         score = 0.0
         if _MEASURE_HINTS.search(col):
             score += 2
@@ -151,14 +172,37 @@ def _measure_candidates(meta: dict, nunique: pd.Series, n_rows: int,
             score -= 2
         if _ID_AUDIT_HINTS.search(col):
             score -= 2
+        if _JUNK_HINTS.search(col):
+            score -= 3  # contact/tag/free-text names are never the forecast quantity
         if distinct_pct > 95:
             score -= 3
+
+        # Continuous-signal bonuses (all scale/unit-free), hard-capped at +1.75 so an
+        # unhinted column can never cross the measure-keyword bar of 2 (which would flip
+        # event_log_mode). This is the tiebreaker keyword ties need: a real volume
+        # measure (~1M distinct fractional values, healthy CV) now outranks a
+        # near-constant headcount attribute that happens to share the keyword — the
+        # observed failure was `total_farmers` (distinct 0.04%, CV≈0) beating
+        # `total_litre`/`total_kilo` purely by schema column order.
+        score += min(1.0, float(np.log10(max(nu, 1))) / 6.0)   # cardinality: 1e6 → +1.0
+        if cv is not None:
+            score += min(0.5, cv / 2.0)                        # variation: CV ≥ 1 → +0.5
+        if _is_float_like(item, stats):
+            score += 0.25
+        # Near-constant penalty: a column whose values barely vary carries no
+        # forecastable flow — it is an attribute, not a measure.
+        if cv is not None and cv < 0.05:
+            score -= 1.5
+        elif cv is not None and cv < 0.15:
+            score -= 0.75
+
         out.append({
-            "col": col, "kind": "measure", "score": score,
+            "col": col, "kind": "measure", "score": _f(score, 3),
             "agg_hint": "mean" if _RATE_HINTS.search(col) else "sum",
             "distinct_pct": _f(distinct_pct, 2),
+            "cv": _f(cv, 3),
         })
-    out.sort(key=lambda c: -c["score"])
+    out.sort(key=lambda c: (-c["score"], -(c["distinct_pct"] or 0), c["col"]))
     return out
 
 
@@ -298,10 +342,14 @@ def detect(run_id: str) -> dict:
     # ── Target: measures + event counts ─────────────────────────────────────
     measures = _measure_candidates(meta, nunique, n_rows, ts_cols)
     counts = _count_candidates(meta, nunique, n_rows, ts_cols)
-    best_measure_score = measures[0]["score"] if measures else -99
     # Event-log mode: no convincing numeric measure but a plausible event-ID column —
-    # the forecastable quantity is events per period (the vet-data case).
-    event_log_mode = best_measure_score < 2 and len(counts) > 0
+    # the forecastable quantity is events per period (the vet-data case). The gate is
+    # KEYWORD-based (a measure-named column with a non-degenerate score), deliberately
+    # independent of the continuous-signal bonuses/penalties so their tuning can never
+    # flip a measure dataset into count mode.
+    has_keyword_measure = any(
+        _MEASURE_HINTS.search(m["col"]) and (m["score"] or 0) > 0 for m in measures)
+    event_log_mode = not has_keyword_measure and len(counts) > 0
 
     candidates = (counts + measures) if event_log_mode else (measures + counts)
     suggested_target = candidates[0]["col"] if candidates else None
@@ -369,7 +417,8 @@ def detect(run_id: str) -> dict:
             "confidence": ts_conf,
         },
         "target": {
-            "candidates": candidates[:12],
+            # capped generously so real measures can't fall off the UI dropdown
+            "candidates": candidates[:int(cfg.get("max_target_candidates", 30))],
             "suggested": suggested_target,
             "suggested_agg": suggested_agg,
             "confidence": target_conf,

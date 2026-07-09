@@ -23,7 +23,7 @@ categories:
     description: "Gradient-boosted trees on lag/date features; handles exogenous drivers and global panel training."
   deep_learning:
     label: "Deep learning"
-    description: "Neural forecasters; need long history and an installed neuralforecast."
+    description: "Neural forecasters (torch NHITS, pretrained Chronos); panel totals count toward their history requirement."
 
 models:
   - id: seasonal_naive
@@ -47,6 +47,43 @@ models:
     when_to_use: >-
       Trend-dominant series; deseasonalizes then extrapolates a damped trend. Very
       robust default on short-to-medium history (a top performer in the M-competitions).
+
+  - id: auto_ets
+    label: "AutoETS"
+    library: statsmodels            # models_lib/statistical.py::AutoETSForecaster
+    import_check: statsmodels
+    categories: [statistical]
+    min_length: 10
+    supports_exog: false
+    when_to_use: >-
+      Exponential smoothing with automatic trend/seasonal selection. Best for trend
+      and/or a single seasonality with smooth demand; the multiplicative variants suit
+      series whose variance grows with the level (heteroskedastic).
+
+  - id: auto_arima
+    label: "AutoARIMA"
+    library: pmdarima               # models_lib/statistical.py::AutoARIMAForecaster
+    import_check: pmdarima
+    categories: [statistical]
+    min_length: 30
+    supports_exog: false
+    when_to_use: >-
+      Rich autocorrelation structure (many significant ACF lags) with at most one
+      seasonal period <= 24; differencing handles trend. Slow on very long series and
+      infeasible for weekly-52 / daily-365 seasonality.
+
+  - id: prophet
+    label: "Prophet"
+    library: prophet
+    import_check: prophet
+    categories: [statistical]
+    min_length: 20
+    supports_exog: false
+    when_to_use: >-
+      Trend with automatic changepoints plus one or several seasonal cycles — including
+      long periods (e.g. yearly-365) where ARIMA is infeasible — and calendar effects;
+      robust to gaps and outliers. Point forecasts; intervals come from the conformal
+      fallback.
 
   - id: croston
     label: "Croston (optimized)"
@@ -108,3 +145,16 @@ models:
       panels trained globally — for per-series scope the TOTAL observations across
       all series count toward min_length, so a 1,800-series monthly panel qualifies
       even when each series is short. Needs PyTorch installed.
+
+  - id: chronos
+    label: "Chronos (zero-shot)"
+    library: chronos-forecasting    # models_lib/chronos_model.py — Amazon pretrained
+    import_check: chronos
+    categories: [deep_learning]
+    min_length: 10
+    supports_exog: false
+    when_to_use: >-
+      Amazon's pretrained transformer — zero-shot inference, no training: a strong
+      generalist on regular, pattern-rich series of any length, and cheap even on
+      large panels (batched inference). Weak on intermittent / zero-heavy demand;
+      cannot use exogenous drivers. First use downloads ~190MB of weights.

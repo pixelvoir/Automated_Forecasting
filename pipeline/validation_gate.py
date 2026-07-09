@@ -224,6 +224,30 @@ def run(run_id: str) -> dict:
             "passed": passed_t, "severity": "blocking", "detail": detail_t,
         }
 
+    # 6b-2. The target's LEVEL must survive too (sum/mean measure targets): a recipe
+    # that clips/winsorizes the target compresses its top tail, silently shrinking every
+    # aggregated total — and the forecast inherits the bias (observed real failure:
+    # clip_iqr on a sum-target cut cleaned totals far below raw). Row loss legitimately
+    # removes target value with the rows, so the allowance is threshold + row loss.
+    report_path = run_dir / "cleaning_report.json"
+    creport = json.loads(report_path.read_text()) if report_path.exists() else {}
+    if intent and intent.get("agg") in ("sum", "mean") and creport.get("target_total_before"):
+        before = float(creport["target_total_before"])
+        after = creport.get("target_total_after")
+        max_drift = float(cfg.get("max_target_sum_drift_pct", 5))
+        if after is not None and before:
+            drift_pct = round((float(after) - before) / abs(before) * 100, 2)
+            allowed = max_drift + max(row_delta_pct, 0)
+            passed_lvl = abs(drift_pct) <= allowed
+            detail_lvl = (f"Target '{intent['target_col']}' total changed {drift_pct:+}% "
+                          f"(allowed: ±{max_drift}% beyond the {row_delta_pct}% row loss)")
+            if not passed_lvl:
+                detail_lvl += (" — a level-mutating strategy (clip/winsorize/log) likely "
+                               "compressed the values; re-run cleaning")
+            checks["target_level_preserved"] = {
+                "passed": passed_lvl, "severity": "blocking", "detail": detail_lvl,
+            }
+
     # 6c. Series-key columns must survive when the user chose per-series scope
     if intent and intent.get("scope") == "per_series" and intent.get("group_cols"):
         missing_groups = [c for c in intent["group_cols"] if c not in clean_nulls]

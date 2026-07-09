@@ -150,6 +150,44 @@ def _provenance(sel):
                       color="info", className="py-2 mb-3")]
 
 
+# ── Ranked top-5 ─────────────────────────────────────────────────────────────
+
+def _ranking_card(sel):
+    """The ranked top-5 (rule suitability scores, optionally re-ranked by the LLM) —
+    the list the user picks training candidates from. Absent on pre-ranking runs."""
+    ranking = sel.get("ranking") or []
+    if not ranking:
+        return None
+    rows = []
+    for e in ranking:
+        cat = e.get("category")
+        rows.append(html.Div([
+            html.Span(f"#{e['rank']}",
+                      style={"color": "#6366f1", "fontWeight": "700",
+                             "fontSize": "0.85rem", "minWidth": "32px",
+                             "display": "inline-block"}),
+            html.Span(e.get("label") or e["model"],
+                      style={"color": _TEXT, "fontWeight": "600", "fontSize": "0.88rem",
+                             "marginRight": "8px"}),
+            dbc.Badge(_CAT_LABEL.get(cat, cat), color=_CAT_COLOR.get(cat, "secondary"),
+                      className="me-1", style={"fontSize": "0.6rem"}),
+            dbc.Badge("LLM" if e.get("source") == "llm" else "rules",
+                      color="info" if e.get("source") == "llm" else "secondary",
+                      style={"fontSize": "0.6rem"}),
+            html.Div(e.get("reason") or "", style={"fontSize": "0.75rem",
+                                                   "color": "#94a3b8",
+                                                   "marginLeft": "32px"}),
+        ], className="mb-2"))
+    return dbc.Card(dbc.CardBody([
+        html.Div(html.Span([_cicon("bi-trophy"), "Ranked candidates (best first)"],
+                           style=_SH), className="mb-2"),
+        html.P("Ranked by expected accuracy on this series' statistics. The top two are "
+               "pre-selected on the Training tab — train up to five and compare.",
+               style={"fontSize": "0.75rem", "color": "#64748b"}, className="mb-2"),
+        *rows,
+    ]), className="mb-3")
+
+
 # ── Training hints ───────────────────────────────────────────────────────────
 
 def _hints_card(sel):
@@ -323,10 +361,12 @@ def render_model_tab(data):
             _rerun_row(has_selection=False),
         ])
 
+    ranking_card = _ranking_card(sel)
     return html.Div([
         header,
         *_provenance(sel),
         _decision_hero(sel),
+        *([ranking_card] if ranking_card else []),
         _hints_card(sel),
         _rerun_row(has_selection=True),
         _eligible_table(sel),

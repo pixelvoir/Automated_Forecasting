@@ -1,15 +1,17 @@
-"""Stage 5 agent: LLM model selection on top of the deterministic rule engine.
+"""Stage 5 agent: LLM model RANKING on top of the deterministic rule engine.
 
-pipeline/rule_engine.py ALWAYS runs first and produces a pick + full reasoning trace.
-When use_llm is on, the LLM receives the Stage 4 statistics, the derived decision
-features, the eligible model cards and the rule suggestion, and may override the pick —
-a field-level sanitizer reverts anything invalid (unknown/ineligible model, mismatched
-category) to the rule engine's answer for that field only, and LLM confidence is
-dampened to at most one level above the rule confidence. LLM failure → the rule pick
-stands and the error is recorded for the UI. Same architecture as the intent agent.
+pipeline/rule_engine.py ALWAYS runs first and produces a pick + reasoning trace + a
+suitability ranking of every eligible model. When use_llm is on, the LLM receives the
+Stage 4 statistics, the derived decision features, the eligible model cards and the
+rule suggestion (pick + ranking), and returns a re-ranked TOP-5 with a one-sentence
+reason per entry — a list-level sanitizer drops ineligible/duplicate entries, backfills
+from the rule ranking, and puts the rule pick back at rank 1 whenever the LLM's #1
+didn't survive. LLM confidence is dampened to at most one level above the rule
+confidence. LLM failure → the rule ranking stands and the error is recorded for the UI.
 
-Writes runs/{id}/model_selection.json — the single file Stage 6 (feature engineering)
-and Stage 7 (training) read: model + runner_up + training_hints.
+Writes runs/{id}/model_selection.json — the single file Stage 6 (feature engineering),
+Stage 7 (training) and the UI read: model + runner_up (= ranks 1/2, backward compat) +
+`ranking` (the top-5 the user picks training candidates from) + training_hints.
 """
 import json
 from datetime import datetime, timezone
@@ -36,41 +38,36 @@ _MODEL_ALIASES = {
     "lgbm": "lightgbm", "light_gbm": "lightgbm", "gbm": "lightgbm",
     "croston_optimized": "croston", "crostonoptimized": "croston",
     "naive": "seasonal_naive", "seasonalnaive": "seasonal_naive",
+    "fbprophet": "prophet", "meta_prophet": "prophet",
+    "chronos_bolt": "chronos", "chronos_bolt_small": "chronos",
+    "amazon/chronos_bolt_small": "chronos", "chronos_forecasting": "chronos",
 }
-_CATEGORY_ALIASES = {
-    "machine_learning": "ml", "machine-learning": "ml", "gbm": "ml", "boosting": "ml",
-    "classical": "statistical", "stats": "statistical", "univariate": "statistical",
-    "neural": "deep_learning", "deep": "deep_learning", "dl": "deep_learning",
-    "croston": "intermittent", "sparse": "intermittent",
-    "benchmark": "baseline", "naive": "baseline",
-}
-
-
 # ── Pydantic output schema ────────────────────────────────────────────────────
 
-class ModelChoice(BaseModel):
-    # NOTE: the Literal must match the category ids in config/model_categories.yaml.
-    category: Literal["baseline", "statistical", "intermittent", "ml", "deep_learning"]
+class RankedEntry(BaseModel):
     model: str
-    runner_up: str | None = None
-    confidence: Literal["high", "medium", "low"]
-    reason: str
+    reason: str = ""
 
-    @field_validator("category", mode="before")
-    @classmethod
-    def _category_aliases(cls, v):
-        if isinstance(v, str):
-            v = v.strip().lower()
-            return _CATEGORY_ALIASES.get(v, v)
-        return v
-
-    @field_validator("model", "runner_up", mode="before")
+    @field_validator("model", mode="before")
     @classmethod
     def _model_aliases(cls, v):
         if isinstance(v, str):
             v = v.strip().lower().replace(" ", "_").replace("-", "_")
             return _MODEL_ALIASES.get(v, v)
         return v
+
+    @field_validator("reason", mode="before")
+    @classmethod
+    def _reason_str(cls, v):
+        return str(v)[:250] if v is not None else ""
+
+
+class ModelRanking(BaseModel):
+    """The LLM re-ranks the eligible models (top-5, best first). Category is NOT part of
+    the contract — it is derived from the catalog for whichever model lands rank 1."""
+    ranking: list[RankedEntry]
+    confidence: Literal["high", "medium", "low"]
+    reason: str
 
     @field_validator("reason", mode="before")
     @classmethod
@@ -86,42 +83,56 @@ You are a time-series model-selection expert. You receive the dataset context (s
 column names + per-column statistics, the user-confirmed forecast intent — never raw
 values), the computed statistics of the forecast series, the catalog of AVAILABLE
 candidate models with guidance on when each fits, and a deterministic rule-engine
-suggestion with its reasoning trace. Use the dataset context to understand WHAT is
-being forecast (the business meaning of the target, series keys and drivers); use the
-series statistics to decide HOW to forecast it. Decide the single best model for
-training. ineligible_models are listed with the reason they were ruled out — never
-pick one.
+suggestion: its top pick with the reasoning trace AND its full suitability ranking.
+Use the dataset context to understand WHAT is being forecast (the business meaning of
+the target, series keys and drivers); use the series statistics to decide HOW to
+forecast it. Produce a RANKING of the best models to train, best first — the user
+trains the top of this list, so order = expected accuracy. ineligible_models are
+listed with the reason they were ruled out — never include one.
 
 Return STRICT JSON with exactly these fields:
 {
-  "category":   "baseline" | "statistical" | "intermittent" | "ml" | "deep_learning",
-  "model":      "<one id from eligible_models>",
-  "runner_up":  "<a different id from eligible_models>" | null,
+  "ranking": [
+    {"model": "<id from eligible_models>", "reason": "<one sentence: why this rank>"},
+    ...
+  ],
   "confidence": "high" | "medium" | "low",
-  "reason":     "<2-3 short sentences citing the statistics that drove the choice>"
+  "reason": "<2-3 short sentences on the #1 pick, citing the statistics that drove it>"
 }
+The ranking must contain min(5, number of eligible models) DISTINCT entries, best
+first. Start from rule_suggestion.ranking and reorder only where the statistics
+justify it.
 
-Rules:
-- model MUST be one of the ids in eligible_models. Never invent a model.
+Model guidance (beyond each card's when_to_use):
 - Intermittent/lumpy demand (high ADI, many zero periods) needs croston/tsb; smooth
   series never do.
-- Two or more seasonal periods -> mstl (or prophet if eligible).
+- Two or more seasonal periods -> lightgbm (Fourier/calendar features capture each
+  cycle after seasonal-index deseasonalization) or prophet (decomposes them natively).
+- chronos is a pretrained zero-shot transformer: a strong generalist on regular,
+  pattern-rich series with no training cost, but weak on intermittent/zero-heavy
+  demand and it cannot use exogenous drivers.
+- prophet fits trend with automatic changepoints plus multiple seasonalities and
+  calendar effects — strongest on daily/weekly data and long seasonal periods (e.g.
+  yearly-365) where ARIMA is infeasible.
+- auto_arima suits rich short-lag autocorrelation with a single seasonal period <= 24
+  (monthly/quarterly); never for weekly-52 / daily-365 seasonality.
+- auto_ets suits smooth single-seasonal series; its multiplicative variants handle
+  level-dependent variance (heteroskedastic with a log recommendation).
 - Exogenous drivers only help if they LEAD the target (best_lag >= 1) or their future
   values are known; lag-0 correlation alone is NOT usable at forecast time. High VIF
   means the drivers are collinear — at most 1-2 of them add real signal. A best_lag
   within +-2 of the seasonal period may just echo the seasonality (seasonal_echo flag).
-- SARIMA-family is infeasible for seasonal periods above ~24; prefer
-  auto_ets/mstl/lightgbm there.
-- Short history (under ~3 full seasonal cycles) favors auto_ets/auto_theta over
-  auto_arima; lightgbm needs long history or a many-series panel to beat classical
-  models.
-- Growing variance (heteroskedastic with a log recommendation) favors multiplicative
-  smoothing (auto_ets) or a log transform, which training applies from the hints.
-- A recent structural break favors models robust to level shifts and a shorter
-  training window; mention it in reason if it influenced you.
-- Prefer the simplest adequate model. Agree with the rule engine unless the evidence
-  clearly contradicts it; overriding a "high"-confidence rule suggestion needs strong
-  justification.
+  Only lightgbm/xgboost can exploit exogenous drivers.
+- lightgbm, xgboost, nhits and chronos serve many-series panels with ONE global model:
+  the panel's TOTAL observations count toward their history requirement.
+- Short history (under ~3 full seasonal cycles) favors auto_theta/auto_ets/chronos;
+  lightgbm/nhits need long history or a many-series panel to beat classical models.
+- Growing variance (heteroskedastic with a log recommendation) is handled by the log
+  transform, which training applies automatically from the hints.
+- A recent structural break favors models robust to level shifts; mention it in
+  reason if it influenced the order.
+- Agree with the rule engine's #1 unless the evidence clearly contradicts it;
+  demoting a "high"-confidence rule pick needs strong justification.
 - confidence: "high" only when the statistics point one way unambiguously.
 - Return pure JSON. No markdown, no extra text.
 """
@@ -185,37 +196,55 @@ def _build_llm_payload(payload: dict, rule: dict, catalog: dict, run_dir: Path) 
             "runner_up": rule["runner_up"],
             "confidence": rule["confidence"],
             "trace": [t["detail"] for t in rule["trace"] if t["fired"]],
+            "ranking": [{"model": e["model"], "score": e["score"],
+                         "reasons": e["reasons"]}
+                        for e in (rule.get("ranking") or [])[:5]],
         },
     }
 
 
-# ── Field-level sanitizer ─────────────────────────────────────────────────────
+# ── List-level sanitizer ──────────────────────────────────────────────────────
 
-def _sanitize(choice: ModelChoice, rule: dict, catalog: dict) -> tuple[dict, list[str]]:
-    """Validate each LLM field against the eligible set; an invalid field reverts to
-    the rule pick for that field only. Returns (clean dict, list of overrides)."""
+def _rank_cap(rule: dict) -> int:
+    return min(5, len(rule["eligible_models"]))
+
+
+def _sanitize_ranking(choice: ModelRanking, rule: dict) -> tuple[list[dict], list[str]]:
+    """Validate the LLM ranking against the eligible set: drop invalid/duplicate
+    entries, then backfill from the rule ranking up to min(5, n_eligible). Returns
+    (entries [{model, reason, source}], overrides). Override "rank1" means the LLM's
+    top pick did not survive — the rule engine owns the decision then."""
     overrides: list[str] = []
     eligible = set(rule["eligible_models"])
-    out = choice.model_dump()
+    llm_first = choice.ranking[0].model if choice.ranking else None
 
-    if out["model"] not in eligible:
-        out["model"] = rule["model"]
-        out["category"] = rule["category"]
-        overrides.append("model")
-    else:
-        # A valid model in the wrong category: trust the model, fix the category
-        # from the catalog (the model id is the decision that matters downstream).
-        card = catalog["models"].get(out["model"])
-        if card and out["category"] not in card["categories"]:
-            out["category"] = card["categories"][0]
-            overrides.append("category")
+    entries, seen = [], set()
+    for e in choice.ranking:
+        if e.model in eligible and e.model not in seen:
+            entries.append({"model": e.model, "reason": e.reason, "source": "llm"})
+            seen.add(e.model)
+        else:
+            overrides.append("ranking")
+    if llm_first is None or not entries or entries[0]["model"] != llm_first:
+        overrides.append("rank1")
 
-    if out["runner_up"] is not None and (
-            out["runner_up"] not in eligible or out["runner_up"] == out["model"]):
-        out["runner_up"] = rule["runner_up"] if rule["runner_up"] != out["model"] else None
-        overrides.append("runner_up")
+    for r in rule.get("ranking") or []:
+        if len(entries) >= _rank_cap(rule):
+            break
+        if r["model"] not in seen:
+            entries.append({"model": r["model"],
+                            "reason": "; ".join(r["reasons"]) or "rule-ranked",
+                            "source": "rule"})
+            seen.add(r["model"])
+            overrides.append("ranking")
 
-    return out, overrides
+    # The LLM's #1 didn't survive → the rule pick owns rank 1 (the hero card must
+    # attribute the decision honestly; a demoted-by-accident rule pick would lie).
+    if "rank1" in overrides:
+        entries = [e for e in entries if e["model"] != rule["model"]]
+        entries.insert(0, {"model": rule["model"], "reason": rule["reason"],
+                           "source": "rule"})
+    return entries[:_rank_cap(rule)], sorted(set(overrides))
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -233,7 +262,18 @@ def run(run_id: str, use_llm: bool = True) -> dict:
                       "rationale": None, "error": None, "response": None,
                       "sanitizer_overrides": []}
 
-    final = {k: rule[k] for k in ("category", "model", "runner_up", "confidence", "reason")}
+    def _cat_of(mid):
+        card = catalog["models"].get(mid)
+        return card["categories"][0] if card else None
+
+    # Default (no LLM / LLM failure): the rule engine's suitability ranking, with the
+    # ladder's own reason on rank 1.
+    entries = [{"model": e["model"], "reason": "; ".join(e["reasons"]) or rule["reason"],
+                "source": "rule"}
+               for e in (rule.get("ranking") or [])[:_rank_cap(rule)]]
+    if entries and entries[0]["model"] == rule["model"]:
+        entries[0]["reason"] = rule["reason"]
+    confidence, top_reason = rule["confidence"], rule["reason"]
     source = "rule_engine"
 
     if use_llm:
@@ -245,41 +285,59 @@ def run(run_id: str, use_llm: bool = True) -> dict:
             {"role": "user", "content": (
                 "Here is the forecasting task description:\n\n"
                 + json.dumps(payload, indent=2)
-                + "\n\nReturn the model selection JSON."
+                + "\n\nReturn the model ranking JSON."
             )},
         ]
         try:
             raw = llm_client.call(messages, require_json=True)
             llm_info["response"] = json.loads(json.dumps(raw))
-            choice = ModelChoice.model_validate(raw)
-            clean, overrides = _sanitize(choice, rule, catalog)
+            choice = ModelRanking.model_validate(raw)
+            clean_entries, overrides = _sanitize_ranking(choice, rule)
+            if clean_entries:
+                entries = clean_entries
 
             # Dampen: LLM confidence capped at one level above the rule confidence;
-            # a reverted model/category means the LLM's judgement failed -> low.
-            if "model" in overrides or "category" in overrides:
-                conf = "low"
+            # a reverted rank-1 means the LLM's judgement failed -> low.
+            if "rank1" in overrides:
+                confidence = "low"
+                top_reason = rule["reason"]
             else:
-                conf = _NAME[min(_RANK[clean["confidence"]],
-                                 _RANK[rule["confidence"]] + 1)]
-
-            final = {"category": clean["category"], "model": clean["model"],
-                     "runner_up": clean["runner_up"], "confidence": conf,
-                     "reason": clean["reason"]}
+                confidence = _NAME[min(_RANK[choice.confidence],
+                                       _RANK[rule["confidence"]] + 1)]
+                top_reason = choice.reason
             # `source` names who actually picked the final model (drives the UI hero
-            # card) — if the sanitizer reverted the model, the rule engine picked it.
-            source = "rule_engine" if "model" in overrides else "llm"
-            llm_info.update({"suggested_by": "llm", "rationale": clean["reason"],
+            # card) — if the sanitizer reverted rank 1, the rule engine picked it.
+            source = "rule_engine" if "rank1" in overrides else "llm"
+            llm_info.update({"suggested_by": "llm", "rationale": choice.reason,
                              "sanitizer_overrides": overrides})
         except (LLMError, ValidationError, Exception) as exc:  # noqa: BLE001
             llm_info["error"] = f"{type(exc).__name__}: {exc}"
             print(f"[model_selector_agent] LLM unavailable or invalid "
-                  f"({llm_info['error']}). Rule-engine pick stands.")
+                  f"({llm_info['error']}). Rule-engine ranking stands.")
+
+    rule_score_of = {e["model"]: e["score"] for e in rule.get("ranking") or []}
+    label_of = {mid: card["label"] for mid, card in catalog["models"].items()}
+    ranking = [{"rank": i + 1, "model": e["model"], "category": _cat_of(e["model"]),
+                "label": label_of.get(e["model"], e["model"]), "reason": e["reason"],
+                "source": e["source"], "rule_score": rule_score_of.get(e["model"])}
+               for i, e in enumerate(entries)]
+
+    top = ranking[0]["model"] if ranking else rule["model"]
+    final = {
+        "category": _cat_of(top) or rule["category"],
+        "model": top,
+        "runner_up": ranking[1]["model"] if len(ranking) > 1 else None,
+        "confidence": confidence,
+        "reason": top_reason,
+    }
 
     selection = {
         **final,
         "source": source,
-        "rule": {k: rule[k] for k in ("category", "model", "runner_up", "confidence",
-                                      "reason", "rule_id", "trace")},
+        "ranking": ranking,
+        "rule": {**{k: rule[k] for k in ("category", "model", "runner_up", "confidence",
+                                         "reason", "rule_id", "trace")},
+                 "ranking": rule.get("ranking") or []},
         "llm": llm_info,
         "derived": rule["derived"],
         "training_hints": rule["training_hints"],

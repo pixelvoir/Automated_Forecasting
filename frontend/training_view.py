@@ -36,7 +36,7 @@ _TIER = {"fast": ("success", "bi-lightning-charge", "Fast"),
          "moderate": ("info", "bi-hourglass-split", "Moderate"),
          "heavy": ("warning", "bi-exclamation-triangle", "Heavy")}
 _ML_IDS = {"lightgbm", "xgboost"}
-_MAX_MODELS = 4
+_MAX_MODELS = 5
 
 
 def _cicon(name, **style):
@@ -58,7 +58,11 @@ def estimate_cost(n_series: int, policy: str, selected: list) -> dict:
     pipeline/trainer.estimate_cost and the settings.yaml tier thresholds."""
     units = 0.0
     for m in selected or []:
-        if m in _ML_IDS:
+        if m == "chronos":
+            units += 0.5  # zero-shot: no fit, one batched inference pass
+        elif m == "nhits":
+            units += 3.0  # one global network, epochs ≈ 2× an ML fit
+        elif m in _ML_IDS:
             units += 1.5 if policy == "global" else (n_series * 1.5 if policy == "per_series_local" else 1.5)
         else:
             units += n_series if policy == "per_series_local" else 1
@@ -115,24 +119,44 @@ def _eligible_options(sel):
 
 
 def _default_models(sel, option_ids):
-    picks = [sel.get("model"), sel.get("runner_up")]
+    # Top-2 of the Stage 5 ranking; pre-ranking runs fall back to pick + runner-up.
+    picks = [e.get("model") for e in (sel.get("ranking") or [])[:2]] \
+        or [sel.get("model"), sel.get("runner_up")]
     return [m for m in dict.fromkeys(picks) if m and m in option_ids] or option_ids[:1]
+
+
+def _excluded_note(sel):
+    """Why some catalog models aren't offered (e.g. NHITS needs 200 points — a short
+    aggregate can't select it, by design). Content-level guidance, not locking."""
+    excluded = [(m.get("label", m["id"]), m.get("excluded_reason"))
+                for m in sel.get("eligible_models") or [] if m.get("excluded_reason")]
+    if not excluded:
+        return None
+    return html.Div(
+        [html.Div(f"· {label}: {reason}", style={"fontSize": "0.72rem", "color": "#64748b"})
+         for label, reason in excluded],
+        className="mb-2",
+    )
 
 
 def _picker_card(data, sel):
     options = _eligible_options(sel)
     option_ids = [o["value"] for o in options]
     default = _default_models(sel, option_ids)
+    excluded_note = _excluded_note(sel)
     return dbc.Card(dbc.CardBody([
         html.Div(html.Span([_cicon("bi-ui-checks"), "Models to train"], style=_SH),
                  className="mb-2"),
-        html.P([f"Stage 5 recommends ", html.Strong(_label_of(sel, sel.get("model"))),
-                ". Train it, or override — pick up to ", html.Strong(str(_MAX_MODELS)),
-                " models. A seasonal-naive baseline is always trained for comparison."],
+        html.P([f"Stage 5 ranks ", html.Strong(_label_of(sel, sel.get("model"))),
+                " first — the top two are pre-selected. Pick up to ",
+                html.Strong(str(_MAX_MODELS)),
+                " models. Your selection is final: the best of YOUR models is crowned; "
+                "the always-trained seasonal-naive baseline is only the MASE reference."],
                style={"fontSize": "0.82rem", "color": "#94a3b8"}),
         dcc.Dropdown(id="dropdown-train-models", multi=True, options=options, value=default,
                      placeholder="Choose one or more models…", className="mb-3",
                      style={"fontSize": "0.85rem"}),
+        *([excluded_note] if excluded_note is not None else []),
         html.Div(id="train-estimate-banner", children=build_estimate_banner(data, default)),
         dcc.Loading(
             dbc.Button([_cicon("bi-play-fill"), "Train Models"], id="btn-train",
@@ -161,7 +185,7 @@ def _leaderboard(report):
         if e.get("is_primary"):
             notes.append("your pick")
         if e.get("is_baseline"):
-            notes.append("baseline")
+            notes.append("baseline (reference)")
         if e.get("error"):
             notes = ["error: " + e["error"][:40]]
         rows.append({
@@ -202,12 +226,19 @@ def _style_fig(fig, height=320):
     return fig
 
 
-def _forecast_fig(entry, history):
+def forecast_figure(entry, history):
+    """History + backtest + forecast chart for one model entry (or one series' arrays
+    from /series-forecast). Public: the update_train_chart callback reuses it."""
     fig = go.Figure()
+    bt = entry.get("backtest") or {}
     if history and history.get("x"):
         fig.add_scatter(x=history["x"], y=history["y"], mode="lines", name="History",
                         line=dict(width=1.8, color=_C_HIST))
-    bt = entry.get("backtest") or {}
+    elif bt.get("actual"):
+        # single-series view: no downsampled history in the store — the backtest
+        # window's actuals are the history proxy
+        fig.add_scatter(x=bt["ds"], y=bt["actual"], mode="lines", name="Actual",
+                        line=dict(width=1.8, color=_C_HIST))
     if bt.get("ds"):
         fig.add_scatter(x=bt["ds"], y=bt["predicted"], mode="lines", name="Backtest fit",
                         line=dict(width=1.6, color=_C_BT, dash="dot"))
@@ -265,8 +296,16 @@ def _details(report, data):
     ], className="mb-2")
 
 
+def history_for(data, report):
+    """Aggregate history arrays from Stage 4 (aggregate scope only — a panel's summed
+    history isn't stored downsampled per series)."""
+    if report.get("scope") == "per_series":
+        return None
+    return (((data.get("_stage4") or {}).get("eda") or {}).get("full") or {}) \
+        .get("aggregate", {}).get("plot_data", {}).get("series")
+
+
 def _results_block(data, report):
-    scope = report.get("scope")
     results = report.get("results") or []
     trained = [e for e in results if not e.get("error")]
     hero = next((e for e in results if e.get("is_best")), trained[0] if trained else None)
@@ -275,7 +314,8 @@ def _results_block(data, report):
     if hero:
         m = hero.get("metrics") or {}
         kids.append(dbc.Card(dbc.CardBody([
-            html.Div(html.Span([_cicon("bi-trophy"), "Best model"], style=_SH), className="mb-1"),
+            html.Div(html.Span([_cicon("bi-trophy"), "Best of your selected models"],
+                               style=_SH), className="mb-1"),
             html.Div([
                 html.Span(hero.get("label", hero["model"]),
                           style={"fontSize": "1.4rem", "fontWeight": "700", "color": _TEXT,
@@ -283,21 +323,50 @@ def _results_block(data, report):
                 dbc.Badge(f"MASE {_fmt(m.get('mase'))}", color="success", className="me-1"),
                 dbc.Badge(f"sMAPE {_fmt(m.get('smape'))}%", color="secondary"),
             ], className="d-flex align-items-center flex-wrap"),
-            html.P("MASE < 1 means the model beats the seasonal-naive benchmark.",
+            html.P("MASE < 1 means the model beats the seasonal-naive reference. The crown "
+                   "goes to the best of the models you selected — the baseline can rank "
+                   "higher in the table without winning.",
                    className="mb-0 mt-1", style={"fontSize": "0.78rem", "color": "#64748b"}),
         ]), className="mb-3", style={"borderLeft": "3px solid #059669"}))
 
-        history = None
-        if scope != "per_series":
-            history = (((data.get("_stage4") or {}).get("eda") or {}).get("full") or {}) \
-                .get("aggregate", {}).get("plot_data", {}).get("series")
+        history = history_for(data, report)
+
+        # Chart card: EVERY trained model is viewable (dropdown), not just the best —
+        # and for per-series runs a series picker charts any single series via
+        # /runs/{id}/series-forecast (update_train_chart callback).
+        model_options = [{"label": e.get("label", e["model"]), "value": e["model"]}
+                         for e in trained]
+        series_ids = report.get("series_ids") or []
+        series_row_style = {} if (report.get("has_series_forecasts") and series_ids) \
+            else {"display": "none"}
         kids.append(dbc.Card(dbc.CardBody([
             html.Div(html.Span([_cicon("bi-graph-up-arrow"),
-                                f"{hero.get('label', hero['model'])} — history, backtest & forecast"],
-                               style=_SH), className="mb-2"),
-            dcc.Graph(figure=_forecast_fig(hero, history),
-                      config={"displayModeBar": False},
-                      style={"borderRadius": "10px", "overflow": "hidden"}),
+                                "History, backtest & forecast"], style=_SH),
+                     className="mb-2"),
+            dbc.Row([
+                dbc.Col([
+                    html.Div("Model", style={"fontSize": "0.68rem", "color": "#94a3b8",
+                                             "textTransform": "uppercase"}),
+                    dcc.Dropdown(id="dropdown-train-chart-model", options=model_options,
+                                 value=hero["model"], clearable=False,
+                                 style={"fontSize": "0.82rem"}),
+                ], md=5),
+                dbc.Col([
+                    html.Div("Series (per-series runs)",
+                             style={"fontSize": "0.68rem", "color": "#94a3b8",
+                                    "textTransform": "uppercase"}),
+                    dcc.Dropdown(id="dropdown-train-chart-series",
+                                 options=[{"label": s, "value": s} for s in series_ids],
+                                 value=None, placeholder="All series (sum)",
+                                 style={"fontSize": "0.82rem"}),
+                ], md=7, style=series_row_style),
+            ], className="mb-2"),
+            dcc.Loading(
+                dcc.Graph(id="graph-train-chart",
+                          figure=forecast_figure(hero, history),
+                          config={"displayModeBar": False},
+                          style={"borderRadius": "10px", "overflow": "hidden"}),
+                type="circle", color="#6366f1", delay_show=150),
         ]), className="mb-3"))
 
     kids.append(dbc.Card(dbc.CardBody([

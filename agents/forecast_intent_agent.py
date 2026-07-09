@@ -82,6 +82,14 @@ Rules:
   * event/entity ID column (visit id, order id, ticket no) -> "nunique"
     = number of distinct events per period. Use this for transactional/event-log
     data with no numeric measure — e.g. "number of visits per day".
+  * Prefer continuous, TIME-VARYING volume/amount measures — high distinct_pct and cv
+    comfortably above ~0.2 — over near-constant attribute or headcount columns (tiny
+    distinct_pct AND low cv). A supplier/member/farmer headcount describes who
+    participates, not the quantity the business forecasts.
+  * Evaluate EVERY entry in target_candidates on its own statistics (score,
+    distinct_pct, cv, kind) before deciding. rule_suggestions.target_col is a starting
+    point, NOT an anchor — override it when another candidate's statistics clearly fit
+    the business quantity better.
   * NEVER pick phone numbers, addresses, tags, audit columns or free text as target.
 - scope: "aggregate" forecasts one overall series; "per_series" additionally profiles
   each series separately. Prefer "aggregate" unless the data is clearly many parallel

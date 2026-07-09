@@ -43,6 +43,11 @@ _DEFAULT_CFG = {
 # the classical models in practice, so it is also the safest degradation target.
 _FALLBACK_ORDER = ["lightgbm", "auto_theta", "seasonal_naive"]
 
+# Deterministic tie-break for equal suitability scores in the ranking (nothing more —
+# scores dominate). Roughly "observed general strength" order.
+_PREF_ORDER = ["lightgbm", "xgboost", "nhits", "chronos", "auto_theta", "auto_ets",
+               "auto_arima", "prophet", "croston", "tsb", "seasonal_naive"]
+
 _RANK = {"low": 0, "medium": 1, "high": 2}
 _NAME = {0: "low", 1: "medium", 2: "high"}
 
@@ -144,6 +149,19 @@ def _derive(payload: dict, cfg: dict) -> dict:
     }
 
 
+def _total_obs(payload: dict) -> int:
+    """Per-series scope: global models (ML/DL) train across the whole panel, so the TOTAL
+    observations count toward min_length — a 1,800-series × 60-month panel is 108k
+    training points for NHITS/LightGBM/Chronos, not 60."""
+    length = payload.get("series_length") or 0
+    panel = payload.get("panel") or None
+    if payload.get("scope") == "per_series" and panel:
+        n_series = panel.get("n_series") or 1
+        median_len = (panel.get("series_length") or {}).get("median") or length
+        return max(length, int(n_series * median_len))
+    return length
+
+
 # ── Eligibility ──────────────────────────────────────────────────────────────
 
 def _eligible(payload: dict, derived: dict, catalog: dict, cfg: dict) -> tuple[list, dict]:
@@ -156,16 +174,7 @@ def _eligible(payload: dict, derived: dict, catalog: dict, cfg: dict) -> tuple[l
     length = payload.get("series_length") or 0
     icls = payload.get("intermittency_class")
     zero_pct = payload.get("zero_pct") or 0
-
-    # Per-series scope: global models (ML/DL) train across the whole panel, so the TOTAL
-    # observations count toward min_length — a 1,800-series × 60-month panel is 108k
-    # training points for NHITS/LightGBM, not 60.
-    total_obs = length
-    panel = payload.get("panel") or None
-    if payload.get("scope") == "per_series" and panel:
-        n_series = panel.get("n_series") or 1
-        median_len = (panel.get("series_length") or {}).get("median") or length
-        total_obs = max(length, int(n_series * median_len))
+    total_obs = _total_obs(payload)
 
     eligible, excluded = [], {}
     for mid, card in catalog["models"].items():
@@ -184,6 +193,149 @@ def _eligible(payload: dict, derived: dict, catalog: dict, cfg: dict) -> tuple[l
         else:
             eligible.append(mid)
     return eligible, excluded
+
+
+# ── Suitability scoring (drives the ranked top-N; the ladder still owns rank 1) ──
+
+def _suitability_scores(payload: dict, derived: dict, eligible: list, cfg: dict) -> dict:
+    """Per-model suitability score + human-readable reasons, from the SAME signals and
+    cfg thresholds the ladder uses — generic, no dataset-specific constants. The scores
+    order ranks 3+ of the ranking (the ladder's pick and runner-up own ranks 1-2)."""
+    length = payload.get("series_length") or 0
+    seas = payload.get("seasonality_strength") or 0
+    trend = payload.get("trend_strength") or 0
+    period = payload.get("seasonality_period")
+    icls = payload.get("intermittency_class")
+    zero_pct = payload.get("zero_pct") or 0
+    n_cycles = derived["n_cycles"]
+    secondary = payload.get("secondary_seasonality_periods") or []
+    fcast = payload.get("forecastability")
+    freq = payload.get("forecast_frequency") or payload.get("frequency")
+    panel = payload.get("panel") or {}
+    n_series = panel.get("n_series") or 0
+    is_panel = payload.get("scope") == "per_series" and n_series >= cfg["panel_global_min_series"]
+    total_obs = _total_obs(payload)
+    sband, tband = derived["seasonality_band"], derived["trend_band"]
+    strong_exog = [e for e in derived["exog_usable"]
+                   if abs(e["best_corr"]) >= cfg["exog_route_min_abs_corr"]]
+    sparse = icls in ("intermittent", "lumpy") or zero_pct >= 30
+    too_short = length < cfg["short_series_length"] or (
+        n_cycles is not None and 1 <= n_cycles < 2)
+    near_noise = (fcast is not None and fcast < cfg["low_forecastability"]
+                  and seas < cfg["seasonality_moderate"])
+    single_seasonal = (sband in ("strong", "moderate")) and not secondary
+
+    scores = {m: {"score": 0.0, "reasons": []} for m in eligible}
+
+    def add(mid, pts, why):
+        if mid in scores and pts:
+            scores[mid]["score"] += pts
+            scores[mid]["reasons"].append(f"{pts:+g} {why}")
+
+    # baseline
+    if too_short:
+        add("seasonal_naive", 3.0, "history too short for fitted models")
+    elif near_noise:
+        add("seasonal_naive", 2.0, "near-noise series — honest baseline")
+    else:
+        add("seasonal_naive", -1.0, "signal exists — baseline is a reference only")
+
+    # intermittent family
+    if icls == "intermittent":
+        add("croston", 4.0, "intermittent demand quadrant")
+        add("tsb", 2.0, "intermittent demand (TSB is the lumpy specialist)")
+    elif icls == "lumpy":
+        add("tsb", 4.0, "lumpy demand quadrant")
+        add("croston", 2.0, "lumpy demand (Croston prefers stable sizes)")
+    share = derived.get("panel_intermittent_share") or 0
+    if is_panel and share > 0.5:
+        mix = panel.get("intermittency_mix") or {}
+        winner = "croston" if (mix.get("intermittent") or 0) >= (mix.get("lumpy") or 0) else "tsb"
+        add(winner, 2.0, f"{share:.0%} of panel series are intermittent/lumpy")
+
+    # classical
+    if tband == "strong" and trend > seas:
+        add("auto_theta", 2.0, "trend dominates seasonality")
+    elif tband == "moderate":
+        add("auto_theta", 1.0, "moderate trend")
+    if length < cfg["exog_route_min_length"]:
+        add("auto_theta", 1.0, "short/medium history favors classical")
+        add("auto_ets", 0.5, "short/medium history favors classical")
+    if secondary:
+        add("auto_theta", -1.0, "multiple seasonal periods (single-season model)")
+        add("auto_ets", -1.0, "multiple seasonal periods (single-season model)")
+    if single_seasonal:
+        add("auto_ets", 1.5, "single seasonal cycle — ETS territory")
+    if payload.get("heteroskedastic") and payload.get("transform_recommendation") == "log":
+        add("auto_ets", 1.0, "level-dependent variance suits multiplicative ETS")
+    if sparse:
+        add("auto_ets", -0.5, "sparse/zero-heavy demand")
+
+    if not derived["sarima_feasible"]:
+        add("auto_arima", -3.0, f"period {period} infeasible for SARIMA (> {cfg['sarima_max_period']})")
+    elif single_seasonal:
+        add("auto_arima", 2.0, "single seasonal period within SARIMA range")
+    if len(payload.get("significant_acf_lags") or []) >= 3:
+        add("auto_arima", 0.5, "rich autocorrelation structure")
+    if (payload.get("ndiffs") or 0) >= 1:
+        add("auto_arima", 0.25, "differencing evidence (ndiffs ≥ 1)")
+    if length > 1000:
+        add("auto_arima", -1.0, "very long series — pmdarima search is slow")
+
+    if secondary:
+        add("prophet", 1.5, "multiple seasonal cycles decomposed natively")
+    if tband == "strong":
+        add("prophet", 1.0, "strong trend with automatic changepoints")
+    if period and period > cfg["sarima_max_period"] and sband in ("strong", "moderate"):
+        add("prophet", 1.0, f"long seasonal period ({period}) where ARIMA is infeasible")
+    if freq in ("daily", "weekly"):
+        add("prophet", 0.5, "daily/weekly grid — calendar effects likely")
+    if sparse:
+        add("prophet", -1.0, "sparse/zero-heavy demand")
+    if n_cycles is not None and n_cycles < 2:
+        add("prophet", -0.5, "under two seasonal cycles observed")
+
+    # ML
+    add("lightgbm", 0.5, "strongest general-purpose default")
+    if strong_exog:
+        add("lightgbm", 2.0, f"strong leading exogenous driver ({strong_exog[0]['col']})")
+    elif derived["exog_usable"]:
+        add("lightgbm", 1.0, "usable leading exogenous driver")
+    if is_panel:
+        add("lightgbm", 1.5, f"{n_series}-series panel — one global model learns shared patterns")
+    if secondary:
+        add("lightgbm", 1.0, "multiple seasonal periods via Fourier/calendar features")
+    if seas >= cfg["seasonality_strong"] and n_cycles is not None \
+            and n_cycles >= cfg["min_cycles_for_seasonal"]:
+        add("lightgbm", 1.0, "strong seasonality handled by seasonal-index deseasonalization")
+    if length >= cfg["exog_route_min_length"]:
+        add("lightgbm", 0.5, "long history for feature learning")
+    elif length < 60:
+        add("lightgbm", -0.5, "short history for a tree ensemble")
+    if "lightgbm" in scores and "xgboost" in scores:
+        scores["xgboost"]["score"] = scores["lightgbm"]["score"] - 0.25
+        scores["xgboost"]["reasons"] = [*scores["lightgbm"]["reasons"],
+                                        "-0.25 same learner family; ladder prefers lightgbm"]
+
+    # deep
+    if total_obs >= 2000:
+        add("nhits", 1.5, f"{total_obs:,} total observations feed a neural net well")
+    if is_panel:
+        add("nhits", 1.0, "global training across the panel")
+    if strong_exog:
+        add("nhits", -1.5, "cannot use exogenous drivers")
+
+    add("chronos", 1.5, "pretrained zero-shot generalist (no training cost)")
+    if sband in ("strong", "moderate"):
+        add("chronos", 0.5, "regular, pattern-rich series")
+    if length < 200:
+        add("chronos", 0.5, "data-starved regime where trained models overfit")
+    if sparse:
+        add("chronos", -2.0, "weak on intermittent/zero-heavy demand")
+    if strong_exog:
+        add("chronos", -1.0, "cannot use exogenous drivers")
+
+    return scores
 
 
 # ── Rule ladder ──────────────────────────────────────────────────────────────
@@ -296,9 +448,10 @@ def decide(payload: dict, catalog: dict, cfg: dict | None = None) -> dict:
         else:
             _skip("R5", "single seasonal period")
 
-    # R6 — strong single seasonality with enough cycles (was seasonal ARIMA/ETS — both
-    # removed after being consistently outperformed; the ML backend deseasonalizes via
-    # per-series seasonal indices, so seasonality is handled explicitly)
+    # R6 — strong single seasonality with enough cycles. Gradient boosting stays the
+    # ladder pick (it consistently outperformed the classical seasonal models here; the
+    # ML backend deseasonalizes via per-series seasonal indices) — auto_arima/auto_ets
+    # are back in the catalog and surface through the suitability RANKING instead.
     if pick is None:
         if seas >= cfg["seasonality_strong"] and n_cycles is not None \
                 and n_cycles >= cfg["min_cycles_for_seasonal"]:
@@ -355,6 +508,21 @@ def decide(payload: dict, catalog: dict, cfg: dict | None = None) -> dict:
         pick["runner_up"] = next(
             (m for m in _FALLBACK_ORDER if m in eligible and m != pick["model"]), None)
 
+    # Ranked eligible models: suitability scores order the list, but the ladder verdict
+    # is authoritative for the top — the pick is hard-promoted to rank 1 and the ladder
+    # runner-up to rank 2 (scores alone decide ranks 3+).
+    scores = _suitability_scores(payload, derived, eligible, cfg)
+    order = sorted(eligible, key=lambda m: (
+        -scores[m]["score"],
+        _PREF_ORDER.index(m) if m in _PREF_ORDER else len(_PREF_ORDER)))
+    for m in (pick.get("runner_up"), pick["model"]):
+        if m in order:
+            order.remove(m)
+            order.insert(0, m)
+    ranking = [{"rank": i + 1, "model": m, "category": _category_of(m, catalog),
+                "score": round(scores[m]["score"], 2), "reasons": scores[m]["reasons"]}
+               for i, m in enumerate(order)]
+
     # Training hints — consumed by Stages 6/7 regardless of which rule fired.
     secondary = payload.get("secondary_seasonality_periods") or []
     default_policy = "aggregate" if payload.get("scope") != "per_series" else "per_series_local"
@@ -370,6 +538,7 @@ def decide(payload: dict, catalog: dict, cfg: dict | None = None) -> dict:
 
     return {
         **pick,
+        "ranking": ranking,
         "trace": trace,
         "derived": derived,
         "training_hints": hints,

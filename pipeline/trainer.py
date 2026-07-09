@@ -1,10 +1,13 @@
 """Stage 7: Model Training — hardcoded, EDA-seeded, NO LLM.
 
 Trains the user-selected models (Stage 5 is only a default suggestion), backtests each with
-walk-forward cross-validation, ranks them by MASE against an always-included seasonal-naive
-baseline, refits the winner on all history, produces a horizon forecast with conformal
-prediction intervals, and serializes the chosen model. One CV harness drives every model
-family (classical / intermittent / ML) through the uniform Forecaster interface.
+walk-forward cross-validation, and ranks them by MASE. A seasonal-naive baseline is always
+trained as the MASE reference but the crowned/serialized ``best_model`` is the best of the
+models the USER requested — the dropdown selection is the ultimate choice. Prediction
+intervals prefer the backend's native quantile forecasts (direct-ML / nhits); conformal
+intervals from CV residuals remain the fallback for the classical models. One CV harness
+drives every family (classical / intermittent / ML / deep) through the uniform Forecaster
+interface, with a time-vs-accuracy budget from ``training.accuracy_profile``.
 
 Guardrails (the reason this is job-managed + cancellable): a big per-series panel fit
 per-series-per-model can be expensive, so ``estimate_cost`` tiers the request fast/moderate/
@@ -55,10 +58,43 @@ def _load_config() -> dict:
             "sarima_max_period": (cfg.get("model_selection", {}) or {}).get("sarima_max_period", 24)}
 
 
+def _resolve_profile(tcfg: dict) -> dict:
+    """The accuracy-vs-time budget passed to every backend: the selected profile's knobs
+    (optuna trials, early-stopping rounds, nhits epochs) + the global caps. The user chose
+    to trade longer training for accuracy — `balanced` is the default, `max` is the
+    1-3h-class budget."""
+    name = str(tcfg.get("accuracy_profile", "balanced"))
+    prof = dict((tcfg.get("profiles") or {}).get(name) or {})
+    prof.setdefault("optuna_trials", 30)
+    prof.setdefault("early_stopping_rounds", 80)
+    prof.setdefault("nhits_max_epochs", 200)
+    prof["profile_name"] = name
+    prof["max_train_rows"] = int(tcfg.get("max_train_rows", 1_500_000))
+    prof["interval_levels"] = list(tcfg.get("interval_levels", [80, 95]))
+    # global-panel Optuna only in the `max` profile (it is the 1-3h cost driver)
+    prof["optuna_trials_global"] = prof["optuna_trials"] if name == "max" else 0
+    return prof
+
+
 def _round_list(arr, nd=4):
     out = []
     for v in np.asarray(arr, dtype=float):
         out.append(round(float(v), nd) if np.isfinite(v) else None)
+    return out
+
+
+def _json_safe_params(params) -> dict:
+    """Numpy scalars (optuna/best_iteration) → native types for the JSON report."""
+    out = {}
+    for k, v in (params or {}).items():
+        if isinstance(v, np.integer):
+            out[k] = int(v)
+        elif isinstance(v, np.floating):
+            out[k] = float(v)
+        elif isinstance(v, (list, tuple)):
+            out[k] = [float(x) if isinstance(x, (np.floating, float)) else x for x in v]
+        else:
+            out[k] = v
     return out
 
 
@@ -70,7 +106,11 @@ def estimate_cost(n_series: int, policy: str, model_ids, cfg: dict) -> dict:
     t = cfg["training"]
     units = 0.0
     for mid in model_ids:
-        if registry.is_ml(mid):
+        if mid in registry.CHRONOS_IDS:
+            units += 0.5  # zero-shot: no fit at all, one batched inference pass
+        elif mid in registry.NHITS_IDS:
+            units += 3.0  # always ONE global network, but epochs make it ~2× an ML fit
+        elif registry.is_ml(mid):
             units += 1.5 if policy == "global" else (n_series * 1.5 if policy == "per_series_local" else 1.5)
         else:
             units += n_series if policy == "per_series_local" else 1
@@ -133,25 +173,37 @@ def _walk_forward(series_df, make_fn, period, cv_plan, exog_cols):
     return recs
 
 
-def _final_forecast(series_df, make_fn, period, horizon, freq_alias, exog_cols):
+def _final_forecast(series_df, make_fn, period, horizon, freq_alias, exog_cols, levels=None):
     model = make_fn().fit(series_df, period)
     fut_ds = future_index(series_df["ds"].iloc[-1], horizon, freq_alias)
     yhat = model.predict(horizon, fut_ds.to_numpy(), None)
-    return fut_ds, np.asarray(yhat, dtype=float), model
+    # Native quantile intervals (direct-ML / nhits backends) — preferred over conformal.
+    native_iv = None
+    if levels and hasattr(model, "predict_quantiles"):
+        try:
+            native_iv = model.predict_quantiles(horizon, fut_ds.to_numpy(), levels)
+        except Exception:  # noqa: BLE001 — intervals are best-effort, conformal covers
+            native_iv = None
+    return fut_ds, np.asarray(yhat, dtype=float), model, native_iv
 
 
-def _run_per_series(frame, series_ids, make_fn, period, cv_plan, horizon, freq_alias, exog_cols):
+def _run_per_series(frame, series_ids, make_fn, period, cv_plan, horizon, freq_alias,
+                    exog_cols, levels=None):
     """CV + final forecast for each series. Per-series failures (a tiny/degenerate series in
     a panel) are isolated so one bad series can't wipe the whole model's results — for
-    aggregate scope there's just one series, so a failure there surfaces to the caller."""
-    cv_all, fc_parts, fitted, n_ok = [], [], None, 0
+    aggregate scope there's just one series, so a failure there surfaces to the caller.
+    Native quantile intervals are only kept for the single-series case (quantiles cannot
+    be summed across a panel — the per-series display falls back to conformal)."""
+    cv_all, fc_parts, fitted, n_ok, native_iv = [], [], None, 0, None
+    want_native = levels if len(series_ids) == 1 else None
     for uid in series_ids:
         g = frame[frame["unique_id"] == uid].sort_values("ds").reset_index(drop=True)
         try:
             for r in _walk_forward(g, make_fn, period, cv_plan, exog_cols):
                 r["unique_id"] = uid
                 cv_all.append(r)
-            fut_ds, yhat, model = _final_forecast(g, make_fn, period, horizon, freq_alias, exog_cols)
+            fut_ds, yhat, model, native_iv = _final_forecast(
+                g, make_fn, period, horizon, freq_alias, exog_cols, want_native)
             fc_parts.append(pd.DataFrame({"unique_id": uid, "ds": fut_ds, "yhat": yhat}))
             fitted = model
             n_ok += 1
@@ -163,7 +215,7 @@ def _run_per_series(frame, series_ids, make_fn, period, cv_plan, horizon, freq_a
         raise RuntimeError("all series failed to train")
     cv_df = pd.DataFrame(cv_all) if cv_all else None
     fc_df = pd.concat(fc_parts, ignore_index=True) if fc_parts else None
-    return cv_df, fc_df, fitted
+    return cv_df, fc_df, fitted, native_iv
 
 
 # ── Display aggregation + intervals ───────────────────────────────────────────
@@ -179,7 +231,7 @@ def _display_backtest(cv_df, scope):
             "predicted": _round_list(g["predicted"])}
 
 
-def _display_forecast(fc_df, scope, cv_df, levels):
+def _display_forecast(fc_df, scope, cv_df, levels, native_iv=None):
     if fc_df is None or fc_df.empty:
         return {"ds": [], "yhat": []}
     if scope == "per_series":
@@ -187,6 +239,13 @@ def _display_forecast(fc_df, scope, cv_df, levels):
     else:
         g = fc_df.sort_values("ds")
     point = g["yhat"].to_numpy(dtype=float)
+
+    # Backend-provided quantile intervals (direct-ML / nhits / chronos) beat conformal
+    # where present; levels a backend can't produce natively (chronos-bolt's trained
+    # quantile range stops at 90) are conformal-filled below so the UI's 95% band never
+    # silently disappears.
+    native_iv = native_iv or {}
+    missing = [lvl for lvl in levels if int(lvl) not in native_iv]
 
     res_by_step = {}
     if cv_df is not None and not cv_df.empty and "step" in cv_df.columns and scope != "per_series":
@@ -196,15 +255,39 @@ def _display_forecast(fc_df, scope, cv_df, levels):
         bt = _display_backtest(cv_df, scope)
         resid = np.asarray(bt["actual"], dtype=float) - np.asarray(bt["predicted"], dtype=float)
         res_by_step = {k + 1: resid for k in range(len(point))}
-    intervals = conformal_intervals(point, res_by_step, levels) if len(point) else {}
+    intervals = conformal_intervals(point, res_by_step, missing) if (missing and len(point)) else {}
 
-    out = {"ds": [str(d) for d in g["ds"]], "yhat": _round_list(point)}
+    if not native_iv:
+        method = "conformal"
+    elif missing:
+        method = "quantile+conformal"
+    else:
+        method = "quantile"
+    out = {"ds": [str(d) for d in g["ds"]], "yhat": _round_list(point),
+           "interval_method": method}
     for lvl in levels:
-        if lvl in intervals:
+        if int(lvl) in native_iv:
+            lo, hi = native_iv[int(lvl)]
+        elif lvl in intervals:
             lo, hi = intervals[lvl]
-            out[f"lo{lvl}"] = _round_list(lo)
-            out[f"hi{lvl}"] = _round_list(hi)
+        else:
+            continue
+        out[f"lo{lvl}"] = _round_list(lo)
+        out[f"hi{lvl}"] = _round_list(hi)
     return out
+
+
+def _collect_series_frames(series_frames: list, mid: str, cv_df, fc_df) -> None:
+    """Accumulate one model's per-series backtest + forecast rows (long format:
+    model, unique_id, ds, kind, actual, predicted) for the series-viewer parquet."""
+    if cv_df is not None and not cv_df.empty and "unique_id" in cv_df.columns:
+        p = cv_df.copy()
+        p["model"], p["kind"] = mid, "backtest"
+        series_frames.append(p[["model", "unique_id", "ds", "kind", "actual", "predicted"]])
+    if fc_df is not None and not fc_df.empty and "unique_id" in fc_df.columns:
+        p = fc_df.rename(columns={"yhat": "predicted"}).copy()
+        p["model"], p["kind"], p["actual"] = mid, "forecast", np.nan
+        series_frames.append(p[["model", "unique_id", "ds", "kind", "actual", "predicted"]])
 
 
 def _pooled_mase_scale(frame, season):
@@ -287,16 +370,33 @@ def run(run_id: str, models, confirm_heavy: bool = False) -> dict:
                        else len(frame), period, horizon, cfg, n_series)
     levels = list(tcfg.get("interval_levels", [80, 95]))
     scale = _pooled_mase_scale(frame, period)
+    profile = _resolve_profile(tcfg)
     n_trials = (tcfg.get("optuna_trials_large", 8) if n_series >= tcfg.get("large_panel_series", 500)
-                else tcfg.get("optuna_trials", 20))
+                else int(profile.get("optuna_trials", 30)))
 
-    results, fitted_objs = [], {}
+    results, fitted_objs, series_frames = [], {}, []
     for mid in run_ids:
         try:
-            params, tuning = None, None
-            if registry.is_ml(mid) and policy == "global" and scope == "per_series":
-                res = ml_models.run_global(frame, recipe, mid, cfg, horizon, alias,
-                                           recipe.get("transform", "none"))
+            params, tuning, native_iv = None, None, None
+            # nhits/chronos are ALWAYS global on a panel (one network / one batched
+            # inference pass); ML goes global only when Stage 5's policy says so.
+            route_global = scope == "per_series" and registry.is_global_capable(mid) \
+                and (policy == "global" or registry.always_global(mid))
+            if route_global:
+                if mid in registry.NHITS_IDS:
+                    from models_lib import nhits_model  # lazy: torch is a heavy import
+                    res = nhits_model.run_global(frame, recipe, cfg, horizon, alias,
+                                                 recipe.get("transform", "none"),
+                                                 levels, profile)
+                elif mid in registry.CHRONOS_IDS:
+                    from models_lib import chronos_model  # lazy: transformers is heavy
+                    res = chronos_model.run_global(frame, recipe, cfg, horizon, alias,
+                                                   recipe.get("transform", "none"),
+                                                   levels, profile)
+                else:
+                    res = ml_models.run_global(frame, recipe, mid, cfg, horizon, alias,
+                                               recipe.get("transform", "none"),
+                                               levels=levels, train_cfg=profile)
                 if res.get("error"):
                     raise RuntimeError(res["error"])
                 cv_df, fc_df = res["cv"], res["forecast"]
@@ -304,11 +404,13 @@ def run(run_id: str, models, confirm_heavy: bool = False) -> dict:
             else:
                 if registry.is_ml(mid) and scope != "per_series":
                     agg_df = frame[frame["unique_id"] == series_ids[0]].sort_values("ds").reset_index(drop=True)
-                    params, tuning = ml_models.tune(mid, agg_df, recipe, cfg, n_trials)
+                    params, tuning = ml_models.tune(mid, agg_df, recipe, n_trials, profile)
                 make_fn = (lambda mid=mid, params=params: registry.make_forecaster(
-                    mid, recipe, exog_cols, cfg["sarima_max_period"], params, freq_label))
-                cv_df, fc_df, fitted = _run_per_series(
-                    frame, series_ids, make_fn, period, cv_plan, horizon, alias, exog_cols)
+                    mid, recipe, exog_cols, cfg["sarima_max_period"], params, freq_label,
+                    train_cfg=profile))
+                cv_df, fc_df, fitted, native_iv = _run_per_series(
+                    frame, series_ids, make_fn, period, cv_plan, horizon, alias, exog_cols,
+                    levels)
                 strategy = cv_plan["strategy"]
 
             metrics = (evaluator.compute_metrics(cv_df["actual"], cv_df["predicted"], scale)
@@ -316,13 +418,15 @@ def run(run_id: str, models, confirm_heavy: bool = False) -> dict:
                        else {"mae": None, "rmse": None, "mape": None, "smape": None,
                              "mase": None, "r2": None, "n": 0})
             fitted_objs[mid] = fitted
+            if scope == "per_series":
+                _collect_series_frames(series_frames, mid, cv_df, fc_df)
             results.append({
                 "model": mid, "label": label_map.get(mid, mid), "category": cat_map.get(mid),
                 "requested": mid in requested, "is_baseline": mid == BASELINE and mid not in requested,
-                "metrics": metrics, "params": params or {}, "tuning": tuning, "strategy": strategy,
-                "error": None,
+                "metrics": metrics, "params": _json_safe_params(params), "tuning": tuning,
+                "strategy": strategy, "error": None,
                 "backtest": _display_backtest(cv_df, scope),
-                "forecast": _display_forecast(fc_df, scope, cv_df, levels),
+                "forecast": _display_forecast(fc_df, scope, cv_df, levels, native_iv),
             })
         except Exception as exc:  # noqa: BLE001 — isolate per-model failure
             results.append({
@@ -334,19 +438,37 @@ def run(run_id: str, models, confirm_heavy: bool = False) -> dict:
                 "forecast": {"ds": [], "yhat": []},
             })
 
-    # Rank by MASE (finite first), mark primary + best.
+    # Rank by MASE (finite first), mark primary + best. The user's dropdown selection is
+    # the ULTIMATE choice: only a REQUESTED model can be crowned/serialized — the baseline
+    # is a reference row in the leaderboard, never the winner (unless explicitly selected).
     def _mase(e):
         v = (e.get("metrics") or {}).get("mase")
         return v if v is not None else float("inf")
     results.sort(key=_mase)
     primary_model = requested[0]
-    best_model = next((e["model"] for e in results if np.isfinite(_mase(e))), primary_model)
+    best_model = next((e["model"] for e in results
+                       if e["model"] in requested and np.isfinite(_mase(e))), primary_model)
     for e in results:
         e["is_primary"] = e["model"] == primary_model
         e["is_best"] = e["model"] == best_model
 
     # Serialize the best model (+ recipe as the preprocessor).
     serialized = _serialize(run_id, best_model, fitted_objs.get(best_model), recipe)
+
+    # Per-series backtest + forecast rows → parquet, so the UI can chart any single
+    # series (e.g. one taluka) on demand via /runs/{id}/series-forecast without bloating
+    # the JSON report / browser store.
+    series_ids_out, has_series_fc = [], False
+    if series_frames:
+        try:
+            sf = pd.concat(series_frames, ignore_index=True)
+            out_dir = MODELS_DIR / run_id
+            out_dir.mkdir(parents=True, exist_ok=True)
+            sf.to_parquet(out_dir / "series_forecasts.parquet", index=False)
+            series_ids_out = sorted(sf["unique_id"].astype(str).unique().tolist())
+            has_series_fc = True
+        except Exception as exc:  # noqa: BLE001 — viewer is optional, never fail training
+            warnings_list.append(f"per-series forecast parquet not written: {exc}")
 
     training_report = {
         "run_id": run_id, "scope": scope, "policy": policy, "frequency": freq_label,
@@ -355,6 +477,8 @@ def run(run_id: str, models, confirm_heavy: bool = False) -> dict:
         "reduced_from": reduced_from, "baseline": BASELINE,
         "primary_model": primary_model, "best_model": best_model,
         "suggested_model": suggested, "requested_models": requested,
+        "accuracy_profile": profile.get("profile_name"),
+        "has_series_forecasts": has_series_fc, "series_ids": series_ids_out,
         "cost": estimate, "cv": cv_plan, "results": results,
         "serialized": serialized, "warnings": warnings_list,
         "trained_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),

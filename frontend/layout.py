@@ -149,7 +149,18 @@ def _ingestion_form():
         ]),
 
         html.Div(id="section-file", style={"display": "none"}, children=[
-            _lbl("Upload file"),
+            _lbl("Local file path (recommended for large files)"),
+            dbc.Input(
+                id="input-file-path", type="text",
+                placeholder=r"e.g. C:\data\my_data.csv", className="mb-1",
+                style={"fontSize": "0.82rem"},
+            ),
+            html.P("Read directly from disk — no upload, no size limit. The path must "
+                   "exist on the machine running this app.",
+                   style={"fontSize": "0.7rem", "color": "#64748b"}, className="mb-2"),
+            html.Div("— or —", className="mb-2 text-center",
+                     style={"fontSize": "0.7rem", "color": "#475569"}),
+            _lbl("Upload file (up to 100 MB)"),
             dcc.Upload(
                 id="upload-file",
                 children=html.Div([
@@ -165,10 +176,15 @@ def _ingestion_form():
                     "fontSize": "0.82rem", "transition": "all 0.2s ease",
                 },
                 accept=".csv,.xlsx,.xls,.parquet", multiple=False, className="mb-1",
+                # a browser upload base64-encodes the WHOLE file in memory — large files
+                # OOM'd the Dash process before ingest ever saw them. Oversize files are
+                # silently ignored by dcc.Upload, so the copy below must carry the limit.
+                max_size=100 * 1024 * 1024,
             ),
             html.Div(id="upload-filename",
                      style={"fontSize": "0.75rem", "color": "#94a3b8"}, className="mb-2"),
-            html.P("Supported: .csv  .xlsx  .xls  .parquet",
+            html.P("Supported: .csv  .xlsx  .xls  .parquet — files over 100 MB are "
+                   "ignored by the uploader; paste the file path above instead.",
                    style={"fontSize": "0.7rem", "color": "#64748b"}, className="mb-0"),
         ]),
 

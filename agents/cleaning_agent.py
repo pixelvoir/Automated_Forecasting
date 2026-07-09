@@ -102,7 +102,8 @@ OUTLIER STRATEGY options:
                      Use for non-temporal numerics, or when temporal_pct is null/unavailable,
                      or when series is too short for temporal methods.
   "winsorize"      - cap at 1.5th and 98.5th percentiles
-  "log_transform"  - apply log1p (use only if values are positive and right-skewed)
+  "log_transform"  - DO NOT USE: it permanently rewrites the stored values in a new unit;
+                     the modeling stages apply transforms non-destructively instead.
   "remove"         - drop rows containing outliers in this column
   "keep"           - do not modify outliers
 
@@ -289,6 +290,11 @@ def _sanitize_recipe(recipe: dict, meta: dict, payload: dict | None = None,
     - row-dropping (missing "drop_row", outlier "remove") is only allowed on the
       timestamp and target columns: a null in an irrelevant column must never delete a
       row that carries target signal (the vet event-log failure mode)
+    - level-mutating strategies never touch intent columns: clip_iqr/winsorize on the
+      target/exog → keep (they one-sidedly compress the top tail → cleaned aggregate
+      totals drop far below raw — an observed real failure), "remove" on a sum/mean
+      target → keep, and log_transform → keep on EVERY column (it permanently changes
+      stored units; modeling applies transforms non-destructively at Stage 4/6)
     """
     dtypes = {s["col"]: s.get("dtype_inferred") for s in meta.get("schema", [])}
     raw_dtypes = {s["col"]: s.get("dtype_raw", "") for s in meta.get("schema", [])}
@@ -325,6 +331,20 @@ def _sanitize_recipe(recipe: dict, meta: dict, payload: dict | None = None,
             # Counting distinct events: fills would FABRICATE events, outlier logic on
             # an identifier is meaningless. NaN ids are simply not counted.
             cr["missing_strategy"] = "none"
+            cr["outlier_strategy"] = "keep"
+
+        # Level-mutating outlier strategies permanently change the stored values and bias
+        # aggregated totals: clip_iqr/winsorize one-sidedly compress the top tail of
+        # skewed volume data, log_transform changes the column's unit entirely. Observed
+        # real failure: clip_iqr on a confirmed sum-target shrank the cleaned aggregate
+        # totals far below the raw data — and the forecast inherited the bias. Modeling
+        # applies transforms non-destructively at Stage 4/6, so cleaning must never.
+        if cr.get("outlier_strategy") == "log_transform":
+            cr["outlier_strategy"] = "keep"
+        if col in protected and cr.get("outlier_strategy") in ("clip_iqr", "winsorize"):
+            cr["outlier_strategy"] = "keep"
+        if col == target_col and (intent or {}).get("agg") in ("sum", "mean") \
+                and cr.get("outlier_strategy") == "remove":
             cr["outlier_strategy"] = "keep"
 
         if intent and col not in row_drop_allowed:
@@ -436,6 +456,10 @@ def run(run_id: str, use_llm: bool = True) -> dict:
                 "- Use 'drop_row'/'remove' ONLY on the timestamp or target columns — "
                 "dropping rows for nulls/outliers in an irrelevant column deletes real "
                 "target signal.\n"
+                "- NEVER clip_iqr/winsorize/log_transform the target or exogenous "
+                "columns: clipping compresses the top tail and biases every aggregated "
+                "total (and thus the forecast level) downward. Repairs on the target "
+                "must be level-neutral ('rolling_iqr'/'stl_residuals') or 'keep'.\n"
             )
         messages = [
             {"role": "system", "content": _SYSTEM_PROMPT},

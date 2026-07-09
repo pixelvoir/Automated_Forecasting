@@ -202,6 +202,12 @@ def _apply_outlier(df: pd.DataFrame, col: str, strategy: str,
     s = df[col]
     if not pd.api.types.is_numeric_dtype(s):
         return df
+    # Nullable-integer columns (pandas Int64, e.g. from DB ingest) reject fractional
+    # values: s.clip(q3 + 1.5*iqr) raises "Invalid value ... for dtype 'Int64'". Every
+    # strategy below can produce fractional replacements, so work in float64.
+    if not pd.api.types.is_float_dtype(s):
+        s = s.astype("float64")
+        df[col] = s
     valid = s.dropna()
     if len(valid) == 0:
         return df
@@ -283,6 +289,16 @@ def _snapshot(df: pd.DataFrame) -> dict:
     }
 
 
+def _target_total(df: pd.DataFrame, target_col: str | None) -> float | None:
+    """Sum of the confirmed target column (numeric-coerced). Tracked before/after so a
+    level-mutating recipe (e.g. clipping a sum-target) shows up as a visible drift in
+    the report instead of silently shrinking every downstream forecast."""
+    if not target_col or target_col not in df.columns:
+        return None
+    total = float(pd.to_numeric(df[target_col], errors="coerce").sum())
+    return total if np.isfinite(total) else None
+
+
 # ── Stage 3 executor ──────────────────────────────────────────────────────────
 
 def run(run_id: str) -> dict:
@@ -313,6 +329,8 @@ def run(run_id: str) -> dict:
     cols_recipe: dict = recipe.get("columns", {})
     ts_col: str | None = recipe.get("timestamp_col")
     rows_before = len(df)
+    target_col: str | None = recipe.get("target_col")
+    target_total_before = _target_total(df, target_col)
     removed_cols: list[str] = []
 
     # 1. Drop columns marked action=drop
@@ -398,6 +416,11 @@ def run(run_id: str) -> dict:
 
     rows_after = len(df)
     row_loss_pct = round((rows_before - rows_after) / max(rows_before, 1) * 100, 2)
+    target_total_after = _target_total(df, target_col)
+    target_drift_pct = None
+    if target_total_before and target_total_after is not None:
+        target_drift_pct = round(
+            (target_total_after - target_total_before) / abs(target_total_before) * 100, 2)
 
     CLEANED_DIR.mkdir(parents=True, exist_ok=True)
     cleaned_path = CLEANED_DIR / f"{run_id}_cleaned.parquet"
@@ -411,6 +434,10 @@ def run(run_id: str) -> dict:
         "rows_after": rows_after,
         "rows_removed": rows_before - rows_after,
         "row_loss_pct": row_loss_pct,
+        "target_col": target_col,
+        "target_total_before": target_total_before,
+        "target_total_after": target_total_after,
+        "target_total_drift_pct": target_drift_pct,
         "cols_dropped": removed_cols,
         "recipe_applied": recipe,
     }
@@ -421,6 +448,10 @@ def run(run_id: str) -> dict:
         "rows_before": rows_before,
         "rows_after": rows_after,
         "row_loss_pct": row_loss_pct,
+        "target_col": target_col,
+        "target_total_before": target_total_before,
+        "target_total_after": target_total_after,
+        "target_total_drift_pct": target_drift_pct,
         "cols_dropped": removed_cols,
         "cleaned_path": str(cleaned_path),
         "snapshot": snapshot,
