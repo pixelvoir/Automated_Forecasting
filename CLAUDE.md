@@ -37,7 +37,11 @@ model_selector_agent.run(run_id, use_llm=True)  # Stage 5: rule engine always ru
 
 from pipeline import feature_builder, trainer
 feature_builder.run(run_id, build_ml_matrix=True)          # Stage 6: EDA-seeded features (no LLM)
-trainer.run(run_id, models=["lightgbm", "xgboost"])        # Stage 7: train + backtest chosen models
+trainer.run(run_id, models=["lightgbm", "xgboost"],        # Stage 7: train + backtest chosen models
+            profile="balanced")                            #   optional fast|balanced|max override
+
+from agents import results_agent
+results_agent.run(run_id, "lightgbm")   # Stage 8: opt-in LLM insight report (LLMError if no key)
 ```
 Note the order: intent (Stage 2.5) comes BEFORE cleaning — the recipe and the per-series
 execution both consume the confirmed intent.
@@ -50,7 +54,7 @@ LLM provider is configured in `config/settings.yaml` — switch between `ollama`
 
 ## Security Constraints (non-negotiable)
 
-- Raw data **never** sent to any LLM or external API — only computed statistics (~200 tokens)
+- Raw data **never** sent to any LLM or external API — only computed statistics (~200 tokens). The opt-in Stage 8 report additionally sends *derived* outputs (metrics, thinned forecast arrays, per-series summary totals + series names) — still never raw rows, and only when the user explicitly clicks Generate
 - Client DB is **read-only** — no writes ever
 - DB credentials **never** logged, stored to disk, or forwarded anywhere
 - Credential path: browser input → POST body → FastAPI RAM → connection → disposed
@@ -102,9 +106,9 @@ Each stage is a standalone Python module in `pipeline/` with a single `run(run_i
 | 5 — Model selection | `pipeline/rule_engine.py` (`decide()`/`run()`) → `agents/model_selector_agent.py` (`run()`) | `runs/{id}/model_selection.json` |
 | 6 — Feature engineering | `pipeline/feature_builder.py` (`run()`) | `data/features/{id}_model_frame.parquet` (+ `_features.parquet` when ML), `runs/{id}/feature_report.json` |
 | 7 — Training | `pipeline/trainer.py` (`run()`) → `models_lib/*` via `models_lib/registry.py`; metrics in `pipeline/evaluator.py` | `runs/{id}/training_report.json`, `models/{id}/best_model.pkl` + `preprocessor.pkl` |
-| 8 — Results | not yet implemented (`pane-results` placeholder) — reads `training_report.json` | — |
+| 8 — Results | `agents/results_agent.py` (`run(run_id, model_id)`) — opt-in LLM insight report + forecast download (`frontend/results_view.py`) | `runs/{id}/results_report.json` |
 
-**Still-corrupt stubs** (out of scope, nothing imports them): `pipeline/decision_extractor.py`, `agents/orchestrator.py`, `agents/results_agent.py` — literal PowerShell `` `r`n `` escapes that raise SyntaxError on import; **rewrite fully, never edit**.
+**Still-corrupt stubs** (out of scope, nothing imports them): `pipeline/decision_extractor.py`, `agents/orchestrator.py` — literal PowerShell `` `r`n `` escapes that raise SyntaxError on import; **rewrite fully, never edit**. (`agents/results_agent.py` was rewritten this way 2026-07-10 and is now the real Stage 8.)
 
 **Intent-first flow:** Stage 2.5 suggests every forecast choice (timestamp, target incl.
 count-of-events, scope, series key, exog, frequency, horizon) from Stage 1/2 evidence +
@@ -139,6 +143,8 @@ Stage 3 is two-step: the LLM agent decides the recipe (`cleaning_agent.py`), the
 
 `cleaning_agent.run()` always writes `cleaning_status.json` (`{"recipe_source": "llm"|"fallback", "recipe_error": str|None}`) alongside `cleaning_recipe.json`, so the actual LLM failure reason survives a reload via `/runs/{id}/summary` instead of showing as `"unknown"`. It also force-corrects `type_fix` to `cast_numeric`/`parse_datetime` for any column Stage 2 flagged in `dtype_issues`, as a safety net in case an LLM response ignores the signal.
 
+**Profiles (2026-07-10):** `call(messages, require_json=..., profile="report")` merges the optional `llm_report:` settings block over `llm:` (absent block → `llm:` used entirely) — this is how Stage 8's report runs on a bigger model/longer timeout without touching the pipeline agents. Report-profile key resolution, first non-empty wins: `api_key_env` named in the block → `REPORT_<PROVIDER>_API_KEY` → the provider's standard env var. The Stage 8 report is the one deliberate exception to the "callers must fall back" rule: it is LLM-only (`results_agent.run` lets `LLMError` propagate → HTTP 502, shown verbatim).
+
 ### API Routes
 
 All routes are under `/runs` (defined in `api/routes.py`):
@@ -161,13 +167,17 @@ All routes are under `/runs` (defined in `api/routes.py`):
 | `/runs/{id}/forecast-eda` | POST | Stage 4 — forecast EDA from confirmed intent (body = optional `scope`/`forecast_frequency`/`horizon`/`exog_cols` overrides — none re-clean; per-series without a confirmed series key → 400; exog cols not in the cleaned data → 400), job-managed |
 | `/runs/{id}/series-forecast` | GET | One series' backtest+forecast arrays for one trained model (`?model=&series=`), from `models/{id}/series_forecasts.parquet` — per-series viewer; lightweight, NOT job-managed |
 | `/runs/{id}/model-select` | POST | Stage 5 — rule engine + optional LLM override (`use_llm` body flag); 400 if Stage 4 hasn't produced the payload; job-managed |
-| `/runs/{id}/train` | POST | Stages 6+7 — feature engineering + training of the user-selected `models` (body list; Stage 5 pick is only the default). 400 if Stage 5 hasn't run, if no trainable model, or — for a heavy per-series panel — if the estimate is `heavy` and `confirm_heavy` is false (the 400 detail is a dict carrying the estimate). Job-managed |
+| `/runs/{id}/train` | POST | Stages 6+7 — feature engineering + training of the user-selected `models` (body list; Stage 5 pick is only the default) with an optional `profile` override (`fast`/`balanced`/`max`). 400 if Stage 5 hasn't run, if no trainable model, or — for a heavy per-series panel — if the estimate is `heavy` and `confirm_heavy` is false (the 400 detail is a dict carrying the estimate). Deletes any stale `results_report.json`. Job-managed |
+| `/runs/training-config` | GET | `training.accuracy_profile` default + profile knobs from settings.yaml (the Training tab's profile picker default); lightweight, NOT job-managed. Must stay defined above the `/{run_id}` routes |
+| `/runs/{id}/report` | POST | Stage 8 — opt-in LLM insight report for one trained model (body `{model}`). **Deliberately NOT job-managed**: network-bound, and the single-slot job manager PREEMPTS — job-managing it would kill an in-flight training. 400 = no training / bad model; **502** = LLM failure (detail shown verbatim in the UI, no fallback report) |
+| `/runs/{id}/report` | GET | Re-read the persisted `results_report.json` (also folded into `/summary` as `_stage8`) |
+| `/runs/{id}/forecast-file` | GET | Forecast rows as a download (`?model=&fmt=csv\|parquet&level=aggregate\|series`) — aggregate from the training report arrays, series from `series_forecasts.parquet`; StreamingResponse, NOT job-managed |
 
 Every job-managed endpoint can return **409** (preempted by a newer job) — callers must handle this explicitly, not treat a non-200 as a generic failure.
 
 ### `runs/{run_id}/` Directory
 
-The `/runs/{id}/summary` endpoint reads all accumulated files to reconstruct full run state for the UI (`_stage2`, `_intent`, `_stage3`, `_stage4`, `_stage5`, `_stage6`, `_stage7`). `forecast_user_selections.json` is written by the `/clean` endpoint — it is the single confirmed-intent file every downstream stage reads (cleaning recipe, per-series cleaner execution, validation gate, forecast EDA). The legacy `user_selections.json` (timestamp only) is still read as a fallback for pre-refactor runs.
+The `/runs/{id}/summary` endpoint reads all accumulated files to reconstruct full run state for the UI (`_stage2`, `_intent`, `_stage3`, `_stage4`, `_stage5`, `_stage6`, `_stage7`, `_stage8`). `forecast_user_selections.json` is written by the `/clean` endpoint — it is the single confirmed-intent file every downstream stage reads (cleaning recipe, per-series cleaner execution, validation gate, forecast EDA). The legacy `user_selections.json` (timestamp only) is still read as a fallback for pre-refactor runs.
 
 Files in order of creation:
 ```
@@ -185,9 +195,11 @@ forecasting_eda_full.json   # Stage 4 (all stats + downsampled plot arrays)
 model_selection_payload.json   # Stage 4 (compact decision JSON for Stage 5)
 model_selection.json        # Stage 5 (final pick + rule trace + LLM info + training_hints)
 feature_report.json         # Stage 6 (EDA-seeded feature recipe + rationale)
-training_report.json        # Stage 7 (per-model metrics, params, backtest+forecast arrays)
+training_report.json        # Stage 7 (per-model metrics incl. train_seconds, params,
+                            #          backtest+forecast arrays, target_insights, total_seconds)
+results_report.json         # Stage 8 (opt-in LLM markdown report; deleted on every /train)
 ```
-`model_selection.json` + `feature_report.json` + `training_report.json` (and the
+`model_selection.json` + `feature_report.json` + `training_report.json` + `results_report.json` (and the
 `data/features/{id}_*.parquet` + `models/{id}/`) are all purged on re-clean
 (`routes._purge_downstream`) and on a fresh `forecasting_eda.run()`, so `/summary` can't
 resurrect a decision/training made on data that no longer exists.
@@ -247,7 +259,7 @@ Deterministic safety net applied to BOTH LLM and fallback recipes, after the use
 
 ### Forecast Intent (Stage 2.5)
 
-`pipeline/forecast_intent.py::detect()` runs on Stage 1/2 evidence + the **raw** parquet (cleaning hasn't happened yet) and suggests every intent field with `confidence: high|medium|low` — low renders a yellow "confirm" badge in the UI, it never blocks. Key detection logic:
+`pipeline/forecast_intent.py::detect()` runs on Stage 1/2 evidence + the **raw** parquet (cleaning hasn't happened yet) and suggests every intent field with `confidence: high|medium|low` — low renders a yellow "confirm" badge in the UI, it never blocks. It also records top-level `data_end` (max parsed timestamp of the SUGGESTED ts column) — this powers the "…or forecast until \<date\>" pickers next to both horizon inputs (`ui.horizon_datepicker` + the `sync_intent_horizon`/`sync_fcst_horizon` callbacks, which convert a picked end date to the canonical integer horizon via `pd.Period` subtraction; the Forecast EDA picker prefers Stage 4's `aggregate.end`). The integer horizon stays authoritative end-to-end — a stale `data_end` can only make the note approximate, never corrupt a run. Key detection logic:
 - **Timestamps** ranked business-vs-audit (`created/loaded/inserted…` names lose); multiple business timestamps (vet data has 3 event times) → low confidence, the user picks.
 - **Targets** = numeric measures (name-heuristics + variance) **plus count candidates**: high-distinct columns with event-identity names (visit/order/ticket/receipt…), `agg_hint: nunique` — "number of visits per day" is `nunique(VISIT ID)` resampled daily. **Continuous-signal scoring (2026-07-09):** keyword score ties are broken by graded, unit-free bonuses — log-cardinality (up to +1.0), CV = |std/mean| (up to +0.5), float-like values (+0.25), hard-capped at +1.75 so an unhinted column can never cross the measure-keyword bar of 2 — plus near-constant penalties (CV < 0.05 → −1.5, < 0.15 → −0.75) and a junk-name penalty (−3). This fixed the observed failure where `total_farmers` (distinct 0.04%, near-constant) beat `total_litre`/`total_kilo` purely by schema column order. `event_log_mode` is now gated on **keyword presence** (a measure-named column with score > 0), deliberately independent of these bonuses/penalties so their tuning can never flip a measure dataset into count mode. Candidates carry `cv`; the dropdown cap is `forecast_intent.max_target_candidates` (30) so real measures can't fall off.
 - **Event-log mode** (no convincing measure + a count candidate): group candidates switch from `(key, ts)`-uniqueness scoring (meaningless when every row is one event) to name-ranked categorical *dimensions* (facility/region/category), and hourly event timestamps suggest `daily` forecast frequency.
@@ -268,6 +280,8 @@ Gotchas encoded in the module:
 - Plot arrays in `forecasting_eda_full.json` are downsampled to `plot_max_points` (JSON stays ~150–500KB; it travels through the store).
 
 Frontend split: `frontend/intent_view.py` renders the Pipeline Setup tab's intent form (confidence badges, LLM rationale banner, always-visible series-key picker — group cols drive per-series *cleaning* even in aggregate scope); `frontend/fcst_eda_view.py` renders the results-only Forecast EDA tab (confirmed-setup summary + a **scope/freq/horizon re-run** that skips cleaning + verdict tiles + Plotly charts); `frontend/model_select_view.py` renders the Model Select tab (decision hero + provenance banner + training hints + eligibility table + rule trace + Stage-5-only re-run with its own LLM switch). Callbacks: `confirm_and_run` (the one chain: `/clean` → `/validate` → `/forecast-eda` → `/model-select`, drops stale `_stage4`/`_stage5`, lands on the Forecast EDA tab on success; a model-select 409/failure keeps the EDA results and surfaces a visible warning), `run_intent_redetect`, `rerun_fcst_eda` (sends `scope`/`forecast_frequency`/`horizon` to `/forecast-eda` — no re-clean — then re-chains `/model-select` and drops stale `_stage5`/`_stage6`/`_stage7`; its `switch-use-llm` State can be `None` for pre-refactor runs — treated as `True`), `run_model_select`; `trigger_run`/`run_eda_retry` auto-chain `/forecast-intent` after Stage 2. `frontend/training_view.py` renders the **Training tab** (Stage 6+7): a multi-select of eligible models (default = top-2 of the Stage 5 ranking, cap 5; excluded models listed with reasons under the picker; seasonal-naive baseline always trained as the MASE *reference* — it can rank in the table but never wins the hero card), a live cost-estimate banner (`build_estimate_banner`, a client-side mirror of `trainer.estimate_cost` incl. nhits = 3 / chronos = 0.5 units) with a heavy-case confirm switch, then a MASE leaderboard + a **model-switchable** history/backtest/forecast chart (`dropdown-train-chart-model` → `update_train_chart` re-renders `forecast_figure` from the store — every trained model is viewable, not just the best) with a **series picker** on per-series runs (`dropdown-train-chart-series` → `GET /series-forecast` charts one series, e.g. a single taluka) + collapsible feature-recipe/params. Callbacks: `render_training_body`, `update_train_estimate` (banner follows the model multiselect), `run_training` (`/train` → store `_stage7`+`_stage6`, lands on the Training tab; a 400 with a dict detail is the heavy-cost confirm prompt). The one `switch-use-llm` on Pipeline Setup gates the LLM for BOTH the cleaning recipe and model selection (training uses no LLM). Chart colors are dataviz-validated against the `#161b2e` card surface: series `#6366f1`, trend `#059669`, seasonal `#d97706`, residual `#e66767`.
+
+**2026-07-10 additions:** `frontend/results_view.py` renders the **Results tab** (Stage 8): trained-model picker (best pre-selected) + opt-in "Generate report" (POST `/report`; a 502 shows the LLM error verbatim — no fallback) + `dcc.Markdown` rendering of `_stage8.markdown` (`.results-report-md` CSS) + CSV/Parquet download buttons (server-side `requests` fetch → `dcc.send_bytes` through the root-level always-mounted `dcc.Download(id="download-forecast")` in layout.py). `frontend/ui.py` holds the shared primitives: `collapse_section` (the one `html.Details` expander every verbose table now uses — Data-tab schema/numeric-stats/missing/outliers, Forecast EDA seasonality + 16-test detail, Model Select eligibility + rule trace) and `horizon_datepicker`. The Forecast EDA setup recap is a one-liner; `_verdict_tiles` keeps only the 4 decision-driving tiles (the other 4 moved into the detail table). Training tab additions: accuracy-profile dropdown (`dropdown-train-profile`), leaderboard Time column, and a `train-insights-strip` (4 target-level tiles from `target_insights`) that `update_train_chart` re-renders when the chart model changes. All charts share `_GRAPH_CONFIG` (`displayModeBar: "hover"`, `scrollZoom`, double-click reset) + dark-themed vertical modebar in `_style_fig`; the training chart adds an x-axis rangeslider. Every new callback keeps the house rules: `n_clicks`/`not date`/`ctx.triggered_id` mount-fire guards, string-id-only `running=` targets.
 
 ### Model Selection (Stage 5)
 
@@ -303,7 +317,7 @@ statsforecast 2.0.3 is installed and Stage 5's catalog lists its models, but its
 
 **Direct multi-horizon ML backend** (`ml_models.py`, rewritten 2026-07 from the manual milk pipeline's strategies — the recursive rollout is gone): per-series **seasonal-index deseasonalization** (phase mean / overall mean, clipped 0.2–5.0 — trees can't extrapolate multiplicative seasonality; flat-index fallback for negative/zero-level series), origin features from `feature_builder.build_supervised` expanded × horizon steps (`horizon`/`target_phase`/`target_sindex` features), **quantile objectives** (P50 = the point model; interval alphas fitted lazily by `predict_quantiles`, non-crossing enforced by sorting), **early stopping on the last ~20% of origins then refit at the found tree count on ALL rows**, temp.txt-derived base params (n_estimators 800 cap, lr 0.025, leaves 63…). `run_global` adds `series_id` + per-series level/scale scalars + `share_lag1` (share of panel total at t−1) and a stratified `(series, horizon)` row cap (`training.max_train_rows`). Optuna (`tune`) searches around the base params on the same direct dataset; trials come from the **accuracy profile**.
 
-**Accuracy profiles** (`training.accuracy_profile: fast|balanced|max` + `training.profiles`): the time-vs-accuracy budget — Optuna trials (0/30/100), early-stopping rounds, nhits epochs; global-panel Optuna only in `max` (the 1–3h-class budget). Report carries `accuracy_profile`.
+**Accuracy profiles** (`training.accuracy_profile: fast|balanced|max` + `training.profiles`): the time-vs-accuracy budget — Optuna trials (0/30/100), early-stopping rounds, nhits epochs; global-panel Optuna only in `max` (the 1–3h-class budget). Report carries `accuracy_profile`. **Per-run override (2026-07-10):** `trainer.run(..., profile=...)` / `POST /train {"profile": ...}` — the Training tab's profile dropdown (default fetched via `GET /runs/training-config`); an unknown override silently falls back to the settings default. The report also records wall-clock: per-result `train_seconds` (success AND error paths) + top-level `total_seconds` (leaderboard Time column), and per-result `target_insights` (next-period value, horizon total vs trailing same-length history total from the EXACT frame, widest 95% band) feeding the Training tab's insights strip.
 
 **NHITS** (`models_lib/nhits_model.py`, pure torch): stacked MLP blocks with input max-pooling (coarse→fine) + backcast residual stacking + linear-interpolated forecast knots; direct multi-horizon **quantile heads** (pinball loss) → native intervals; per-series standard scaling; Adam + early stopping on the chronologically-last windows. Single-series `NHITSForecaster` + `run_global` (one network across the panel; truncated-data model for the honest holdout backtest, fresh full-data model for the final forecast). **On per-series scope nhits ALWAYS routes global** regardless of policy (trainer's `route_global` via `registry.always_global()`). Counted 3 units in `estimate_cost` (mirrored in `training_view.estimate_cost`). NHITS works on aggregate scope too — its `min_length: 200` just excludes short aggregates (the Training picker now lists excluded models with reasons).
 

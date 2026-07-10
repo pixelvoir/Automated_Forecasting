@@ -21,6 +21,7 @@ Reads:  runs/{id}/feature_report.json (recipe), runs/{id}/model_selection.json (
 Writes: runs/{id}/training_report.json, models/{id}/best_model.pkl + preprocessor.pkl
 """
 import json
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -58,12 +59,14 @@ def _load_config() -> dict:
             "sarima_max_period": (cfg.get("model_selection", {}) or {}).get("sarima_max_period", 24)}
 
 
-def _resolve_profile(tcfg: dict) -> dict:
+def _resolve_profile(tcfg: dict, override=None) -> dict:
     """The accuracy-vs-time budget passed to every backend: the selected profile's knobs
     (optuna trials, early-stopping rounds, nhits epochs) + the global caps. The user chose
     to trade longer training for accuracy — `balanced` is the default, `max` is the
-    1-3h-class budget."""
-    name = str(tcfg.get("accuracy_profile", "balanced"))
+    1-3h-class budget. `override` (the UI's per-run picker) wins only when it names a
+    profile that actually exists in settings; anything else falls back silently."""
+    name = str(override) if override in (tcfg.get("profiles") or {}) \
+        else str(tcfg.get("accuracy_profile", "balanced"))
     prof = dict((tcfg.get("profiles") or {}).get(name) or {})
     prof.setdefault("optuna_trials", 30)
     prof.setdefault("early_stopping_rounds", 80)
@@ -304,9 +307,35 @@ def _pooled_mase_scale(frame, season):
     return scale if (np.isfinite(scale) and scale > 0) else None
 
 
+def _target_insights(entry, hist: pd.Series, horizon: int) -> dict | None:
+    """Target-level summary for the Training tab's insights strip: next-period forecast,
+    horizon total vs the trailing same-length history total (% change), widest 95% band.
+    `hist` is the exact frame's y indexed by ds (panel-summed on per-series scope, which
+    matches _display_forecast's panel-summed yhat)."""
+    fc = entry.get("forecast") or {}
+    ds = fc.get("ds") or []
+    yhat = [v for v in (fc.get("yhat") or []) if v is not None]
+    if not ds or not yhat:
+        return None
+    total = float(np.nansum(yhat))
+    trailing = float(hist.tail(horizon).sum()) if len(hist) >= horizon else None
+    pct = (round((total - trailing) / abs(trailing) * 100, 2)
+           if trailing not in (None, 0) else None)
+    widest = None
+    if fc.get("lo95") and fc.get("hi95"):
+        widths = [h - l for l, h in zip(fc["lo95"], fc["hi95"])
+                  if l is not None and h is not None]
+        widest = round(max(widths), 4) if widths else None
+    return {"next_ds": str(ds[0]), "next_value": round(float(yhat[0]), 4),
+            "horizon_total": round(total, 4),
+            "trailing_total": round(trailing, 4) if trailing is not None else None,
+            "pct_change": pct, "widest_interval_95": widest}
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
-def run(run_id: str, models, confirm_heavy: bool = False) -> dict:
+def run(run_id: str, models, confirm_heavy: bool = False, profile: str | None = None) -> dict:
+    run_t0 = time.perf_counter()
     cfg = _load_config()
     tcfg = cfg["training"]
     run_dir = RUNS_DIR / run_id
@@ -370,12 +399,13 @@ def run(run_id: str, models, confirm_heavy: bool = False) -> dict:
                        else len(frame), period, horizon, cfg, n_series)
     levels = list(tcfg.get("interval_levels", [80, 95]))
     scale = _pooled_mase_scale(frame, period)
-    profile = _resolve_profile(tcfg)
+    profile = _resolve_profile(tcfg, override=profile)
     n_trials = (tcfg.get("optuna_trials_large", 8) if n_series >= tcfg.get("large_panel_series", 500)
                 else int(profile.get("optuna_trials", 30)))
 
     results, fitted_objs, series_frames = [], {}, []
     for mid in run_ids:
+        model_t0 = time.perf_counter()
         try:
             params, tuning, native_iv = None, None, None
             # nhits/chronos are ALWAYS global on a panel (one network / one batched
@@ -425,6 +455,7 @@ def run(run_id: str, models, confirm_heavy: bool = False) -> dict:
                 "requested": mid in requested, "is_baseline": mid == BASELINE and mid not in requested,
                 "metrics": metrics, "params": _json_safe_params(params), "tuning": tuning,
                 "strategy": strategy, "error": None,
+                "train_seconds": round(time.perf_counter() - model_t0, 2),
                 "backtest": _display_backtest(cv_df, scope),
                 "forecast": _display_forecast(fc_df, scope, cv_df, levels, native_iv),
             })
@@ -434,6 +465,7 @@ def run(run_id: str, models, confirm_heavy: bool = False) -> dict:
                 "requested": mid in requested, "is_baseline": mid == BASELINE and mid not in requested,
                 "metrics": {"mase": None}, "params": {}, "tuning": None, "strategy": "none",
                 "error": f"{type(exc).__name__}: {exc}",
+                "train_seconds": round(time.perf_counter() - model_t0, 2),
                 "backtest": {"ds": [], "actual": [], "predicted": []},
                 "forecast": {"ds": [], "yhat": []},
             })
@@ -451,6 +483,15 @@ def run(run_id: str, models, confirm_heavy: bool = False) -> dict:
     for e in results:
         e["is_primary"] = e["model"] == primary_model
         e["is_best"] = e["model"] == best_model
+
+    # Target-level insights for the UI (next period, horizon total vs trailing history,
+    # widest 95% band). Trailing history comes from the EXACT modeling frame — the store's
+    # plot arrays are downsampled, so summing them would be silently wrong on long series.
+    hist = (frame.groupby("ds")["y"].sum() if scope == "per_series"
+            else frame.set_index("ds")["y"]).sort_index()
+    for e in results:
+        if not e.get("error"):
+            e["target_insights"] = _target_insights(e, hist, horizon)
 
     # Serialize the best model (+ recipe as the preprocessor).
     serialized = _serialize(run_id, best_model, fitted_objs.get(best_model), recipe)
@@ -481,6 +522,7 @@ def run(run_id: str, models, confirm_heavy: bool = False) -> dict:
         "has_series_forecasts": has_series_fc, "series_ids": series_ids_out,
         "cost": estimate, "cv": cv_plan, "results": results,
         "serialized": serialized, "warnings": warnings_list,
+        "total_seconds": round(time.perf_counter() - run_t0, 2),
         "trained_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
     (run_dir / "training_report.json").write_text(json.dumps(training_report, indent=2, default=str))

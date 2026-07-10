@@ -269,18 +269,6 @@ def _data_pane():
     ])
 
 
-def _placeholder_pane():
-    return html.Div(
-        [
-            _cicon("bi-hourglass-split", fontSize="2rem", color="#334155",
-                   display="block", marginBottom="12px", marginRight="0"),
-            html.P("This stage is not implemented yet.",
-                   style={"color": "#64748b", "fontSize": "0.9rem"}),
-        ],
-        className="text-center mt-5 pt-4",
-    )
-
-
 def create_layout():
     return dbc.Container(
         fluid=True,
@@ -315,6 +303,9 @@ def create_layout():
             # so the loaded run/results aren't silently lost if the browser reloads.
             dcc.Store(id="results-store", storage_type="session"),
             dcc.Store(id="theme-store", data="dark", storage_type="local"),
+            # Root-level and always mounted: the download target must never be inside a
+            # re-renderable pane body (outputting to an unmounted component fails silently).
+            dcc.Download(id="download-forecast"),
 
             # ── Stage tabs (static — always clickable, see _build_tabs docstring) ──
             dcc.Tabs(
@@ -350,7 +341,8 @@ def create_layout():
                              children=html.Div(id="model-tab-body")),
                     html.Div(id="pane-training", style=_HIDDEN,
                              children=html.Div(id="training-tab-body")),
-                    html.Div(id="pane-results", style=_HIDDEN, children=_placeholder_pane()),
+                    html.Div(id="pane-results", style=_HIDDEN,
+                             children=html.Div(id="results-tab-body")),
                 ]),
                 type="circle",
                 color="#6366f1",

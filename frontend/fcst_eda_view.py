@@ -18,6 +18,8 @@ import plotly.graph_objects as go
 from dash import dcc, html, dash_table
 from plotly.subplots import make_subplots
 
+from frontend.ui import collapse_section, horizon_datepicker
+
 _TEXT = "var(--bs-body-color)"
 _CHART_BG = "#161b2e"
 _GRID = "rgba(255,255,255,0.06)"
@@ -89,6 +91,16 @@ def _fmt(v, nd=3):
 
 # ── Plotly figure base ───────────────────────────────────────────────────────
 
+# Interactive but unobtrusive: toolbar on hover only, wheel-zoom on, double-click resets.
+_GRAPH_CONFIG = {
+    "displayModeBar": "hover",
+    "scrollZoom": True,
+    "doubleClick": "reset",
+    "displaylogo": False,
+    "modeBarButtonsToRemove": ["lasso2d", "select2d", "autoScale2d"],
+}
+
+
 def _style_fig(fig, height=280):
     fig.update_layout(
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor=_CHART_BG,
@@ -96,6 +108,9 @@ def _style_fig(fig, height=280):
         margin=dict(l=50, r=15, t=30, b=30), height=height,
         hovermode="x unified",
         hoverlabel=dict(bgcolor="#1e2235", font=dict(color="#e2e8f0", size=11)),
+        dragmode="zoom",
+        modebar=dict(bgcolor="rgba(0,0,0,0)", color="#64748b",
+                     activecolor="#e2e8f0", orientation="v"),
     )
     fig.update_xaxes(gridcolor=_GRID, zeroline=False, linecolor=_GRID, showline=False)
     fig.update_yaxes(gridcolor=_GRID, zeroline=False, linecolor=_GRID, showline=False)
@@ -103,7 +118,7 @@ def _style_fig(fig, height=280):
 
 
 def _graph(fig):
-    return dcc.Graph(figure=fig, config={"displayModeBar": False},
+    return dcc.Graph(figure=fig, config=_GRAPH_CONFIG,
                      style={"borderRadius": "10px", "overflow": "hidden"})
 
 
@@ -196,11 +211,12 @@ _INTERMITTENCY_COLOR = {"smooth": "success", "intermittent": "warning",
 
 
 def _verdict_tiles(payload):
+    """The four numbers that actually drive the model decision. Everything else
+    (stationarity, SNR, CV, length) lives in the collapsible statistical-detail table."""
     fcast = payload.get("forecastability")
     seas_s = payload.get("seasonality_strength")
     trend_s = payload.get("trend_strength")
     icls = payload.get("intermittency_class") or "—"
-    stationary = payload.get("stationarity")
     tiles = dbc.Row([
         _tile("bi-magic", "Forecastability",
               _fmt(fcast, 2), sub="1 − spectral entropy (1 = clean signal)"),
@@ -211,16 +227,6 @@ def _verdict_tiles(payload):
         _tile("bi-activity", "Demand pattern",
               dbc.Badge(icls, color=_INTERMITTENCY_COLOR.get(icls, "secondary")),
               sub=f"ADI {_fmt(payload.get('adi'), 2)} · CV² {_fmt(payload.get('cv2'), 2)}"),
-        _tile("bi-align-middle", "Stationary",
-              _fmt(stationary),
-              sub=f"ndiffs {_fmt(payload.get('ndiffs'))} · nsdiffs {_fmt(payload.get('nsdiffs'))}"),
-        _tile("bi-soundwave", "Signal / noise",
-              _fmt(payload.get("snr"), 1), sub="Var(trend+seasonal) / Var(resid)"),
-        _tile("bi-percent", "Coeff. of variation", _fmt(payload.get("cv"), 3),
-              sub="std / mean"),
-        _tile("bi-rulers", "Series length", f"{payload.get('series_length', 0):,}",
-              sub=f"{payload.get('forecast_frequency', '')} · "
-                  f"{_fmt(payload.get('missing_pct'), 1)}% grid gaps"),
     ])
     return dbc.Card(dbc.CardBody(tiles), className="mb-3",
                     style={"borderLeft": "3px solid #6366f1"})
@@ -234,52 +240,41 @@ _SCOPE_LABEL = {"aggregate": "Overall (aggregate)", "per_series": "Per-series (p
 
 
 def _setup_summary(selections):
-    """Read-only recap of the confirmed forecast setup. Frequency/horizon can be
-    adjusted in the form below; everything else changes on Pipeline Setup."""
+    """One-line recap of the confirmed forecast setup (the full form lives on Pipeline
+    Setup — repeating it here as a tile card was pure duplication)."""
     if not selections or not selections.get("target_col"):
         return None
     group_cols = selections.get("group_cols") or []
     exog = selections.get("exog_cols") or []
-    horizon = selections.get("horizon")
-    freq = selections.get("forecast_frequency")
-    agg_sub = _AGG_LABEL.get(selections.get("agg"), selections.get("agg") or "")
+    agg = selections.get("agg") or ""
     if selections.get("agg_forced"):
-        agg_sub += " (auto-corrected)"
-
-    exog_row = dbc.Row([dbc.Col([
-        html.Div(
-            [html.I(className="bi bi-diagram-3",
-                    style={"color": "#64748b", "marginRight": "4px", "fontSize": "0.7rem"}),
-             html.Span("Exogenous drivers",
-                       style={"fontSize": "0.65rem", "color": "#94a3b8",
-                              "textTransform": "uppercase", "letterSpacing": "0.06em"})],
-            className="d-flex align-items-center mb-1"),
-        html.Div([dbc.Badge(c, color="secondary", className="me-1 mb-1") for c in exog]
-                 if exog else
-                 html.Span("None", style={"fontSize": "0.85rem", "color": "#64748b"})),
-    ], width=12)], className="mt-1")
-
-    return dbc.Card(dbc.CardBody([
-        html.Div([
-            html.Span([_cicon("bi-sliders"), "Confirmed Forecast Setup"], style=_SH),
-            html.Small("change on the Pipeline Setup tab",
-                       style={"color": "#64748b", "fontSize": "0.68rem"}),
-        ], className="d-flex justify-content-between align-items-center mb-2"),
-        dbc.Row([
-            _tile("bi-bullseye", "Target", selections["target_col"], sub=agg_sub),
-            _tile("bi-clock-history", "Timestamp", selections.get("timestamp_col") or "—"),
-            _tile("bi-collection", "Scope",
-                  _SCOPE_LABEL.get(selections.get("scope"), selections.get("scope") or "—"),
-                  sub=("key: " + " × ".join(group_cols)) if group_cols else "no series key"),
-            _tile("bi-calendar3", "Frequency & horizon",
-                  str(freq).capitalize() if freq else "—",
-                  sub=f"{horizon} periods ahead" if horizon else None),
-        ]),
-        exog_row,
-    ]), className="mb-3", style={"borderLeft": "3px solid #6366f1"})
+        agg += "·auto-corrected"
+    parts = [
+        f"Target {selections['target_col']} ({agg})",
+        str(selections.get("forecast_frequency") or "—"),
+        f"horizon {selections.get('horizon') or '—'}",
+        _SCOPE_LABEL.get(selections.get("scope"), selections.get("scope") or "—"),
+    ]
+    if group_cols:
+        parts.append("key " + " × ".join(group_cols))
+    parts.append("exog: " + (", ".join(exog) if exog else "none"))
+    return html.Div([
+        html.Span([_cicon("bi-sliders"), "  ·  ".join(parts)],
+                  style={"fontSize": "0.78rem", "color": "#94a3b8"}),
+        html.Small("change on the Pipeline Setup tab",
+                   style={"color": "#64748b", "fontSize": "0.68rem"}),
+    ], className="d-flex justify-content-between align-items-center mb-2 px-1")
 
 
 # ── Frequency/horizon adjust mini-form (Stage-4-only re-run) ─────────────────
+
+def _data_end(data):
+    """Last actual timestamp for the 'forecast until' picker: the CLEANED grid's end from
+    Stage 4 when available, else the raw-data end recorded by intent detection."""
+    stage4_end = ((((data.get("_stage4") or {}).get("eda") or {}).get("full") or {})
+                  .get("aggregate") or {}).get("end")
+    return stage4_end or (data.get("_intent") or {}).get("suggestions", {}).get("data_end")
+
 
 def _adjust_form(data, eda_exists):
     """Stage-4-only re-run controls. Scope / frequency / horizon don't affect cleaning, so
@@ -344,6 +339,8 @@ def _adjust_form(data, eda_exists):
                 _lbl("Horizon"),
                 dbc.Input(id="input-fcst-horizon", type="number", min=1, step=1,
                           value=horizon_current, size="sm"),
+                *horizon_datepicker(_data_end(data),
+                                    "date-fcst-horizon-end", "fcst-horizon-note"),
             ], md=3),
         ]),
         dbc.Row([dbc.Col([
@@ -425,6 +422,18 @@ def _detail_tables(agg_stats, payload):
     tr = agg_stats.get("trend", {})
     brk = agg_stats.get("structural_breaks", {})
     rows = [
+        # Formerly their own verdict tiles — demoted here to keep the tile card to the
+        # four decision-driving numbers.
+        {"Statistic": "Stationary", "Value": _fmt(payload.get("stationarity")),
+         "Reading": f"ndiffs {_fmt(payload.get('ndiffs'))} · "
+                    f"nsdiffs {_fmt(payload.get('nsdiffs'))}"},
+        {"Statistic": "Signal / noise ratio", "Value": _fmt(payload.get("snr"), 1),
+         "Reading": "Var(trend+seasonal) / Var(resid)"},
+        {"Statistic": "Coefficient of variation", "Value": _fmt(payload.get("cv"), 3),
+         "Reading": "std / mean"},
+        {"Statistic": "Series length", "Value": f"{payload.get('series_length', 0):,}",
+         "Reading": f"{payload.get('forecast_frequency', '')} · "
+                    f"{_fmt(payload.get('missing_pct'), 1)}% grid gaps"},
         {"Statistic": "ADF p-value", "Value": _fmt(st.get("adf_p"), 4),
          "Reading": "< 0.05 rejects unit root (stationary)"},
         {"Statistic": "KPSS p-value", "Value": _fmt(st.get("kpss_p"), 4),
@@ -453,11 +462,7 @@ def _detail_tables(agg_stats, payload):
                      if brk.get("recent_break") else
                      ", ".join(brk.get("break_dates", [])[:4]) or "none detected")},
     ]
-    return [
-        html.H6([_cicon("bi-clipboard-data"), "Statistical Detail"],
-                className="fw-semibold mb-2 mt-1", style=_SH),
-        _datatable(rows, ["Statistic", "Value", "Reading"]),
-    ]
+    return _datatable(rows, ["Statistic", "Value", "Reading"])
 
 
 def _exog_section(exog):
@@ -611,8 +616,13 @@ def _results_section(stage4):
             subtitle="Bars outside the gray band are statistically significant lags.",
         ))
 
-    sections += _seasonality_section(agg)
-    sections += _detail_tables(agg, payload)
+    seas_rows = _seasonality_section(agg)
+    if seas_rows:
+        sections.append(collapse_section("Seasonality tables (STL periods + FFT)",
+                                         seas_rows, icon="bi-arrow-repeat"))
+    sections.append(collapse_section("Statistical detail (16 tests)",
+                                     _detail_tables(agg, payload),
+                                     icon="bi-clipboard-data"))
     sections += _exog_section(full.get("exogenous"))
     sections += _panel_section(full)
     sections.append(html.Hr(className="my-3"))

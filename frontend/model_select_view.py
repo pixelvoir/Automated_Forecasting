@@ -11,6 +11,8 @@ import json
 import dash_bootstrap_components as dbc
 from dash import dash_table, dcc, html
 
+from frontend.ui import collapse_section
+
 _TEXT = "var(--bs-body-color)"
 
 _SH = {"color": "#94a3b8", "fontSize": "0.78rem", "textTransform": "uppercase",
@@ -257,11 +259,10 @@ def _eligible_table(sel):
             "Eligible": m["excluded_reason"] or "yes",
             "": marker,
         })
-    return html.Div([
-        html.Div(html.Span([_cicon("bi-list-check"), "Candidate Models"], style=_SH),
-                 className="mb-2 mt-1"),
+    return collapse_section(
+        f"Candidate models — eligibility & exclusions ({len(rows)})",
         _datatable(rows, ["Model", "Category", "Available", "Eligible", ""]),
-    ], className="mb-3")
+        icon="bi-list-check")
 
 
 def _rule_trace(sel):
@@ -288,11 +289,7 @@ def _rule_trace(sel):
                                     "color": "#94a3b8", "padding": "10px",
                                     "borderRadius": "10px", "maxHeight": "260px",
                                     "overflowY": "auto"}))
-    return html.Details([
-        html.Summary("Rule-engine trace", style={"cursor": "pointer", "color": "#64748b",
-                                                 "fontSize": "0.8rem"}),
-        *kids,
-    ], className="mb-3")
+    return collapse_section("Rule-engine trace", kids, icon="bi-diagram-2")
 
 
 # ── Re-run row ───────────────────────────────────────────────────────────────

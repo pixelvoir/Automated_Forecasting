@@ -75,9 +75,16 @@ def _panel_n_series(data) -> int:
     return int((payload.get("panel") or {}).get("n_series") or 1)
 
 
-def build_estimate_banner(data, selected):
+# Display-only wall-clock hint per profile; the units/tier math above stays untouched —
+# the server-side trainer.estimate_cost remains the authoritative gate.
+_PROFILE_TIME_HINT = {"fast": "≈0.5× wall-clock vs balanced",
+                      "balanced": "the default budget",
+                      "max": "≈3×+ wall-clock — the 1-3h-class budget on big panels"}
+
+
+def build_estimate_banner(data, selected, profile=None):
     """The live cost banner + (when heavy) the confirm switch. Rendered on load and by the
-    update_train_estimate callback when the model selection changes."""
+    update_train_estimate callback when the model selection or profile changes."""
     hints = (data.get("_stage5") or {}).get("training_hints") or {}
     policy = hints.get("policy") or "aggregate"
     n_series = _panel_n_series(data)
@@ -91,6 +98,11 @@ def build_estimate_banner(data, selected):
         _cicon(icon), html.Strong(f"Estimated cost: {label}"),
         html.Span(f"  ({detail})", style={"fontSize": "0.8rem", "marginLeft": "4px"}),
     ], className="d-flex align-items-center")]
+
+    if profile:
+        kids.append(html.Div(
+            f"Accuracy profile: {profile} ({_PROFILE_TIME_HINT.get(profile, '')})",
+            style={"fontSize": "0.74rem", "marginTop": "4px", "opacity": 0.85}))
 
     if est["tier"] == "heavy":
         kids.append(html.Div(
@@ -139,7 +151,14 @@ def _excluded_note(sel):
     )
 
 
-def _picker_card(data, sel):
+_PROFILE_OPTS = [
+    {"label": "Fast — smallest budgets, no tuning refinement", "value": "fast"},
+    {"label": "Balanced — 30 Optuna trials (default)", "value": "balanced"},
+    {"label": "Max — 100 trials + global-panel tuning (1-3h class)", "value": "max"},
+]
+
+
+def _picker_card(data, sel, default_profile="balanced"):
     options = _eligible_options(sel)
     option_ids = [o["value"] for o in options]
     default = _default_models(sel, option_ids)
@@ -157,7 +176,16 @@ def _picker_card(data, sel):
                      placeholder="Choose one or more models…", className="mb-3",
                      style={"fontSize": "0.85rem"}),
         *([excluded_note] if excluded_note is not None else []),
-        html.Div(id="train-estimate-banner", children=build_estimate_banner(data, default)),
+        html.Div([
+            html.Span("Accuracy profile", style={"fontSize": "0.74rem", "color": "#64748b",
+                                                 "textTransform": "uppercase",
+                                                 "letterSpacing": "0.05em"}),
+            dcc.Dropdown(id="dropdown-train-profile", options=_PROFILE_OPTS,
+                         value=default_profile, clearable=False,
+                         style={"fontSize": "0.82rem"}),
+        ], className="mb-3"),
+        html.Div(id="train-estimate-banner",
+                 children=build_estimate_banner(data, default, default_profile)),
         dcc.Loading(
             dbc.Button([_cicon("bi-play-fill"), "Train Models"], id="btn-train",
                        color="primary", className="w-100", style={"fontWeight": "600"}),
@@ -193,9 +221,11 @@ def _leaderboard(report):
             "MASE": _fmt(m.get("mase")), "RMSE": _fmt(m.get("rmse"), 1),
             "sMAPE": _fmt(m.get("smape")), "MAPE": _fmt(m.get("mape")),
             "R²": _fmt(m.get("r2")), "n": m.get("n") or 0,
+            "Time": (f"{e['train_seconds']:.1f}s" if e.get("train_seconds") is not None
+                     else "—"),
             "Notes": " · ".join(notes),
         })
-    cols = ["Model", "MASE", "RMSE", "sMAPE", "MAPE", "R²", "n", "Notes"]
+    cols = ["Model", "MASE", "RMSE", "sMAPE", "MAPE", "R²", "n", "Time", "Notes"]
     return dash_table.DataTable(
         data=rows, columns=[{"name": c, "id": c} for c in cols],
         style_table={"overflowX": "auto", "borderRadius": "10px", "overflow": "hidden"},
@@ -214,12 +244,25 @@ def _leaderboard(report):
         page_size=12)
 
 
+# Interactive but unobtrusive: toolbar on hover only, wheel-zoom on, double-click resets.
+_GRAPH_CONFIG = {
+    "displayModeBar": "hover",
+    "scrollZoom": True,
+    "doubleClick": "reset",
+    "displaylogo": False,
+    "modeBarButtonsToRemove": ["lasso2d", "select2d", "autoScale2d"],
+}
+
+
 def _style_fig(fig, height=320):
     fig.update_layout(
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor=_CHART_BG,
         font=dict(family="Inter, sans-serif", size=11, color=_INK),
         margin=dict(l=55, r=15, t=20, b=30), height=height, hovermode="x unified",
         legend=dict(orientation="h", y=1.12, x=0, font=dict(size=10)),
+        dragmode="zoom",
+        modebar=dict(bgcolor="rgba(0,0,0,0)", color="#64748b",
+                     activecolor="#e2e8f0", orientation="v"),
         hoverlabel=dict(bgcolor="#1e2235", font=dict(color="#e2e8f0", size=11)))
     fig.update_xaxes(gridcolor=_GRID, zeroline=False, showline=False)
     fig.update_yaxes(gridcolor=_GRID, zeroline=False, showline=False)
@@ -251,7 +294,10 @@ def forecast_figure(entry, history):
                             line=dict(width=0), name="95% interval", hoverinfo="skip")
         fig.add_scatter(x=fc["ds"], y=fc["yhat"], mode="lines+markers", name="Forecast",
                         line=dict(width=2.2, color=_C_FC), marker=dict(size=4))
-    return _style_fig(fig)
+    fig = _style_fig(fig, height=380)
+    fig.update_xaxes(rangeslider=dict(visible=True, thickness=0.07, bgcolor="#1e2235",
+                                      bordercolor="rgba(255,255,255,0.08)", borderwidth=1))
+    return fig
 
 
 def _details(report, data):
@@ -283,6 +329,9 @@ def _details(report, data):
     meta = (f"CV: {cv.get('strategy')} · {cv.get('n_windows')} window(s) × h={cv.get('h')}  |  "
             f"season={report.get('season_length')}  |  transform={report.get('transform')}  |  "
             f"trained {report.get('series_trained')}/{report.get('n_series')} series")
+    if report.get("total_seconds") is not None:
+        meta += (f"  |  total {report['total_seconds']}s "
+                 f"({report.get('accuracy_profile') or 'balanced'} profile)")
     return html.Details([
         html.Summary("Feature recipe, hyperparameters & CV detail",
                      style={"cursor": "pointer", "color": "#64748b", "fontSize": "0.8rem"}),
@@ -303,6 +352,51 @@ def history_for(data, report):
         return None
     return (((data.get("_stage4") or {}).get("eda") or {}).get("full") or {}) \
         .get("aggregate", {}).get("plot_data", {}).get("series")
+
+
+def _tile(icon, label, value, sub=None, width=3):
+    kids = [
+        html.Div([html.I(className=f"bi {icon}",
+                         style={"color": "#64748b", "marginRight": "4px",
+                                "fontSize": "0.7rem"}),
+                  html.Span(label, style={"fontSize": "0.65rem", "color": "#94a3b8",
+                                          "textTransform": "uppercase",
+                                          "letterSpacing": "0.06em"})],
+                 className="d-flex align-items-center mb-1"),
+        html.Div(value, style={"fontSize": "1rem", "fontWeight": "700",
+                               "letterSpacing": "-0.02em", "color": _TEXT}),
+    ]
+    if sub:
+        kids.append(html.Div(sub, style={"fontSize": "0.68rem", "color": "#64748b"}))
+    return dbc.Col(kids, width=width, className="mb-2")
+
+
+def _insights_strip(entry):
+    """Target-level takeaways for one model's forecast (trainer's target_insights).
+    Returns an empty div for old reports / error entries — never breaks a reload."""
+    ins = (entry or {}).get("target_insights")
+    if not ins:
+        return html.Div()
+    pct = ins.get("pct_change")
+    pct_str = (f"{pct:+.1f}%" if pct is not None else "—")
+    pct_color = "#059669" if (pct or 0) >= 0 else "#e66767"
+    next_ds = str(ins.get("next_ds") or "")[:10]
+    tiles = dbc.Row([
+        _tile("bi-calendar-event", "Next period",
+              _fmt(ins.get("next_value"), 2), sub=next_ds),
+        _tile("bi-plus-slash-minus", "Horizon total",
+              _fmt(ins.get("horizon_total"), 2), sub="sum of all forecast periods"),
+        _tile("bi-graph-up-arrow", "vs trailing history",
+              html.Span(pct_str, style={"color": pct_color}),
+              sub=(f"history total {_fmt(ins.get('trailing_total'), 2)}"
+                   if ins.get("trailing_total") is not None
+                   else "history shorter than horizon")),
+        _tile("bi-arrows-expand", "Widest 95% band",
+              _fmt(ins.get("widest_interval_95"), 2),
+              sub="max hi95 − lo95 across the horizon"),
+    ])
+    return dbc.Card(dbc.CardBody(tiles), className="mb-3",
+                    style={"borderLeft": "3px solid #d97706"})
 
 
 def _results_block(data, report):
@@ -328,6 +422,10 @@ def _results_block(data, report):
                    "higher in the table without winning.",
                    className="mb-0 mt-1", style={"fontSize": "0.78rem", "color": "#64748b"}),
         ]), className="mb-3", style={"borderLeft": "3px solid #059669"}))
+
+        # Target insights follow the chart-model dropdown (update_train_chart re-renders
+        # this div's children) — initialized from the hero entry.
+        kids.append(html.Div(id="train-insights-strip", children=_insights_strip(hero)))
 
         history = history_for(data, report)
 
@@ -364,7 +462,7 @@ def _results_block(data, report):
             dcc.Loading(
                 dcc.Graph(id="graph-train-chart",
                           figure=forecast_figure(hero, history),
-                          config={"displayModeBar": False},
+                          config=_GRAPH_CONFIG,
                           style={"borderRadius": "10px", "overflow": "hidden"}),
                 type="circle", color="#6366f1", delay_show=150),
         ]), className="mb-3"))
@@ -380,7 +478,7 @@ def _results_block(data, report):
 
 # ── Tab entry point ───────────────────────────────────────────────────────────
 
-def render_training_tab(data):
+def render_training_tab(data, default_profile="balanced"):
     if not data:
         return html.Div(
             [_cicon("bi-info-circle", fontSize="2rem", color="#334155",
@@ -403,7 +501,7 @@ def render_training_tab(data):
     header = html.Div([html.Span([_cicon("bi-lightning-fill"), "Training"],
                                  className="fw-semibold section-title")], className="mb-3")
     report = data.get("_stage7")
-    blocks = [header, _picker_card(data, sel)]
+    blocks = [header, _picker_card(data, sel, default_profile)]
     if report:
         blocks += _results_block(data, report)
     else:

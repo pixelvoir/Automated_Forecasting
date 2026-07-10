@@ -27,11 +27,12 @@ import os
 import tempfile
 from pathlib import Path
 
+import pandas as pd
 import requests
 import dash_bootstrap_components as dbc
 from dash import Input, Output, State, dcc, html, dash_table, no_update, callback, ALL, ctx, clientside_callback
 
-from frontend import fcst_eda_view, intent_view, model_select_view, training_view
+from frontend import fcst_eda_view, intent_view, model_select_view, results_view, training_view, ui
 from frontend.layout import RUNS_LIST_STYLE, RUNS_LIST_STYLE_LOCKED, TAB_VALUES
 
 API_URL = os.environ.get("API_URL", "http://localhost:8000")
@@ -42,6 +43,22 @@ _TEXT = "var(--bs-body-color)"
 
 _SHOW = {"display": "block"}
 _HIDE = {"display": "none"}
+
+# "Forecast until <date>" → integer horizon. pd.Period subtraction counts whole periods
+# regardless of intra-period position (mid-month vs month-start can't skew the count).
+_PERIOD_FREQ = {"hourly": "h", "daily": "D", "weekly": "W",
+                "monthly": "M", "quarterly": "Q", "yearly": "Y"}
+
+
+def _periods_until(data_end, target_date, freq_label):
+    f = _PERIOD_FREQ.get(freq_label or "")
+    if not (f and data_end and target_date):
+        return None
+    try:
+        n = (pd.Period(str(target_date)[:10], f) - pd.Period(str(data_end)[:19], f)).n
+        return max(int(n), 1)
+    except Exception:
+        return None
 
 
 def _cancel_running():
@@ -407,12 +424,28 @@ def render_model_body(data):
     return model_select_view.render_model_tab(data)
 
 
+_TRAIN_CFG_CACHE: dict = {}
+
+
+def _training_default_profile() -> str:
+    """The configured training.accuracy_profile, fetched once from the API (the Dash
+    process never reads the API's settings.yaml directly)."""
+    if not _TRAIN_CFG_CACHE:
+        try:
+            r = requests.get(f"{API_URL}/runs/training-config", timeout=3)
+            if r.ok:
+                _TRAIN_CFG_CACHE.update(r.json())
+        except requests.RequestException:
+            pass
+    return _TRAIN_CFG_CACHE.get("accuracy_profile") or "balanced"
+
+
 @callback(
     Output("training-tab-body", "children"),
     Input("results-store", "data"),
 )
 def render_training_body(data):
-    return training_view.render_training_tab(data)
+    return training_view.render_training_tab(data, default_profile=_training_default_profile())
 
 
 @callback(
@@ -515,14 +548,11 @@ def _render_data_results(data):
             }
             for col, s in numeric_stats.items()
         ]
-        numeric_section = [
-            html.H6(
-                [html.I(className="bi bi-bar-chart-line", style={"marginRight": "5px"}), "Numeric Statistics"],
-                className="mt-4 mb-2 fw-semibold",
-                style={"color": "#94a3b8", "fontSize": "0.78rem", "textTransform": "uppercase", "letterSpacing": "0.06em"},
-            ),
-            _datatable(numeric_rows, ["Column", "Min", "Max", "Mean", "Median", "Std", "Skew", "Kurtosis", "IQR"]),
-        ]
+        numeric_section = [ui.collapse_section(
+            f"Numeric statistics ({len(numeric_rows)} columns)",
+            _datatable(numeric_rows, ["Column", "Min", "Max", "Mean", "Median", "Std",
+                                      "Skew", "Kurtosis", "IQR"]),
+            icon="bi-bar-chart-line")]
 
     stage2 = data.get("_stage2", {})
     stage2_section = _render_stage2(stage2) if stage2 else []
@@ -544,9 +574,11 @@ def _render_data_results(data):
     return html.Div([
         header,
         shape_card,
-        html.H6([_cicon("bi-table"), "Schema"], className="mb-2 fw-semibold",
-                style={"color": "#94a3b8", "fontSize": "0.78rem", "textTransform": "uppercase", "letterSpacing": "0.06em"}),
-        _datatable(schema_rows, ["Column", "Inferred type", "DB dtype", "Null count", "Null %", "Frequency"]),
+        ui.collapse_section(
+            f"Schema ({len(schema_rows)} columns)",
+            _datatable(schema_rows, ["Column", "Inferred type", "DB dtype", "Null count",
+                                     "Null %", "Frequency"]),
+            icon="bi-table"),
         *numeric_section,
         *stage2_section,
         _cleaning_hint(data),
@@ -783,11 +815,10 @@ def _render_stage2(stage2: dict) -> list:
             {"Column": col, "Null %": f"{v['pct']}%", "Max consecutive": v["max_consecutive"], "Pattern": v["pattern"]}
             for col, v in missing.items()
         ]
-        sections += [
-            html.H6([html.I(className="bi bi-exclamation-triangle", style={"marginRight": "5px"}), "Missing Data"],
-                    className="fw-semibold mb-2", style=_sh),
+        sections.append(ui.collapse_section(
+            f"Missing data ({len(missing_rows)} columns)",
             _datatable(missing_rows, ["Column", "Null %", "Max consecutive", "Pattern"]),
-        ]
+            icon="bi-exclamation-triangle"))
 
     outliers = dp.get("outliers", {})
     if outliers:
@@ -801,15 +832,14 @@ def _render_stage2(stage2: dict) -> list:
             }
             for col, v in outliers.items()
         ]
-        sections += [
-            html.H6([html.I(className="bi bi-diagram-3", style={"marginRight": "5px"}), "Outlier Analysis"],
-                    className="fw-semibold mb-2 mt-3", style=_sh),
-            html.P(
-                "Temporal % uses rolling-window IQR — significantly lower than IQR % signals seasonal inflation, not noise.",
-                style={"fontSize": "0.72rem", "color": "#64748b", "marginBottom": "6px"},
-            ),
-            _datatable(outlier_rows, ["Column", "IQR %", "Z-score %", "MAD %", "Temporal %"]),
-        ]
+        sections.append(ui.collapse_section(
+            f"Outlier analysis ({len(outlier_rows)} columns)",
+            [html.P(
+                "Temporal % uses rolling-window IQR — significantly lower than IQR % "
+                "signals seasonal inflation, not noise.",
+                style={"fontSize": "0.72rem", "color": "#64748b", "marginBottom": "6px"}),
+             _datatable(outlier_rows, ["Column", "IQR %", "Z-score %", "MAD %", "Temporal %"])],
+            icon="bi-diagram-3"))
 
     flags = []
     dupes = dp.get("duplicates", {})
@@ -952,10 +982,10 @@ def confirm_and_run(n_clicks, store_data, ts, target, agg, scope, group_cols,
             **(store_data.get("_intent") or {}),
             "selections": {k: v for k, v in body.items() if k != "use_llm"},
         }
-        # The cleaned parquet was just rewritten — earlier Stage 4/5 results describe
-        # data that no longer exists.
-        new_store.pop("_stage4", None)
-        new_store.pop("_stage5", None)
+        # The cleaned parquet was just rewritten — earlier Stage 4-8 results describe
+        # data that no longer exists (the backend purged them on disk too).
+        for k in ("_stage4", "_stage5", "_stage6", "_stage7", "_stage8"):
+            new_store.pop(k, None)
 
         eda_resp = requests.post(f"{API_URL}/runs/{run_id}/forecast-eda", json={},
                                  timeout=1800)
@@ -1309,6 +1339,51 @@ def run_intent_redetect(n_clicks, store_data):
         return no_update, dbc.Alert(str(e), color="danger", dismissable=True, className="mb-2")
 
 
+# ── Date-based horizon pickers ────────────────────────────────────────────────
+# The integer horizon stays the canonical field end-to-end; picking an end date just
+# fills the horizon input (with a note showing the equivalence). Both callbacks have
+# dynamically inserted Inputs → the `not date` guard is load-bearing (rule 2 above),
+# and they skip when the computed count equals the current value so manual typing is
+# never fought by a pane re-render.
+
+@callback(
+    Output("input-intent-horizon", "value"),
+    Output("intent-horizon-note", "children"),
+    Input("date-intent-horizon-end", "date"),
+    Input("dropdown-intent-freq", "value"),
+    State("results-store", "data"),
+    State("input-intent-horizon", "value"),
+    prevent_initial_call=True,
+)
+def sync_intent_horizon(date, freq, store_data, current):
+    if not date or not store_data:
+        return no_update, no_update
+    data_end = ((store_data.get("_intent") or {}).get("suggestions") or {}).get("data_end")
+    n = _periods_until(data_end, date, freq)
+    if n is None or n == current:
+        return no_update, no_update
+    return n, f"= {n} {freq} period(s) after {str(data_end)[:10]}"
+
+
+@callback(
+    Output("input-fcst-horizon", "value"),
+    Output("fcst-horizon-note", "children"),
+    Input("date-fcst-horizon-end", "date"),
+    Input("dropdown-fcst-freq", "value"),
+    State("results-store", "data"),
+    State("input-fcst-horizon", "value"),
+    prevent_initial_call=True,
+)
+def sync_fcst_horizon(date, freq, store_data, current):
+    if not date or not store_data:
+        return no_update, no_update
+    data_end = fcst_eda_view._data_end(store_data)
+    n = _periods_until(data_end, date, freq)
+    if n is None or n == current:
+        return no_update, no_update
+    return n, f"= {n} {freq} period(s) after {str(data_end)[:10]}"
+
+
 @callback(
     Output("results-store", "data", allow_duplicate=True),
     Output("cleaning-status", "children", allow_duplicate=True),
@@ -1358,8 +1433,8 @@ def rerun_fcst_eda(n_clicks, store_data, freq, horizon, scope, exog, use_llm):
             new_store["_intent"] = {**(store_data.get("_intent") or {}),
                                     "selections": result["selections"]}
         # Fresh Stage 4 evidence invalidates the old model decision + features + training
-        # (the backend purged them on disk) — drop them from the store, re-select below.
-        for k in ("_stage5", "_stage6", "_stage7"):
+        # + report (the backend purged them on disk) — drop them, re-select below.
+        for k in ("_stage5", "_stage6", "_stage7", "_stage8"):
             new_store.pop(k, None)
         msel_resp = requests.post(f"{API_URL}/runs/{run_id}/model-select",
                                   json={"use_llm": use_llm}, timeout=300)
@@ -1437,17 +1512,19 @@ def run_model_select(n_clicks, store_data, use_llm):
 @callback(
     Output("train-estimate-banner", "children"),
     Input("dropdown-train-models", "value"),
+    Input("dropdown-train-profile", "value"),
     State("results-store", "data"),
     prevent_initial_call=True,
 )
-def update_train_estimate(models, store_data):
+def update_train_estimate(models, profile, store_data):
     if not store_data:
         return no_update
-    return training_view.build_estimate_banner(store_data, models or [])
+    return training_view.build_estimate_banner(store_data, models or [], profile)
 
 
 @callback(
     Output("graph-train-chart", "figure"),
+    Output("train-insights-strip", "children"),
     Input("dropdown-train-chart-model", "value"),
     Input("dropdown-train-chart-series", "value"),
     State("results-store", "data"),
@@ -1455,11 +1532,13 @@ def update_train_estimate(models, store_data):
 )
 def update_train_chart(model_id, series, store_data):
     """Chart any trained model (not just the best); with a series selected on a
-    per-series run, fetch that single series' backtest+forecast from the API."""
+    per-series run, fetch that single series' backtest+forecast from the API. The
+    target-insights strip follows the model dropdown (aggregate view only — the
+    insights are panel-level numbers, so a single-series chart leaves them as-is)."""
     store_data = store_data or {}
     report = store_data.get("_stage7") or {}
     if not model_id or not report:
-        return no_update
+        return no_update, no_update
 
     if series:
         run_id = report.get("run_id") or store_data.get("run_id")
@@ -1469,15 +1548,17 @@ def update_train_chart(model_id, series, store_data):
             if resp.ok:
                 js = resp.json()
                 return training_view.forecast_figure(
-                    {"backtest": js.get("backtest"), "forecast": js.get("forecast")}, None)
+                    {"backtest": js.get("backtest"), "forecast": js.get("forecast")},
+                    None), no_update
         except requests.RequestException:
             pass
-        return no_update
+        return no_update, no_update
 
     entry = next((e for e in report.get("results") or [] if e["model"] == model_id), None)
     if not entry:
-        return no_update
-    return training_view.forecast_figure(entry, training_view.history_for(store_data, report))
+        return no_update, no_update
+    return (training_view.forecast_figure(entry, training_view.history_for(store_data, report)),
+            training_view._insights_strip(entry))
 
 
 @callback(
@@ -1488,10 +1569,11 @@ def update_train_chart(model_id, series, store_data):
     State("results-store", "data"),
     State("dropdown-train-models", "value"),
     State("switch-train-confirm", "value"),
+    State("dropdown-train-profile", "value"),
     running=[(Output("btn-train", "disabled"), True, False)],
     prevent_initial_call=True,
 )
-def run_training(n_clicks, store_data, models, confirm):
+def run_training(n_clicks, store_data, models, confirm, profile):
     """Stages 6+7 for the user-selected models. Lands on the Training tab on success; a
     heavy-cost 400 tells the user to enable the confirm switch and retry."""
     if not n_clicks or not store_data:
@@ -1503,7 +1585,7 @@ def run_training(n_clicks, store_data, models, confirm):
         return no_update, dbc.Alert(
             "Select at least one model to train.", color="warning",
             dismissable=True, className="mb-2"), no_update
-    body = {"models": models, "confirm_heavy": bool(confirm)}
+    body = {"models": models, "confirm_heavy": bool(confirm), "profile": profile or None}
     try:
         resp = requests.post(f"{API_URL}/runs/{run_id}/train", json=body, timeout=3600)
         if resp.status_code == 409:
@@ -1532,6 +1614,8 @@ def run_training(n_clicks, store_data, models, confirm):
         new_store = {**store_data, "_stage7": payload.get("report")}
         if payload.get("feature_report"):
             new_store["_stage6"] = payload["feature_report"]
+        # A retrain invalidates the Stage 8 narrative (the route deleted it on disk).
+        new_store.pop("_stage8", None)
         return new_store, "", "tab-training"
     except requests.exceptions.Timeout:
         return no_update, dbc.Alert(
@@ -1543,3 +1627,95 @@ def run_training(n_clicks, store_data, models, confirm):
             dismissable=True, className="mb-2"), no_update
     except Exception as e:
         return no_update, dbc.Alert(str(e), color="danger", dismissable=True, className="mb-2"), no_update
+
+
+# ── Tab 6: Results (Stage 8) ─────────────────────────────────────────────────
+# Opt-in LLM insight report + forecast download. The report POST is NOT job-managed
+# server-side (network-bound; must never preempt a running training job).
+
+@callback(
+    Output("results-tab-body", "children"),
+    Input("results-store", "data"),
+)
+def render_results_body(data):
+    return results_view.render_results_tab(data)
+
+
+@callback(
+    Output("results-store", "data", allow_duplicate=True),
+    Output("cleaning-status", "children", allow_duplicate=True),
+    Input("btn-generate-report", "n_clicks"),
+    State("results-store", "data"),
+    State("dropdown-results-model", "value"),
+    running=[(Output("btn-generate-report", "disabled"), True, False)],
+    prevent_initial_call=True,
+)
+def generate_results_report(n_clicks, store_data, model):
+    """Stage 8 on demand. LLM-only: a failure surfaces verbatim, there is no fallback
+    report. Success merges _stage8 into the store (persisted server-side too)."""
+    if not n_clicks or not store_data:
+        return no_update, no_update
+    run_id = store_data.get("run_id")
+    if not run_id or not model:
+        return no_update, dbc.Alert("Pick a trained model first.", color="warning",
+                                    dismissable=True, className="mb-2")
+    try:
+        resp = requests.post(f"{API_URL}/runs/{run_id}/report",
+                             json={"model": model}, timeout=300)
+        if not resp.ok:
+            detail = resp.json().get("detail", "Report generation failed")
+            color = "danger" if resp.status_code == 502 else "warning"
+            return no_update, dbc.Alert(str(detail), color=color, dismissable=True,
+                                        className="mb-2")
+        return {**store_data, "_stage8": resp.json().get("report")}, ""
+    except requests.exceptions.Timeout:
+        return no_update, dbc.Alert(
+            "Report generation timed out — try again or switch llm_report to a faster "
+            "model.", color="danger", dismissable=True, className="mb-2")
+    except requests.exceptions.ConnectionError:
+        return no_update, dbc.Alert(
+            "Cannot reach API — is run_dev.bat running?", color="danger",
+            dismissable=True, className="mb-2")
+    except Exception as e:
+        return no_update, dbc.Alert(str(e), color="danger", dismissable=True, className="mb-2")
+
+
+@callback(
+    Output("download-forecast", "data"),
+    Output("cleaning-status", "children", allow_duplicate=True),
+    Input("btn-download-csv", "n_clicks"),
+    Input("btn-download-parquet", "n_clicks"),
+    State("results-store", "data"),
+    State("dropdown-results-model", "value"),
+    State("switch-download-series", "value"),
+    running=[(Output("btn-download-csv", "disabled"), True, False),
+             (Output("btn-download-parquet", "disabled"), True, False)],
+    prevent_initial_call=True,
+)
+def download_forecast(n_csv, n_pq, store_data, model, series_level):
+    """Fetch the forecast file server-side (keeps all API access out of the browser) and
+    hand it to the root-level dcc.Download."""
+    if not (n_csv or n_pq) or not store_data or not ctx.triggered_id:
+        return no_update, no_update
+    run_id = store_data.get("run_id")
+    if not run_id or not model:
+        return no_update, dbc.Alert("Pick a trained model first.", color="warning",
+                                    dismissable=True, className="mb-2")
+    fmt = "parquet" if ctx.triggered_id == "btn-download-parquet" else "csv"
+    level = "series" if series_level else "aggregate"
+    try:
+        resp = requests.get(f"{API_URL}/runs/{run_id}/forecast-file",
+                            params={"model": model, "fmt": fmt, "level": level},
+                            timeout=120)
+        if not resp.ok:
+            detail = resp.json().get("detail", "Download failed")
+            return no_update, dbc.Alert(str(detail), color="warning", dismissable=True,
+                                        className="mb-2")
+        fname = f"{run_id}_{model}_forecast_{level}.{fmt}"
+        return dcc.send_bytes(resp.content, fname), ""
+    except requests.exceptions.ConnectionError:
+        return no_update, dbc.Alert(
+            "Cannot reach API — is run_dev.bat running?", color="danger",
+            dismissable=True, className="mb-2")
+    except Exception as e:
+        return no_update, dbc.Alert(str(e), color="danger", dismissable=True, className="mb-2")

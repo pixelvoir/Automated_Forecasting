@@ -30,7 +30,8 @@ def _purge_downstream(run_id: str):
     fresh forecast EDA) so /summary can never resurrect a decision/training made on data
     that no longer exists."""
     run_dir = RUNS_DIR / run_id
-    for name in ("model_selection.json", "feature_report.json", "training_report.json"):
+    for name in ("model_selection.json", "feature_report.json", "training_report.json",
+                 "results_report.json"):
         (run_dir / name).unlink(missing_ok=True)
     feat = ROOT / "data" / "features"
     for p in (feat / f"{run_id}_model_frame.parquet", feat / f"{run_id}_features.parquet"):
@@ -130,6 +131,18 @@ def cancel_running():
     """Terminate whatever heavy stage is currently running (if any). Used when the user
     starts a new run or switches datasets so old work stops burning CPU immediately."""
     return {"cancelled": jobs.cancel_active()}
+
+
+@router.get("/training-config")
+def get_training_config():
+    """Accuracy-profile default + per-profile knobs from settings.yaml, so the UI picker
+    can show the configured default without the Dash process reading the API's config
+    file. Light, never job-managed. (Must stay above the /{run_id} routes.)"""
+    import yaml
+    cfg = yaml.safe_load((ROOT / "config" / "settings.yaml").read_text()) or {}
+    tcfg = cfg.get("training", {}) or {}
+    return {"accuracy_profile": tcfg.get("accuracy_profile", "balanced"),
+            "profiles": tcfg.get("profiles", {}) or {}}
 
 
 # ── Run management ──────────────────────────────────────────────────────────
@@ -261,6 +274,11 @@ def get_run_summary(run_id: str):
     if tr_path.exists():
         data["_stage7"] = json.loads(tr_path.read_text())
 
+    # Stage 8 — persisted results report (opt-in LLM narrative)
+    rr_path = RUNS_DIR / run_id / "results_report.json"
+    if rr_path.exists():
+        data["_stage8"] = json.loads(rr_path.read_text())
+
     return data
 
 
@@ -338,6 +356,103 @@ def get_series_forecast(run_id: str, model: str, series: str):
             out["forecast"]["lo95"] = [round(float(v), 4) for v in lo]
             out["forecast"]["hi95"] = [round(float(v), 4) for v in hi]
     return out
+
+
+# ── Stage 8: results report + forecast download ──────────────────────────────
+
+class ReportRequest(BaseModel):
+    """The trained model the Stage 8 narrative should cover."""
+    model: str
+
+
+@router.post("/{run_id}/report")
+def generate_report(run_id: str, req: ReportRequest):
+    """Stage 8: opt-in LLM insight report for one trained model. Sends DERIVED data only
+    (statistics, metrics, forecast summaries — never raw rows) via the `llm_report`
+    settings profile. LLM-only: no rule fallback — a 502 carries the failure verbatim.
+
+    Deliberately NOT job-managed: the call is network-bound (no CPU work), and the
+    single-slot job manager PREEMPTS — routing this through it would kill an in-flight
+    training when the user clicks Generate. FastAPI runs sync routes in a threadpool,
+    and llm_report.timeout_seconds bounds the wait."""
+    run_dir = RUNS_DIR / run_id
+    if not run_dir.exists():
+        raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found.")
+    if not (run_dir / "training_report.json").exists():
+        raise HTTPException(status_code=400,
+                            detail="Train at least one model first — the report reads "
+                                   "training results.")
+    from agents import results_agent
+    from agents.llm_client import LLMError
+    try:
+        report = results_agent.run(run_id, req.model)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except LLMError as e:
+        raise HTTPException(status_code=502, detail=f"Report LLM call failed: {e}")
+    return {"run_id": run_id, "status": "completed", "report": report}
+
+
+@router.get("/{run_id}/report")
+def get_report(run_id: str):
+    """Re-read the persisted Stage 8 report (also folded into /summary as _stage8)."""
+    p = RUNS_DIR / run_id / "results_report.json"
+    if not p.exists():
+        raise HTTPException(status_code=404, detail="No report generated for this run yet.")
+    return json.loads(p.read_text())
+
+
+@router.get("/{run_id}/forecast-file")
+def download_forecast(run_id: str, model: str, fmt: str = "csv", level: str = "aggregate"):
+    """Forecast rows as a downloadable file. `aggregate` = the training_report display
+    arrays (ds/yhat + interval bounds); `series` = series_forecasts.parquet filtered to
+    the model's forecast rows (per-series runs only). Light, NOT job-managed."""
+    import io
+
+    import pandas as pd
+    from fastapi.responses import StreamingResponse
+
+    if not run_id.startswith("run_") or ".." in run_id or "/" in run_id or "\\" in run_id:
+        raise HTTPException(status_code=400, detail="Invalid run_id.")
+    if fmt not in ("csv", "parquet"):
+        raise HTTPException(status_code=400, detail="fmt must be 'csv' or 'parquet'.")
+    if level not in ("aggregate", "series"):
+        raise HTTPException(status_code=400, detail="level must be 'aggregate' or 'series'.")
+
+    if level == "series":
+        pq = ROOT / "models" / run_id / "series_forecasts.parquet"
+        if not pq.exists():
+            raise HTTPException(status_code=404,
+                                detail="No per-series forecasts for this run — per-series "
+                                       "scope only.")
+        df = pd.read_parquet(pq)
+        df = df[(df["model"] == model) & (df["kind"] == "forecast")]
+        if df.empty:
+            raise HTTPException(status_code=404, detail=f"No forecast rows for '{model}'.")
+        df = df[["unique_id", "ds", "predicted"]].rename(columns={"predicted": "yhat"})
+    else:
+        tr_path = RUNS_DIR / run_id / "training_report.json"
+        if not tr_path.exists():
+            raise HTTPException(status_code=404, detail="No training report for this run.")
+        report = json.loads(tr_path.read_text())
+        entry = next((e for e in report.get("results") or [] if e.get("model") == model), None)
+        if entry is None or entry.get("error") or not (entry.get("forecast") or {}).get("ds"):
+            raise HTTPException(status_code=404,
+                                detail=f"No forecast available for model '{model}'.")
+        fc = entry["forecast"]
+        df = pd.DataFrame({k: v for k, v in fc.items() if isinstance(v, list)})
+
+    buf = io.BytesIO()
+    if fmt == "parquet":
+        df.to_parquet(buf, index=False)
+        media = "application/octet-stream"
+    else:
+        buf.write(df.to_csv(index=False).encode("utf-8"))
+        media = "text/csv"
+    buf.seek(0)
+    fname = f"{run_id}_{model}_forecast_{level}.{fmt}"
+    return StreamingResponse(buf, media_type=media,
+                             headers={"Content-Disposition": f'attachment; filename="{fname}"'})
 
 
 class CleanRequest(BaseModel):
@@ -475,9 +590,11 @@ def run_model_select(run_id: str, req: ModelSelectRequest = ModelSelectRequest()
 class TrainRequest(BaseModel):
     """The user's model choice for Stage 7. The Stage 5 pick is only the default; the user
     may train one or more of the ELIGIBLE models (capped in trainer). `confirm_heavy`
-    acknowledges a 'heavy' cost estimate for a big per-series panel."""
+    acknowledges a 'heavy' cost estimate for a big per-series panel. `profile` optionally
+    overrides training.accuracy_profile for this run (fast/balanced/max)."""
     models: list[str] = []
     confirm_heavy: bool = False
+    profile: str | None = None
 
 
 @router.post("/{run_id}/train")
@@ -490,6 +607,9 @@ def run_train(run_id: str, req: TrainRequest = TrainRequest()):
     run_dir = RUNS_DIR / run_id
     if not run_dir.exists():
         raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found.")
+    if req.profile not in (None, "fast", "balanced", "max"):
+        raise HTTPException(status_code=400,
+                            detail=f"Unknown accuracy profile '{req.profile}'.")
     msel_path = run_dir / "model_selection.json"
     if not msel_path.exists():
         raise HTTPException(
@@ -531,6 +651,9 @@ def run_train(run_id: str, req: TrainRequest = TrainRequest()):
             "message": "Training this many series/models is heavy — confirm to proceed.",
             "estimate": estimate, "needs_confirm": True})
 
+    # A re-train invalidates any Stage 8 narrative written about the old training.
+    (run_dir / "results_report.json").unlink(missing_ok=True)
+
     result = _run_job(tasks.train_task, run_id, valid, confirm_heavy=req.confirm_heavy,
-                      track_id=run_id)
+                      profile=req.profile, track_id=run_id)
     return {"run_id": run_id, "status": "completed", **result}

@@ -330,11 +330,17 @@ def detect(run_id: str) -> dict:
 
     # Panel evidence needs parsed timestamps of the suggested column
     n_ts = 0
+    data_end = None
     if ts_suggested and ts_suggested in df.columns:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")  # dayfirst format guesses on raw string dates
             ts_parsed = pd.to_datetime(df[ts_suggested], errors="coerce")
         n_ts = int(ts_parsed.nunique())
+        # Last actual timestamp — lets the UI offer a "forecast until <date>" picker.
+        # Reflects the SUGGESTED ts column; the integer horizon stays canonical, so a
+        # user picking a different column can never corrupt anything downstream.
+        _mx = ts_parsed.max()
+        data_end = str(_mx) if pd.notna(_mx) else None
     rows_per_ts = n_rows / max(n_ts, 1)
     dup_ts_frac = 1.0 - n_ts / max(n_rows, 1)
     is_panel = dup_ts_frac > cfg.get("panel_dup_ts_threshold", 0.05)
@@ -404,6 +410,7 @@ def detect(run_id: str) -> dict:
     intent = {
         "run_id": run_id,
         "n_rows": n_rows,
+        "data_end": data_end,
         "evidence": {
             "is_panel": is_panel,
             "event_log_mode": event_log_mode,

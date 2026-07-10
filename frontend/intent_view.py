@@ -9,6 +9,8 @@ runs cleaning → validation → forecast EDA in one chain.
 import dash_bootstrap_components as dbc
 from dash import dcc, html
 
+from frontend.ui import horizon_datepicker
+
 _CONF_BADGE = {
     "high": ("auto", "success"),
     "medium": ("suggested", "info"),
@@ -205,6 +207,8 @@ def build_intent_form(suggestions: dict, selections: dict | None, already_run: b
                     _lbl("Horizon (periods)"),
                     dbc.Input(id="input-intent-horizon", type="number", min=1, step=1,
                               value=horizon_default, size="sm"),
+                    *horizon_datepicker(suggestions.get("data_end"),
+                                        "date-intent-horizon-end", "intent-horizon-note"),
                 ], md=3),
             ], className="mb-2"),
 

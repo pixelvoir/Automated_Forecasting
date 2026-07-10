@@ -21,6 +21,19 @@ llm:
   # 0.6+ only if recipes feel too rigid, drop to 0 for fully repeatable recipes.
   temperature: 0.2
 
+# Optional separate LLM for the Stage 8 Results-tab insight report. Any field here
+# OVERRIDES the main `llm` block for report calls only; omit/empty the whole block to
+# reuse `llm` as-is. Key resolution for reports: api_key_env (if set here) →
+# REPORT_<PROVIDER>_API_KEY → the provider's standard env var. The report is a long
+# prose narrative, so a bigger model + higher timeout + a little more temperature
+# than the pick-from-enums agents.
+llm_report:
+  provider: "groq"
+  model: "qwen/qwen3-32b"
+  timeout_seconds: 120
+  temperature: 0.4
+  # api_key_env: "REPORT_GEMINI_API_KEY"   # uncomment to force a specific env var name
+
 # Confidence thresholds
 confidence_threshold: 0.85
 
