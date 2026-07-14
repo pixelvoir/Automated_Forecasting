@@ -1,0 +1,25 @@
+{
+ "seasonal_naive|per_series": [
+  0.654,
+  0.701,
+  0.706
+ ],
+ "prophet|single": [
+  0.295
+ ],
+ "seasonal_naive|single": [
+  0.2
+ ],
+ "lightgbm|single": [
+  3.145
+ ],
+ "prophet|per_series": [
+  0.45
+ ],
+ "xgboost|global": [
+  3.813
+ ],
+ "lightgbm|global": [
+  1.289
+ ]
+}

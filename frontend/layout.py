@@ -1,9 +1,9 @@
 """Dash page layout.
 
-The body is a tabbed interface: one tab per pipeline stage. **All six tab panes are
-always mounted** — a clientside callback in callbacks.py toggles their ``style.display``
-when the active tab changes, so switching tabs never touches the server and never
-unmounts components.
+The body is a 3-section interface (Setup / Pipeline / Results). **All three section
+panes are always mounted** — a clientside callback in callbacks.py toggles their
+``style.display`` when the active section changes, so switching never touches the
+server and never unmounts components.
 
 This matters for correctness, not just speed: Dash fires callbacks whose Inputs are
 dynamically added or removed by another callback's render, *ignoring*
@@ -12,26 +12,29 @@ dynamically added or removed by another callback's render, *ignoring*
 spec — "Cannot read properties of undefined (reading 'run_id')"). Keeping everything
 mounted removes the whole class of bugs.
 
-Only the data-dependent bodies (``data-tab-results``, ``clean-tab-body``,
-``past-runs-list``) are re-rendered by server callbacks, and only when
-``results-store`` actually changes.
+Section anatomy (all six pre-refactor body div ids SURVIVE, re-parented, so every
+store-driven render callback keeps working):
+- **Setup**: ingestion form + past runs (left) · dataset profile ``data-tab-results``
+  + forecast-intent confirmation ``intent-form-body`` (right).
+- **Pipeline**: live stage rail ``stage-rail`` + log ``pipeline-log`` (left) · four
+  static ``ui.stage_card`` expanders wrapping ``clean-tab-body`` /
+  ``fcst-eda-tab-body`` / ``model-tab-body`` / ``training-tab-body`` (right).
+- **Results**: ``results-tab-body`` (leaderboard + charts + LLM report + downloads).
 
-Tabs are always clickable — there is no disabled/locked state. When a tab's prerequisite
-stage hasn't run yet, its content simply shows a short line of text saying so instead of
-blocking access to the tab itself.
+Tabs are always clickable — no disabled/locked state. When a section's prerequisite
+hasn't run yet, its content shows a short line of text saying so.
 """
 import dash_bootstrap_components as dbc
 from dash import dcc, html
 
+from frontend import ui
+
 # Tab definitions: (label, tab-id/value, icon). Each tab value maps to a pane id via
 # "tab-" → "pane-" (see the clientside pane switcher in callbacks.py).
 _TABS = [
-    ("Data & Pre-clean EDA", "tab-data",     "bi-search"),
-    ("Pipeline Setup",       "tab-clean",     "bi-scissors"),
-    ("Forecast EDA",         "tab-fcst-eda",  "bi-graph-up"),
-    ("Model Select",         "tab-model",     "bi-cpu"),
-    ("Training",             "tab-training",  "bi-lightning-fill"),
-    ("Results",              "tab-results",   "bi-trophy"),
+    ("Setup",    "tab-setup",    "bi-cloud-download"),
+    ("Pipeline", "tab-pipeline", "bi-diagram-3"),
+    ("Results",  "tab-results",  "bi-trophy"),
 ]
 
 TAB_VALUES = [value for _, value, _ in _TABS]
@@ -58,7 +61,7 @@ def _lbl(text):
     return dbc.Label(
         text, className="fw-semibold small mb-1",
         style={"fontSize": "0.68rem", "letterSpacing": "0.07em",
-               "textTransform": "uppercase", "color": "#94a3b8"},
+               "textTransform": "uppercase", "color": "var(--ink-muted)"},
     )
 
 
@@ -94,7 +97,7 @@ def _ingestion_form():
             className="mb-3",
             inputStyle={"marginRight": "6px", "accentColor": "#6366f1"},
             labelStyle={"display": "block", "marginBottom": "6px",
-                        "cursor": "pointer", "color": "#94a3b8", "fontSize": "0.85rem"},
+                        "cursor": "pointer", "color": "var(--ink-muted)", "fontSize": "0.85rem"},
         ),
 
         html.Div(id="section-db", children=[
@@ -157,16 +160,16 @@ def _ingestion_form():
             ),
             html.P("Read directly from disk — no upload, no size limit. The path must "
                    "exist on the machine running this app.",
-                   style={"fontSize": "0.7rem", "color": "#64748b"}, className="mb-2"),
+                   style={"fontSize": "0.7rem", "color": "var(--ink-faint)"}, className="mb-2"),
             html.Div("— or —", className="mb-2 text-center",
-                     style={"fontSize": "0.7rem", "color": "#475569"}),
+                     style={"fontSize": "0.7rem", "color": "var(--ink-ghost)"}),
             _lbl("Upload file (up to 100 MB)"),
             dcc.Upload(
                 id="upload-file",
                 children=html.Div([
                     _cicon("bi-cloud-upload", fontSize="1.4rem", color="#4b5563",
                            display="block", marginBottom="4px", marginRight="0"),
-                    html.Span("Drag & drop or ", style={"color": "#94a3b8"}),
+                    html.Span("Drag & drop or ", style={"color": "var(--ink-muted)"}),
                     html.A("browse", style={"color": "#6366f1", "cursor": "pointer"}),
                 ], style={"paddingTop": "12px"}),
                 style={
@@ -182,13 +185,23 @@ def _ingestion_form():
                 max_size=100 * 1024 * 1024,
             ),
             html.Div(id="upload-filename",
-                     style={"fontSize": "0.75rem", "color": "#94a3b8"}, className="mb-2"),
+                     style={"fontSize": "0.75rem", "color": "var(--ink-muted)"}, className="mb-2"),
             html.P("Supported: .csv  .xlsx  .xls  .parquet — files over 100 MB are "
                    "ignored by the uploader; paste the file path above instead.",
-                   style={"fontSize": "0.7rem", "color": "#64748b"}, className="mb-0"),
+                   style={"fontSize": "0.7rem", "color": "var(--ink-faint)"}, className="mb-0"),
         ]),
 
         html.Hr(className="my-3"),
+
+        # Auto-run: one click from ingest to report. Static/always mounted → safe as a
+        # State in every chain callback (no mount-fire). The one pause is the forecast-
+        # intent confirmation; the final report step calls the configured LLM.
+        dbc.Switch(
+            id="switch-auto-run", value=True,
+            label="Run everything automatically (pauses once to confirm the forecast "
+                  "setup; generates the LLM report at the end)",
+            className="mb-2", style={"fontSize": "0.78rem"},
+        ),
 
         dcc.Loading(
             children=[
@@ -245,7 +258,7 @@ def _data_source_card():
 def _past_runs_card():
     return dbc.Card(className="mt-3", children=[
         dbc.CardHeader([
-            _cicon("bi-clock-history", color="#475569"),
+            _cicon("bi-clock-history", color="var(--ink-ghost)"),
             "Past Runs",
         ]),
         # Children filled by render_data_pane (callbacks.py) at page load and on every
@@ -258,14 +271,46 @@ def _past_runs_card():
     ])
 
 
-def _data_pane():
+def _setup_pane():
     return dbc.Row([
         dbc.Col(width=3, children=[
             _data_source_card(),
             _past_runs_card(),
         ]),
-        # Right column: rebuilt by render_data_results whenever results-store changes.
-        dbc.Col(width=9, children=html.Div(id="data-tab-results")),
+        # Right column: dataset profile (rebuilt on store change) then the forecast-
+        # intent confirmation form — the pipeline's single user checkpoint lives on
+        # Setup so the whole decision surface is one screen.
+        dbc.Col(width=9, children=[
+            html.Div(id="data-tab-results"),
+            html.Div(id="intent-form-body", className="mt-3"),
+        ]),
+    ])
+
+
+def _pipeline_pane():
+    """Stage rail + log (left) · per-stage result cards (right). Card chrome is static —
+    only the badges and the body divs inside are updated by callbacks."""
+    return dbc.Row([
+        dbc.Col(width=3, children=[
+            dbc.Card([
+                dbc.CardHeader([_cicon("bi-diagram-3", color="#6366f1"), "Pipeline progress"]),
+                dbc.CardBody(html.Div(id="stage-rail"), className="py-2"),
+            ]),
+            dbc.Card(className="mt-3", children=[
+                dbc.CardHeader([_cicon("bi-terminal", color="var(--ink-ghost)"), "Log"]),
+                dbc.CardBody(html.Div(id="pipeline-log"), className="p-2"),
+            ]),
+        ]),
+        dbc.Col(width=9, children=[
+            ui.stage_card("clean", "Cleaning & Validation", "bi-scissors",
+                          html.Div(id="clean-tab-body")),
+            ui.stage_card("forecast_eda", "Forecast EDA", "bi-graph-up",
+                          html.Div(id="fcst-eda-tab-body")),
+            ui.stage_card("model_select", "Model Selection", "bi-cpu",
+                          html.Div(id="model-tab-body")),
+            ui.stage_card("train", "Training", "bi-lightning-fill",
+                          html.Div(id="training-tab-body"), open=True),
+        ]),
     ])
 
 
@@ -303,14 +348,20 @@ def create_layout():
             # so the loaded run/results aren't silently lost if the browser reloads.
             dcc.Store(id="results-store", storage_type="session"),
             dcc.Store(id="theme-store", data="dark", storage_type="local"),
+            # Auto-run state machine (phase: await_intent/train_pending/…). Session so a
+            # refresh mid-auto-run can resume; every dataset switch resets it.
+            dcc.Store(id="auto-run-store", storage_type="session"),
+            # Polls GET /runs/{id}/progress while a chain callback is in flight — every
+            # long callback enables it via running=. Drives ONLY the rail/log render.
+            dcc.Interval(id="progress-interval", interval=1500, disabled=True),
             # Root-level and always mounted: the download target must never be inside a
             # re-renderable pane body (outputting to an unmounted component fails silently).
             dcc.Download(id="download-forecast"),
 
-            # ── Stage tabs (static — always clickable, see _build_tabs docstring) ──
+            # ── Section tabs (static — always clickable, see _build_tabs docstring) ──
             dcc.Tabs(
                 id="stage-tabs",
-                value="tab-data",
+                value="tab-setup",
                 persistence=True,
                 className="stage-tabs",
                 parent_className="stage-tabs-parent",
@@ -330,17 +381,12 @@ def create_layout():
             # target_components covers the actual slow work (ingest / clean / load past
             # run all write results-store.data) so the overlay stays up for the whole
             # operation, not just the fast re-render that follows it.
+            # NOTE: the rail/log divs are deliberately NOT in target_components — the
+            # 1.5s progress polls must not flash the full-pane spinner.
             dcc.Loading(
                 html.Div(id="tab-content", className="mt-2", children=[
-                    html.Div(id="pane-data", children=_data_pane()),
-                    html.Div(id="pane-clean", style=_HIDDEN,
-                             children=html.Div(id="clean-tab-body")),
-                    html.Div(id="pane-fcst-eda", style=_HIDDEN,
-                             children=html.Div(id="fcst-eda-tab-body")),
-                    html.Div(id="pane-model", style=_HIDDEN,
-                             children=html.Div(id="model-tab-body")),
-                    html.Div(id="pane-training", style=_HIDDEN,
-                             children=html.Div(id="training-tab-body")),
+                    html.Div(id="pane-setup", children=_setup_pane()),
+                    html.Div(id="pane-pipeline", style=_HIDDEN, children=_pipeline_pane()),
                     html.Div(id="pane-results", style=_HIDDEN,
                              children=html.Div(id="results-tab-body")),
                 ]),

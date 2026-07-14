@@ -31,7 +31,7 @@ _C_SEASONAL = "#d97706"
 _C_RESID = "#e66767"
 _C_OVERLAY = [_C_SERIES, _C_TREND, _C_SEASONAL, _C_RESID]  # fixed slot order, never cycled
 
-_SH = {"color": "#94a3b8", "fontSize": "0.78rem", "textTransform": "uppercase",
+_SH = {"color": "var(--ink-muted)", "fontSize": "0.78rem", "textTransform": "uppercase",
        "letterSpacing": "0.06em"}
 
 _CONF_BADGE = {
@@ -53,7 +53,7 @@ def _lbl(text, confidence=None):
         kids.append(dbc.Badge(word, color=color, className="ms-2",
                               style={"fontSize": "0.6rem", "verticalAlign": "middle"}))
     return html.Label(kids, className="form-label",
-                      style={"fontSize": "0.8rem", "color": "#94a3b8"})
+                      style={"fontSize": "0.8rem", "color": "var(--ink-muted)"})
 
 
 def _datatable(rows, columns):
@@ -69,7 +69,7 @@ def _datatable(rows, columns):
             "fontFamily": "Inter, sans-serif", "whiteSpace": "normal", "height": "auto",
         },
         style_header={
-            "fontWeight": "600", "backgroundColor": "#1e2235", "color": "#64748b",
+            "fontWeight": "600", "backgroundColor": "#1e2235", "color": "var(--ink-faint)",
             "fontSize": "10px", "textTransform": "uppercase", "letterSpacing": "0.06em",
             "border": "none", "borderBottom": "1px solid rgba(255,255,255,0.10)",
             "fontFamily": "Inter, sans-serif",
@@ -125,7 +125,7 @@ def _graph(fig):
 def _chart_card(title, icon, graph, subtitle=None):
     body = [html.H6([_cicon(icon), title], className="fw-semibold mb-1", style=_SH)]
     if subtitle:
-        body.append(html.P(subtitle, style={"fontSize": "0.72rem", "color": "#64748b",
+        body.append(html.P(subtitle, style={"fontSize": "0.72rem", "color": "var(--ink-faint)",
                                             "marginBottom": "6px"}))
     body.append(graph)
     return dbc.Card(dbc.CardBody(body), className="mb-3")
@@ -193,8 +193,8 @@ def _tile(icon, label, value, sub=None, width=3):
     kids = [
         html.Div(
             [html.I(className=f"bi {icon}",
-                    style={"color": "#64748b", "marginRight": "4px", "fontSize": "0.7rem"}),
-             html.Span(label, style={"fontSize": "0.65rem", "color": "#94a3b8",
+                    style={"color": "var(--ink-faint)", "marginRight": "4px", "fontSize": "0.7rem"}),
+             html.Span(label, style={"fontSize": "0.65rem", "color": "var(--ink-muted)",
                                      "textTransform": "uppercase", "letterSpacing": "0.06em"})],
             className="d-flex align-items-center mb-1",
         ),
@@ -202,7 +202,7 @@ def _tile(icon, label, value, sub=None, width=3):
                                "letterSpacing": "-0.02em", "color": _TEXT}),
     ]
     if sub:
-        kids.append(html.Div(sub, style={"fontSize": "0.68rem", "color": "#64748b"}))
+        kids.append(html.Div(sub, style={"fontSize": "0.68rem", "color": "var(--ink-faint)"}))
     return dbc.Col(kids, width=width, className="mb-2")
 
 
@@ -260,9 +260,9 @@ def _setup_summary(selections):
     parts.append("exog: " + (", ".join(exog) if exog else "none"))
     return html.Div([
         html.Span([_cicon("bi-sliders"), "  ·  ".join(parts)],
-                  style={"fontSize": "0.78rem", "color": "#94a3b8"}),
+                  style={"fontSize": "0.78rem", "color": "var(--ink-muted)"}),
         html.Small("change on the Pipeline Setup tab",
-                   style={"color": "#64748b", "fontSize": "0.68rem"}),
+                   style={"color": "var(--ink-faint)", "fontSize": "0.68rem"}),
     ], className="d-flex justify-content-between align-items-center mb-2 px-1")
 
 
@@ -295,7 +295,7 @@ def _adjust_form(data, eda_exists):
     has_key = bool(group_cols)
 
     _radio_lbl = {"display": "block", "marginBottom": "4px", "cursor": "pointer",
-                  "color": "#94a3b8", "fontSize": "0.82rem"}
+                  "color": "var(--ink-muted)", "fontSize": "0.82rem"}
     key_hint = None
     if not has_key:
         key_hint = html.Div(
@@ -314,7 +314,7 @@ def _adjust_form(data, eda_exists):
     return dbc.Card(dbc.CardBody([
         html.P("Scope, frequency, horizon and exogenous drivers re-run from here "
                "without re-cleaning.",
-               style={"fontSize": "0.72rem", "color": "#64748b", "marginBottom": "8px"}),
+               style={"fontSize": "0.72rem", "color": "var(--ink-faint)", "marginBottom": "8px"}),
         dbc.Row([
             dbc.Col([
                 _lbl("Scope"),
@@ -370,7 +370,7 @@ def _payload_details(payload):
     return html.Details([
         html.Summary(
             [_cicon("bi-filetype-json", color="#6366f1"), "View model selection payload"],
-            style={"cursor": "pointer", "fontSize": "0.78rem", "color": "#94a3b8",
+            style={"cursor": "pointer", "fontSize": "0.78rem", "color": "var(--ink-muted)",
                    "userSelect": "none"},
         ),
         html.Pre(
@@ -482,7 +482,7 @@ def _exog_section(exog):
     out = [
         html.H6([_cicon("bi-diagram-3"), "Exogenous Drivers"],
                 className="fw-semibold mb-2 mt-3", style=_SH),
-        html.P(exog.get("note") or "", style={"fontSize": "0.72rem", "color": "#64748b",
+        html.P(exog.get("note") or "", style={"fontSize": "0.72rem", "color": "var(--ink-faint)",
                                               "marginBottom": "6px"}),
     ]
     cols = []
@@ -517,10 +517,10 @@ def _panel_section(full):
               sub="low = demand spread evenly across series"),
         dbc.Col([
             html.Div([html.I(className="bi bi-activity",
-                             style={"color": "#64748b", "marginRight": "4px",
+                             style={"color": "var(--ink-faint)", "marginRight": "4px",
                                     "fontSize": "0.7rem"}),
                       html.Span("Demand pattern mix",
-                                style={"fontSize": "0.65rem", "color": "#94a3b8",
+                                style={"fontSize": "0.65rem", "color": "var(--ink-muted)",
                                        "textTransform": "uppercase",
                                        "letterSpacing": "0.06em"})],
                      className="d-flex align-items-center mb-1"),
@@ -635,10 +635,10 @@ def _results_section(stage4):
 def render_fcst_eda_tab(data):
     if not data:
         return html.Div(
-            [_cicon("bi-info-circle", fontSize="2rem", color="#334155",
+            [_cicon("bi-info-circle", fontSize="2rem", color="var(--ink-ghost)",
                     display="block", marginBottom="12px", marginRight="0"),
              html.P("Load a dataset on the Data tab first.",
-                    style={"color": "#64748b", "fontSize": "0.9rem"})],
+                    style={"color": "var(--ink-faint)", "fontSize": "0.9rem"})],
             className="text-center mt-5 pt-4",
         )
 
@@ -649,11 +649,11 @@ def render_fcst_eda_tab(data):
 
     if not eda_exists and not data.get("_stage3"):
         return html.Div(
-            [_cicon("bi-info-circle", fontSize="2rem", color="#334155",
+            [_cicon("bi-info-circle", fontSize="2rem", color="var(--ink-ghost)",
                     display="block", marginBottom="12px", marginRight="0"),
              html.P("Confirm the forecast setup on the Pipeline Setup tab — the pipeline "
                     "runs cleaning, validation, forecast EDA and model selection in one go.",
-                    style={"color": "#64748b", "fontSize": "0.9rem"})],
+                    style={"color": "var(--ink-faint)", "fontSize": "0.9rem"})],
             className="text-center mt-5 pt-4",
         )
 

@@ -15,7 +15,7 @@ from frontend.ui import collapse_section
 
 _TEXT = "var(--bs-body-color)"
 
-_SH = {"color": "#94a3b8", "fontSize": "0.78rem", "textTransform": "uppercase",
+_SH = {"color": "var(--ink-muted)", "fontSize": "0.78rem", "textTransform": "uppercase",
        "letterSpacing": "0.06em"}
 
 _CONF_COLOR = {"high": "success", "medium": "info", "low": "warning"}
@@ -37,8 +37,8 @@ def _tile(icon, label, value, sub=None, width=3):
     kids = [
         html.Div(
             [html.I(className=f"bi {icon}",
-                    style={"color": "#64748b", "marginRight": "4px", "fontSize": "0.7rem"}),
-             html.Span(label, style={"fontSize": "0.65rem", "color": "#94a3b8",
+                    style={"color": "var(--ink-faint)", "marginRight": "4px", "fontSize": "0.7rem"}),
+             html.Span(label, style={"fontSize": "0.65rem", "color": "var(--ink-muted)",
                                      "textTransform": "uppercase", "letterSpacing": "0.06em"})],
             className="d-flex align-items-center mb-1",
         ),
@@ -46,7 +46,7 @@ def _tile(icon, label, value, sub=None, width=3):
                                "letterSpacing": "-0.02em", "color": _TEXT}),
     ]
     if sub:
-        kids.append(html.Div(sub, style={"fontSize": "0.68rem", "color": "#64748b"}))
+        kids.append(html.Div(sub, style={"fontSize": "0.68rem", "color": "var(--ink-faint)"}))
     return dbc.Col(kids, width=width, className="mb-2")
 
 
@@ -63,7 +63,7 @@ def _datatable(rows, columns):
             "fontFamily": "Inter, sans-serif", "whiteSpace": "normal", "height": "auto",
         },
         style_header={
-            "fontWeight": "600", "backgroundColor": "#1e2235", "color": "#64748b",
+            "fontWeight": "600", "backgroundColor": "#1e2235", "color": "var(--ink-faint)",
             "fontSize": "10px", "textTransform": "uppercase", "letterSpacing": "0.06em",
             "border": "none", "borderBottom": "1px solid rgba(255,255,255,0.10)",
             "fontFamily": "Inter, sans-serif",
@@ -93,7 +93,7 @@ def _decision_hero(sel):
     runner_line = []
     if runner:
         runner_line = [html.Div([
-            html.Span("Runner-up: ", style={"color": "#64748b", "fontSize": "0.75rem"}),
+            html.Span("Runner-up: ", style={"color": "var(--ink-faint)", "fontSize": "0.75rem"}),
             html.Span(labels.get(runner, runner),
                       style={"color": _TEXT, "fontSize": "0.78rem", "fontWeight": "600"}),
         ], className="mt-1")]
@@ -101,7 +101,7 @@ def _decision_hero(sel):
     return dbc.Card(dbc.CardBody([
         html.Div([
             html.Span([_cicon("bi-cpu"), "Selected Model"], style=_SH),
-            html.Small(picked_by, style={"color": "#64748b", "fontSize": "0.68rem"}),
+            html.Small(picked_by, style={"color": "var(--ink-faint)", "fontSize": "0.68rem"}),
         ], className="d-flex justify-content-between align-items-center mb-2"),
         html.Div([
             html.Span(model_label,
@@ -115,7 +115,7 @@ def _decision_hero(sel):
                       style={"verticalAlign": "middle"}),
         ], className="d-flex align-items-center flex-wrap mb-2"),
         html.P(sel.get("reason") or "", className="mb-0",
-               style={"fontSize": "0.85rem", "color": "#94a3b8"}),
+               style={"fontSize": "0.85rem", "color": "var(--ink-muted)"}),
         *runner_line,
     ]), className="mb-3", style={"borderLeft": "3px solid #6366f1"})
 
@@ -177,7 +177,7 @@ def _ranking_card(sel):
                       color="info" if e.get("source") == "llm" else "secondary",
                       style={"fontSize": "0.6rem"}),
             html.Div(e.get("reason") or "", style={"fontSize": "0.75rem",
-                                                   "color": "#94a3b8",
+                                                   "color": "var(--ink-muted)",
                                                    "marginLeft": "32px"}),
         ], className="mb-2"))
     return dbc.Card(dbc.CardBody([
@@ -185,7 +185,7 @@ def _ranking_card(sel):
                            style=_SH), className="mb-2"),
         html.P("Ranked by expected accuracy on this series' statistics. The top two are "
                "pre-selected on the Training tab — train up to five and compare.",
-               style={"fontSize": "0.75rem", "color": "#64748b"}, className="mb-2"),
+               style={"fontSize": "0.75rem", "color": "var(--ink-faint)"}, className="mb-2"),
         *rows,
     ]), className="mb-3")
 
@@ -208,10 +208,10 @@ def _hints_card(sel):
             badges.append(dbc.Badge(txt, color="secondary", className="me-1 mb-1"))
         exog_kids = [html.Div([
             html.Div([html.I(className="bi bi-diagram-3",
-                             style={"color": "#64748b", "marginRight": "4px",
+                             style={"color": "var(--ink-faint)", "marginRight": "4px",
                                     "fontSize": "0.7rem"}),
                       html.Span("Usable exogenous drivers (leading)",
-                                style={"fontSize": "0.65rem", "color": "#94a3b8",
+                                style={"fontSize": "0.65rem", "color": "var(--ink-muted)",
                                        "textTransform": "uppercase",
                                        "letterSpacing": "0.06em"})],
                      className="d-flex align-items-center mb-1"),
@@ -276,17 +276,17 @@ def _rule_trace(sel):
             html.Span(f"{mark} {t.get('rule')}",
                       style={"color": color, "fontWeight": "600", "fontSize": "0.78rem",
                              "minWidth": "42px", "display": "inline-block"}),
-            html.Span(t.get("detail") or "", style={"color": "#94a3b8", "fontSize": "0.78rem"}),
+            html.Span(t.get("detail") or "", style={"color": "var(--ink-muted)", "fontSize": "0.78rem"}),
         ], className="mb-1"))
 
     kids = [html.Div(rows, className="mt-2")]
     if llm.get("response"):
         kids.append(html.Div("Raw LLM response", className="mt-2 mb-1",
-                             style={"fontSize": "0.7rem", "color": "#64748b",
+                             style={"fontSize": "0.7rem", "color": "var(--ink-faint)",
                                     "textTransform": "uppercase", "letterSpacing": "0.06em"}))
         kids.append(html.Pre(json.dumps(llm["response"], indent=2),
                              style={"fontSize": "11px", "background": "#161b2e",
-                                    "color": "#94a3b8", "padding": "10px",
+                                    "color": "var(--ink-muted)", "padding": "10px",
                                     "borderRadius": "10px", "maxHeight": "260px",
                                     "overflowY": "auto"}))
     return collapse_section("Rule-engine trace", kids, icon="bi-diagram-2")
@@ -299,7 +299,7 @@ def _rerun_row(has_selection):
         dbc.Col(
             dbc.Switch(id="switch-model-llm", value=True,
                        label="Use LLM for model selection",
-                       style={"fontSize": "0.82rem", "color": "#94a3b8"},
+                       style={"fontSize": "0.82rem", "color": "var(--ink-muted)"},
                        className="mt-2"),
             md=7),
         dbc.Col(
@@ -322,10 +322,10 @@ def _rerun_row(has_selection):
 def render_model_tab(data):
     if not data:
         return html.Div(
-            [_cicon("bi-info-circle", fontSize="2rem", color="#334155",
+            [_cicon("bi-info-circle", fontSize="2rem", color="var(--ink-ghost)",
                     display="block", marginBottom="12px", marginRight="0"),
              html.P("Load a dataset on the Data tab first.",
-                    style={"color": "#64748b", "fontSize": "0.9rem"})],
+                    style={"color": "var(--ink-faint)", "fontSize": "0.9rem"})],
             className="text-center mt-5 pt-4",
         )
 
@@ -335,11 +335,11 @@ def render_model_tab(data):
 
     if not eda_exists and not sel:
         return html.Div(
-            [_cicon("bi-info-circle", fontSize="2rem", color="#334155",
+            [_cicon("bi-info-circle", fontSize="2rem", color="var(--ink-ghost)",
                     display="block", marginBottom="12px", marginRight="0"),
              html.P("Run the pipeline on the Pipeline Setup tab first — model "
                     "selection needs the forecast-EDA evidence.",
-                    style={"color": "#64748b", "fontSize": "0.9rem"})],
+                    style={"color": "var(--ink-faint)", "fontSize": "0.9rem"})],
             className="text-center mt-5 pt-4",
         )
 

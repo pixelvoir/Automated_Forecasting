@@ -1,5 +1,6 @@
 """API routes for pipeline runs."""
 import json
+import logging
 import shutil
 from pathlib import Path
 
@@ -7,7 +8,9 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, model_validator
 
 from api import jobs, tasks
-from pipeline import ingest  # list_tables only — light, stays in-process
+from pipeline import ingest, progress  # both light, stay in-process
+
+logger = logging.getLogger(__name__)
 
 ROOT = Path(__file__).resolve().parent.parent
 RUNS_DIR = ROOT / "runs"
@@ -204,80 +207,94 @@ def run_pre_clean_eda(run_id: str):
     return _run_job(tasks.eda_task, run_id, track_id=run_id)
 
 
+def _read_stage_json(path) -> dict | list | None:
+    """Read a stage JSON file, tolerating corruption. A hard crash mid-write (e.g. the
+    machine dying under memory pressure during training) can leave a file whose size was
+    committed to NTFS but whose data blocks are all NUL bytes — json.loads then raises
+    and, before this helper, 500'd the whole /summary so the run could never be reloaded.
+    A corrupt optional stage file now just means that stage shows as not-run in the UI."""
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError) as e:
+        logger.warning("Skipping corrupt stage file %s: %s", path, e)
+        return None
+
+
+@router.get("/{run_id}/progress")
+def get_progress(run_id: str):
+    """Live pipeline progress for the UI rail + log panel: runs/{id}/progress.json
+    (written by the job child / routes) plus a job-alive flag so the frontend can
+    render a stranded 'running' (killed job) as cancelled. Lightweight, NOT job-managed,
+    polled every ~1.5s while a stage is in flight."""
+    prog = _read_stage_json(RUNS_DIR / run_id / "progress.json") or {}
+    prog["job_active"] = jobs.active_track_id() == run_id
+    return prog
+
+
 @router.get("/{run_id}/summary")
 def get_run_summary(run_id: str):
     """Return metadata + Stage 2 results for a past run, read entirely from disk.
     Used to reload a run into the UI without touching the database."""
-    meta_path = RUNS_DIR / run_id / "metadata.json"
+    run_dir = RUNS_DIR / run_id
+    meta_path = run_dir / "metadata.json"
     if not meta_path.exists():
         raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found.")
-    data = json.loads(meta_path.read_text())
-    dp_path = RUNS_DIR / run_id / "cleaning_decision_payload.json"
-    if dp_path.exists():
-        data["_stage2"] = {"decision_payload": json.loads(dp_path.read_text())}
+    data = _read_stage_json(meta_path)
+    if data is None:
+        raise HTTPException(status_code=500,
+                            detail=f"Run '{run_id}' has a corrupt metadata.json — "
+                                   "re-ingest the dataset (or delete this run).")
+    dp = _read_stage_json(run_dir / "cleaning_decision_payload.json")
+    if dp is not None:
+        data["_stage2"] = {"decision_payload": dp}
 
-    recipe_path = RUNS_DIR / run_id / "cleaning_recipe.json"
-    report_path = RUNS_DIR / run_id / "cleaning_report.json"
-    vg_path = RUNS_DIR / run_id / "validation_gate.json"
-    status_path = RUNS_DIR / run_id / "cleaning_status.json"
-    if recipe_path.exists():
-        status = (
-            json.loads(status_path.read_text()) if status_path.exists()
-            else {"recipe_source": "unknown", "recipe_error": None}
-        )
+    recipe = _read_stage_json(run_dir / "cleaning_recipe.json")
+    if recipe is not None:
+        status = _read_stage_json(run_dir / "cleaning_status.json") \
+            or {"recipe_source": "unknown", "recipe_error": None}
         stage3: dict = {
             "recipe_source": status.get("recipe_source", "unknown"),
             "recipe_error": status.get("recipe_error"),
             "llm_model": status.get("llm_model"),
             "llm_response": status.get("llm_response"),
-            "recipe": json.loads(recipe_path.read_text()),
+            "recipe": recipe,
         }
-        if report_path.exists():
-            stage3.update(json.loads(report_path.read_text()))
-        if vg_path.exists():
-            stage3["_validation"] = json.loads(vg_path.read_text())
+        report = _read_stage_json(run_dir / "cleaning_report.json")
+        if report is not None:
+            stage3.update(report)
+        vg = _read_stage_json(run_dir / "validation_gate.json")
+        if vg is not None:
+            stage3["_validation"] = vg
         data["_stage3"] = stage3
 
     # Stage 2.5 — forecast intent: suggestions (detect + LLM) and the user-confirmed
     # selections are independent files (a run can have suggestions but no confirmation).
-    intent_path = RUNS_DIR / run_id / "forecast_intent.json"
-    fsel_path = RUNS_DIR / run_id / "forecast_user_selections.json"
-    if intent_path.exists() or fsel_path.exists():
+    suggestions = _read_stage_json(run_dir / "forecast_intent.json")
+    selections = _read_stage_json(run_dir / "forecast_user_selections.json")
+    if suggestions is not None or selections is not None:
         intent: dict = {}
-        if intent_path.exists():
-            intent["suggestions"] = json.loads(intent_path.read_text())
-        if fsel_path.exists():
-            intent["selections"] = json.loads(fsel_path.read_text())
+        if suggestions is not None:
+            intent["suggestions"] = suggestions
+        if selections is not None:
+            intent["selections"] = selections
         data["_intent"] = intent
 
     # Stage 4 — forecast EDA results
-    feda_path = RUNS_DIR / run_id / "forecasting_eda_full.json"
-    payload_path = RUNS_DIR / run_id / "model_selection_payload.json"
-    if feda_path.exists() and payload_path.exists():
-        data["_stage4"] = {"eda": {
-            "payload": json.loads(payload_path.read_text()),
-            "full": json.loads(feda_path.read_text()),
-        }}
+    feda = _read_stage_json(run_dir / "forecasting_eda_full.json")
+    payload = _read_stage_json(run_dir / "model_selection_payload.json")
+    if feda is not None and payload is not None:
+        data["_stage4"] = {"eda": {"payload": payload, "full": feda}}
 
-    # Stage 5 — model selection decision
-    msel_path = RUNS_DIR / run_id / "model_selection.json"
-    if msel_path.exists():
-        data["_stage5"] = json.loads(msel_path.read_text())
-
-    # Stage 6 — feature engineering recipe/report
-    fr_path = RUNS_DIR / run_id / "feature_report.json"
-    if fr_path.exists():
-        data["_stage6"] = json.loads(fr_path.read_text())
-
-    # Stage 7 — training results
-    tr_path = RUNS_DIR / run_id / "training_report.json"
-    if tr_path.exists():
-        data["_stage7"] = json.loads(tr_path.read_text())
-
-    # Stage 8 — persisted results report (opt-in LLM narrative)
-    rr_path = RUNS_DIR / run_id / "results_report.json"
-    if rr_path.exists():
-        data["_stage8"] = json.loads(rr_path.read_text())
+    # Stages 5–8 — one file each
+    for key, name in (("_stage5", "model_selection.json"),
+                      ("_stage6", "feature_report.json"),
+                      ("_stage7", "training_report.json"),
+                      ("_stage8", "results_report.json")):
+        content = _read_stage_json(run_dir / name)
+        if content is not None:
+            data[key] = content
 
     return data
 
@@ -384,22 +401,28 @@ def generate_report(run_id: str, req: ReportRequest):
                                    "training results.")
     from agents import results_agent
     from agents.llm_client import LLMError
+    # Not job-managed, so the route writes the progress bracket itself (in-process).
+    progress.stage_start(run_id, "report", detail=f"generating LLM report ({req.model})")
     try:
         report = results_agent.run(run_id, req.model)
     except ValueError as e:
+        progress.stage_finish(run_id, "report", status="failed", detail=str(e))
         raise HTTPException(status_code=400, detail=str(e))
     except LLMError as e:
+        progress.stage_finish(run_id, "report", status="failed",
+                              detail=f"report LLM call failed: {e}")
         raise HTTPException(status_code=502, detail=f"Report LLM call failed: {e}")
+    progress.stage_finish(run_id, "report", detail="insight report generated")
     return {"run_id": run_id, "status": "completed", "report": report}
 
 
 @router.get("/{run_id}/report")
 def get_report(run_id: str):
     """Re-read the persisted Stage 8 report (also folded into /summary as _stage8)."""
-    p = RUNS_DIR / run_id / "results_report.json"
-    if not p.exists():
+    report = _read_stage_json(RUNS_DIR / run_id / "results_report.json")
+    if report is None:
         raise HTTPException(status_code=404, detail="No report generated for this run yet.")
-    return json.loads(p.read_text())
+    return report
 
 
 @router.get("/{run_id}/forecast-file")
@@ -430,11 +453,22 @@ def download_forecast(run_id: str, model: str, fmt: str = "csv", level: str = "a
         if df.empty:
             raise HTTPException(status_code=404, detail=f"No forecast rows for '{model}'.")
         df = df[["unique_id", "ds", "predicted"]].rename(columns={"predicted": "yhat"})
+        # Split the composite series key back into the user's original columns
+        # (feature_builder joins group_cols with " / " to form unique_id) so the file
+        # carries e.g. store_nbr + family instead of an opaque combined id.
+        sel = _read_stage_json(RUNS_DIR / run_id / "forecast_user_selections.json") or {}
+        group_cols = sel.get("group_cols") or []
+        if len(group_cols) > 1:
+            parts = df["unique_id"].str.split(" / ", n=len(group_cols) - 1, expand=True)
+            if parts.shape[1] == len(group_cols) and not parts.isna().any().any():
+                parts.columns = group_cols
+                df = pd.concat([parts, df.drop(columns=["unique_id"])], axis=1)
+        elif len(group_cols) == 1:
+            df = df.rename(columns={"unique_id": group_cols[0]})
     else:
-        tr_path = RUNS_DIR / run_id / "training_report.json"
-        if not tr_path.exists():
+        report = _read_stage_json(RUNS_DIR / run_id / "training_report.json")
+        if report is None:
             raise HTTPException(status_code=404, detail="No training report for this run.")
-        report = json.loads(tr_path.read_text())
         entry = next((e for e in report.get("results") or [] if e.get("model") == model), None)
         if entry is None or entry.get("error") or not (entry.get("forecast") or {}).get("ds"):
             raise HTTPException(status_code=404,
@@ -484,6 +518,7 @@ def run_clean(run_id: str, req: CleanRequest = CleanRequest()):
     # features, training) — remove them so /summary can't resurrect a stale result if the
     # chain aborts early.
     _purge_downstream(run_id)
+    progress.reset_downstream(run_id, "clean")
 
     result = _run_job(tasks.clean_task, run_id, use_llm=req.use_llm, track_id=run_id)
     return {"run_id": run_id, "status": "completed", **result}
@@ -565,6 +600,7 @@ def run_forecast_eda(run_id: str, req: ForecastEDARequest = ForecastEDARequest()
         if req.scope:
             sel["scope"] = req.scope
         sel_path.write_text(json.dumps(sel, indent=2))
+    progress.reset_downstream(run_id, "forecast_eda")
     return _run_job(tasks.forecast_eda_task, run_id, track_id=run_id)
 
 
@@ -585,6 +621,20 @@ def run_model_select(run_id: str, req: ModelSelectRequest = ModelSelectRequest()
             status_code=400,
             detail="Run forecast EDA first — model selection needs its evidence payload.")
     return _run_job(tasks.model_select_task, run_id, use_llm=req.use_llm, track_id=run_id)
+
+
+@router.get("/{run_id}/train-estimate")
+def train_estimate(run_id: str, models: str = "", profile: str | None = None):
+    """Authoritative wall-clock cost estimate for a training request (the Training tab's
+    live banner calls this as the selection changes). Same numbers as the /train heavy
+    gate — the frontend keeps only a rough client-side fallback. Lightweight, NOT
+    job-managed."""
+    run_dir = RUNS_DIR / run_id
+    if not run_dir.exists():
+        raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found.")
+    from pipeline import trainer  # lazy — keeps API startup light
+    ids = [m for m in (models or "").split(",") if m]
+    return trainer.estimate_for_run(run_id, ids, profile or None)
 
 
 class TrainRequest(BaseModel):
@@ -639,20 +689,22 @@ def run_train(run_id: str, req: TrainRequest = TrainRequest()):
                                 detail="No trainable model selected. Pick at least one "
                                        "eligible model.")
 
-    n_series = 1
-    payload_path = run_dir / "model_selection_payload.json"
-    if payload_path.exists():
-        panel = (json.loads(payload_path.read_text()).get("panel") or {})
-        n_series = panel.get("n_series") or 1
-
-    estimate = trainer.estimate_cost(n_series, policy, valid, trainer._load_config())
+    estimate = trainer.estimate_for_run(run_id, valid, req.profile)
     if estimate["tier"] == "heavy" and not req.confirm_heavy:
         raise HTTPException(status_code=400, detail={
-            "message": "Training this many series/models is heavy — confirm to proceed.",
+            "message": "This training request is estimated to take a while — confirm "
+                       "to proceed.",
             "estimate": estimate, "needs_confirm": True})
 
     # A re-train invalidates any Stage 8 narrative written about the old training.
     (run_dir / "results_report.json").unlink(missing_ok=True)
+    # Seed the progress ETA before the job child boots, so the UI rail shows the
+    # expected duration within one poll tick (the child's stage_start keeps it).
+    progress.reset_downstream(run_id, "train")
+    progress.stage_start(
+        run_id, "train",
+        detail=f"training {len(valid)} model(s) + baseline — est ~{max(round(estimate['est_seconds'] / 60), 1)} min",
+        eta_seconds=estimate["est_seconds"])
 
     result = _run_job(tasks.train_task, run_id, valid, confirm_heavy=req.confirm_heavy,
                       profile=req.profile, track_id=run_id)

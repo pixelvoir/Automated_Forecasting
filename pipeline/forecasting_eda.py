@@ -25,6 +25,8 @@ import numpy as np
 import pandas as pd
 import yaml
 
+from pipeline import progress
+
 ROOT = Path(__file__).resolve().parent.parent
 RUNS_DIR = ROOT / "runs"
 CLEANED_DIR = ROOT / "data" / "cleaned"
@@ -738,13 +740,18 @@ def run(run_id: str) -> dict:
     if len(y) < 10:
         raise ValueError(
             f"Only {len(y)} points at {freq_label} granularity — too short to analyze.")
+    progress.stage_update(run_id, "forecast_eda",
+                          f"series built ({len(y)} points) — running statistics", 1, 5)
     stats = _series_stats(y, freq_label, cfg)
     period = stats["seasonality"]["primary_period"] or 1
+    progress.stage_update(run_id, "forecast_eda",
+                          "seasonality/stationarity done — exogenous analysis", 2, 5)
     exog_stats = _exog_analysis(y, exog, period, cfg)
 
     panel = None
     per_series_deep = []
     if selections["scope"] == "per_series" and group_cols:
+        progress.stage_update(run_id, "forecast_eda", "per-series panel summary", 3, 5)
         alias = _pandas_freq(freq_label, df[ts_col])
         panel = _panel_summary(df, ts_col, target, group_cols,
                                selections["agg"], alias, grid_len=len(y))
@@ -764,6 +771,7 @@ def run(run_id: str) -> dict:
             s = _series_stats(ys, freq_label, cfg)
             per_series_deep.append({"key": entry["key"], "fill_report": fr, "stats": s})
 
+    progress.stage_update(run_id, "forecast_eda", "building decision payload", 4, 5)
     payload = _build_payload(stats, selections, exog_stats, fill_report, panel)
 
     full = {

@@ -34,6 +34,14 @@ def _entry(func, args, kwargs, q):
         q.put({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
 
 
+def active_track_id() -> str | None:
+    """The track_id of the currently-running job, or None. Read-only — lets the
+    /progress route tell a live 'running' stage from one stranded by a kill."""
+    with _lock:
+        p = _active["proc"]
+        return _active["track_id"] if (p is not None and p.is_alive()) else None
+
+
 def cancel_active() -> bool:
     """Terminate the currently running job, if any. Returns True if something was killed."""
     with _lock:

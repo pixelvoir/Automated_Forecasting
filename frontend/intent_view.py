@@ -31,7 +31,7 @@ def _lbl(text, confidence=None):
         kids.append(dbc.Badge(word, color=color, className="ms-2",
                               style={"fontSize": "0.6rem", "verticalAlign": "middle"}))
     return html.Label(kids, className="form-label",
-                      style={"fontSize": "0.8rem", "color": "#94a3b8"})
+                      style={"fontSize": "0.8rem", "color": "var(--ink-muted)"})
 
 
 def llm_intent_banner(suggestions: dict):
@@ -128,7 +128,7 @@ def build_intent_form(suggestions: dict, selections: dict | None, already_run: b
                            id="btn-intent-redetect", color="link", size="sm",
                            className="p-0 text-decoration-none"),
             ], className="d-flex justify-content-between align-items-center mb-2"),
-            html.P(note, style={"fontSize": "0.75rem", "color": "#64748b"}, className="mb-3"),
+            html.P(note, style={"fontSize": "0.75rem", "color": "var(--ink-faint)"}, className="mb-3"),
 
             dbc.Row([
                 dbc.Col([
@@ -169,7 +169,7 @@ def build_intent_form(suggestions: dict, selections: dict | None, already_run: b
                         value=scope_default,
                         inputStyle={"marginRight": "6px", "accentColor": "#6366f1"},
                         labelStyle={"display": "block", "marginBottom": "4px",
-                                    "cursor": "pointer", "color": "#94a3b8",
+                                    "cursor": "pointer", "color": "var(--ink-muted)",
                                     "fontSize": "0.82rem"},
                     ),
                 ], md=4),
@@ -183,7 +183,7 @@ def build_intent_form(suggestions: dict, selections: dict | None, already_run: b
                                      style={"fontSize": "0.85rem"}),
                         html.Small(
                             "Also used to clean each series within its own boundary.",
-                            style={"color": "#64748b", "fontSize": "0.7rem"}),
+                            style={"color": "var(--ink-faint)", "fontSize": "0.7rem"}),
                     ]),
                 ], md=8),
             ], className="mb-3"),
@@ -217,14 +217,14 @@ def build_intent_form(suggestions: dict, selections: dict | None, already_run: b
                  "Scope, frequency and horizon can be changed later on the Forecast EDA tab "
                  "without re-cleaning. The series key, target and aggregation affect cleaning, "
                  "so changing those re-runs the pipeline from here."],
-                className="d-block mb-3", style={"color": "#64748b", "fontSize": "0.72rem"}),
+                className="d-block mb-3", style={"color": "var(--ink-faint)", "fontSize": "0.72rem"}),
 
             dbc.Row([
                 dbc.Col([
                     dbc.Switch(id="switch-use-llm", value=True,
                                label="Use LLM for pipeline (cleaning recipe + model selection)",
                                className="mt-1",
-                               style={"fontSize": "0.82rem", "color": "#94a3b8"}),
+                               style={"fontSize": "0.82rem", "color": "var(--ink-muted)"}),
                 ], md=6),
             ], className="mb-2"),
 
@@ -241,7 +241,7 @@ def build_intent_form(suggestions: dict, selections: dict | None, already_run: b
             ),
             html.Small("Runs the full pipeline: clean → validate → forecast EDA → model selection.",
                        className="d-block text-center mt-1",
-                       style={"color": "#64748b", "fontSize": "0.7rem"}),
+                       style={"color": "var(--ink-faint)", "fontSize": "0.7rem"}),
         ]),
         className="mb-3",
         style={"background": "rgba(30, 41, 59, 0.7)",
@@ -257,7 +257,7 @@ def detect_prompt_card():
         html.P("Scans the data and suggests the forecast target, timestamp, series "
                "grouping and horizon (LLM-assisted) — you confirm everything before "
                "cleaning runs.",
-               style={"fontSize": "0.8rem", "color": "#94a3b8"}),
+               style={"fontSize": "0.8rem", "color": "var(--ink-muted)"}),
         dcc.Loading(
             dbc.Button([_cicon("bi-search"), "Detect Forecast Setup"],
                        id="btn-intent-redetect", color="primary",

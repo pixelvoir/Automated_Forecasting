@@ -112,6 +112,9 @@ clientside_callback(
     f"""
     function(tab) {{
         const order = {json.dumps(TAB_VALUES)};
+        // dcc.Tabs persistence restores pre-refactor values ("tab-data", "tab-clean",
+        // "tab-training"…) from old sessions — without this fallback EVERY pane hides.
+        if (!order.includes(tab)) {{ tab = 'tab-setup'; }}
         return order.map(t => (t === tab ? {{display: 'block'}} : {{display: 'none'}}));
     }}
     """,
@@ -249,6 +252,7 @@ def toggle_query(n_clicks, is_open):
 @callback(
     Output("results-store", "data"),
     Output("alert-div", "children"),
+    Output("auto-run-store", "data", allow_duplicate=True),
     Input("btn-run", "n_clicks"),
     State("source-radio", "value"),
     State("dropdown-table", "value"),
@@ -261,13 +265,15 @@ def toggle_query(n_clicks, is_open):
     State("upload-file", "contents"),
     State("upload-file", "filename"),
     State("input-file-path", "value"),
-    running=[(Output("btn-run", "disabled"), True, False)],
+    State("switch-auto-run", "value"),
+    running=[(Output("btn-run", "disabled"), True, False),
+             (Output("progress-interval", "disabled"), False, True)],
     prevent_initial_call=True,
 )
 def trigger_run(n_clicks, source, table, query, host, port, database, user, password,
-                upload_contents, upload_filename, file_path):
+                upload_contents, upload_filename, file_path, auto_run):
     if not n_clicks:
-        return no_update, no_update
+        return no_update, no_update, no_update
     if source == "file":
         # A pasted local path wins: zero copies — the API streams straight from disk
         # (the upload route base64-inflates the whole file through browser + Dash RAM,
@@ -278,29 +284,30 @@ def trigger_run(n_clicks, source, table, query, host, port, database, user, pass
             if not p.is_file():
                 return no_update, dbc.Alert(
                     f"File not found: {path} — the path must exist on the machine "
-                    "running this app.", color="warning", dismissable=True)
+                    "running this app.", color="warning", dismissable=True), no_update
             if p.suffix.lower() not in (".csv", ".xlsx", ".xls", ".parquet"):
                 return no_update, dbc.Alert(
                     "Unsupported file type — use .csv, .xlsx, .xls or .parquet.",
-                    color="warning", dismissable=True)
+                    color="warning", dismissable=True), no_update
             payload = {"source": "file", "file_path": str(p)}
         elif upload_contents:
             try:
                 tmp_path = _save_upload(upload_contents, upload_filename)
             except Exception as e:
-                return no_update, dbc.Alert(f"Could not process upload: {e}", color="danger", dismissable=True)
+                return no_update, dbc.Alert(f"Could not process upload: {e}",
+                                            color="danger", dismissable=True), no_update
             payload = {"source": "file", "file_path": tmp_path}
         else:
             return no_update, dbc.Alert(
                 "Provide a file: paste a local path (any size), or upload one up to "
-                "100 MB.", color="warning", dismissable=True)
+                "100 MB.", color="warning", dismissable=True), no_update
 
     else:  # database
         if not all([host, database, user, password]):
             return no_update, dbc.Alert(
                 "Fill in all credential fields and click Connect first.",
                 color="warning", dismissable=True,
-            )
+            ), no_update
         if query and query.strip():
             payload = {"source": "database", "query": query.strip()}
         elif table:
@@ -309,7 +316,7 @@ def trigger_run(n_clicks, source, table, query, host, port, database, user, pass
             return no_update, dbc.Alert(
                 "Select a table from the dropdown or enter a custom query.",
                 color="warning", dismissable=True,
-            )
+            ), no_update
         payload["credentials"] = {
             "host": host.strip(),
             "port": int(port) if port else 5432,
@@ -322,7 +329,8 @@ def trigger_run(n_clicks, source, table, query, host, port, database, user, pass
         run_resp = requests.post(f"{API_URL}/runs", json=payload, timeout=1800)  # 30 min for large tables
         if not run_resp.ok:
             detail = run_resp.json().get("detail", "Unknown error")
-            return no_update, dbc.Alert(f"Run failed: {detail}", color="danger", dismissable=True)
+            return no_update, dbc.Alert(f"Run failed: {detail}", color="danger",
+                                        dismissable=True), None
 
         run_data = run_resp.json()
         run_id = run_data["run_id"]
@@ -330,21 +338,21 @@ def trigger_run(n_clicks, source, table, query, host, port, database, user, pass
         meta_resp = requests.get(f"{API_URL}/runs/{run_id}/metadata", timeout=15)
         if not meta_resp.ok:
             return no_update, dbc.Alert(
-                f"Run completed ({run_id}) but metadata fetch failed.", color="warning", dismissable=True
-            )
+                f"Run completed ({run_id}) but metadata fetch failed.", color="warning",
+                dismissable=True), None
 
         full_data = meta_resp.json()
         full_data["_summary"] = run_data
 
         # Auto-trigger Stage 2 immediately after Stage 1. If this fails or gets preempted,
-        # say so explicitly — the "Run Pre-clean EDA" button on the Data tab lets the user
-        # retry rather than silently ending up with no Stage 2 and no explanation.
+        # say so explicitly — the "Run Pre-clean EDA" button lets the user retry rather
+        # than silently ending up with no Stage 2 and no explanation.
         try:
             eda_resp = requests.post(f"{API_URL}/runs/{run_id}/pre-clean-eda", timeout=600)  # 10 min for large tables
             if eda_resp.ok:
                 full_data["_stage2"] = eda_resp.json()
                 # Auto-chain Stage 2.5: intent suggestions are ready by the time the
-                # user opens the Pipeline Setup tab.
+                # user scrolls to the forecast setup form.
                 intent = _fetch_intent(run_id)
                 if intent:
                     full_data["_intent"] = {"suggestions": intent}
@@ -354,30 +362,38 @@ def trigger_run(n_clicks, source, table, query, host, port, database, user, pass
                     f"Ingested {run_id}, but pre-clean EDA failed: {detail}. "
                     "Use the \"Run Pre-clean EDA\" button below to retry.",
                     color="warning", dismissable=True,
-                )
+                ), None
         except Exception as e:
             return full_data, dbc.Alert(
                 f"Ingested {run_id}, but pre-clean EDA failed: {e}. "
                 "Use the \"Run Pre-clean EDA\" button below to retry.",
                 color="warning", dismissable=True,
-            )
+            ), None
 
+        # Auto mode: pause ONCE at the intent confirmation — the banner on the setup
+        # form explains, and confirm_and_run carries the phase forward.
+        auto_state = ({"mode": "auto", "run_id": run_id, "phase": "await_intent"}
+                      if auto_run and full_data.get("_intent") else None)
+        note = (" Review the forecast setup on the right and confirm to continue the "
+                "automated run." if auto_state else "")
         return full_data, dbc.Alert(
-            f"Completed: {run_id}", color="success", dismissable=True, duration=6000
-        )
+            f"Completed: {run_id}.{note}", color="success", dismissable=True,
+            duration=None if auto_state else 6000
+        ), auto_state
 
     except requests.exceptions.Timeout:
         return no_update, dbc.Alert(
             "Request timed out after 30 minutes — the dataset may be too large to ingest fully. "
             "Set 'row_limit' in config/settings.yaml to cap rows (e.g. row_limit: 500000).",
             color="danger", dismissable=True,
-        )
+        ), None
     except requests.exceptions.ConnectionError:
         return no_update, dbc.Alert(
             "Cannot reach API — is run_dev.bat running?", color="danger", dismissable=True
-        )
+        ), None
     except Exception as e:
-        return no_update, dbc.Alert(f"Unexpected error: {e}", color="danger", dismissable=True)
+        return no_update, dbc.Alert(f"Unexpected error: {e}", color="danger",
+                                    dismissable=True), None
 
 
 # ── 5. Data pane — everything driven by the store, in one round trip ────────
@@ -405,7 +421,166 @@ def render_data_pane(data):
     Input("results-store", "data"),
 )
 def render_clean_body(data):
-    return _render_clean_tab(data)
+    """Cleaning & Validation card body (Pipeline section) — results only; the intent
+    form lives on Setup (render_intent_form)."""
+    stage3 = (data or {}).get("_stage3") or {}
+    if not stage3:
+        return html.P("Runs when you confirm the forecast setup on the Setup section.",
+                      style={"color": "var(--ink-faint)", "fontSize": "0.85rem"}, className="mb-0")
+    return html.Div([_llm_status_banner(stage3), *_render_stage3(stage3)])
+
+
+@callback(
+    Output("intent-form-body", "children"),
+    Input("results-store", "data"),
+    State("auto-run-store", "data"),
+)
+def render_intent_form(data, auto_state):
+    """The forecast-intent confirmation form on the Setup section — the pipeline's
+    single user checkpoint. In auto mode a pause banner makes the state explicit."""
+    if not data or "_stage2" not in data:
+        return None
+    intent = data.get("_intent") or {}
+    suggestions = intent.get("suggestions")
+    stage3 = data.get("_stage3", {})
+
+    header = html.Div([html.Span([_cicon("bi-sliders"), "Forecast setup"],
+                                 className="fw-semibold section-title")], className="mb-3")
+    kids = [header]
+    if (auto_state or {}).get("phase") == "await_intent":
+        kids.append(dbc.Alert(
+            [_cicon("bi-pause-circle"),
+             html.Strong("Auto-run paused — review the forecast setup below and click "
+                         "Confirm & Run Pipeline. "),
+             "Everything after that (clean → validate → EDA → model select → training → "
+             "report) runs without further input."],
+            color="info", className="py-2"))
+    if not suggestions:
+        kids.append(intent_view.detect_prompt_card())
+    else:
+        kids += [intent_view.llm_intent_banner(suggestions),
+                 intent_view.build_intent_form(suggestions, intent.get("selections"),
+                                               already_run=bool(stage3))]
+    return html.Div(kids)
+
+
+# ── Pipeline progress rail + log (polled while any chain callback is in flight) ──
+# The interval only drives this render — results still arrive on the blocking HTTP
+# responses. Old runs without progress.json fall back to store-derived done/pending.
+
+_QUEUEABLE = ["clean", "validate", "forecast_eda", "model_select", "train", "report"]
+
+
+def _store_stage_statuses(data) -> dict:
+    d = data or {}
+    st = {}
+    if d.get("run_id"):
+        st["ingest"] = {"status": "done"}
+    if d.get("_stage2"):
+        st["pre_clean_eda"] = {"status": "done"}
+    if (d.get("_intent") or {}).get("suggestions"):
+        st["intent"] = {"status": "done"}
+    if d.get("_stage3"):
+        st["clean"] = {"status": "done"}
+        if (d.get("_stage3") or {}).get("_validation"):
+            st["validate"] = {"status": "done"}
+    if d.get("_stage4"):
+        st["forecast_eda"] = {"status": "done"}
+    if d.get("_stage5"):
+        st["model_select"] = {"status": "done"}
+    if d.get("_stage7"):
+        st["train"] = {"status": "done"}
+    if d.get("_stage8"):
+        st["report"] = {"status": "done"}
+    return st
+
+
+@callback(
+    Output("stage-rail", "children"),
+    Output("pipeline-log", "children"),
+    Output("stage-badge-clean", "children"),
+    Output("stage-badge-forecast_eda", "children"),
+    Output("stage-badge-model_select", "children"),
+    Output("stage-badge-train", "children"),
+    Input("progress-interval", "n_intervals"),
+    Input("results-store", "data"),
+    State("auto-run-store", "data"),
+)
+def render_progress(_n, data, auto_state):
+    """Merge order: store-derived done markers → progress.json (richer, live) →
+    'cancelled' override for a running stage whose job is dead → 'queued' markers from
+    the auto-run phase. Never writes results-store."""
+    statuses = _store_stage_statuses(data)
+    log_events = []
+    run_id = (data or {}).get("run_id")
+    file_train_done = False
+    if run_id:
+        try:
+            prog = requests.get(f"{API_URL}/runs/{run_id}/progress", timeout=2).json()
+            job_active = bool(prog.get("job_active"))
+            for k, v in (prog.get("stages") or {}).items():
+                v = dict(v or {})
+                # A stage left 'running' by a killed job renders as cancelled — except
+                # 'report', which runs in-process (never owned by the job slot).
+                if v.get("status") == "running" and not job_active and k != "report":
+                    v["status"] = "cancelled"
+                statuses[k] = {**(statuses.get(k) or {}), **v}
+            log_events = prog.get("log") or []
+            file_train_done = ((prog.get("stages") or {}).get("train") or {}) \
+                .get("status") == "done"
+        except (requests.RequestException, ValueError):
+            pass
+
+    phase = (auto_state or {}).get("phase")
+    if phase == "await_intent":
+        queue_from = _QUEUEABLE
+    elif phase == "train_pending":
+        queue_from = ["train", "report"]
+    else:
+        queue_from = []
+    for k in queue_from:
+        if (statuses.get(k) or {}).get("status") in (None, "pending"):
+            statuses[k] = {**(statuses.get(k) or {}), "status": "queued"}
+
+    rail_kids = [ui.stage_rail(statuses)]
+    # Training finished server-side but this session missed the response (refresh /
+    # closed tab mid-run) → offer a one-click resync from disk.
+    if file_train_done and not (data or {}).get("_stage7"):
+        rail_kids.append(dbc.Button(
+            [_cicon("bi-arrow-repeat"), "Resync results"], id="btn-resync-run",
+            color="secondary", size="sm", outline=True, className="w-100 mt-2"))
+
+    def badge(key):
+        e = statuses.get(key) or {}
+        return ui.stage_badge(e.get("status"), e.get("seconds"))
+
+    return (html.Div(rail_kids), ui.log_panel(log_events),
+            badge("clean"), badge("forecast_eda"), badge("model_select"), badge("train"))
+
+
+@callback(
+    Output("results-store", "data", allow_duplicate=True),
+    Output("cleaning-status", "children", allow_duplicate=True),
+    Input("btn-resync-run", "n_clicks"),
+    State("results-store", "data"),
+    running=[(Output("btn-resync-run", "disabled"), True, False)],
+    prevent_initial_call=True,
+)
+def resync_run(n_clicks, data):
+    """Pull the run's full state from disk (same mechanism as loading a past run) when
+    the session missed a blocking response — e.g. refreshed mid-training."""
+    if not n_clicks or not (data or {}).get("run_id"):
+        return no_update, no_update
+    run_id = data["run_id"]
+    try:
+        resp = requests.get(f"{API_URL}/runs/{run_id}/summary", timeout=10)
+        if resp.ok:
+            return resp.json(), ""
+        return no_update, dbc.Alert("Could not resync this run.", color="warning",
+                                    dismissable=True, className="mb-2")
+    except requests.RequestException as e:
+        return no_update, dbc.Alert(f"Could not resync: {e}", color="warning",
+                                    dismissable=True, className="mb-2")
 
 
 @callback(
@@ -440,12 +615,32 @@ def _training_default_profile() -> str:
     return _TRAIN_CFG_CACHE.get("accuracy_profile") or "balanced"
 
 
+def _fetch_train_estimate(run_id, models, profile):
+    """Server-side wall-clock estimate for the banner (same math as the /train heavy
+    gate). None = API unreachable → the banner says so instead of showing stale numbers."""
+    if not run_id or not models:
+        return None
+    try:
+        resp = requests.get(f"{API_URL}/runs/{run_id}/train-estimate",
+                            params={"models": ",".join(models),
+                                    "profile": profile or ""}, timeout=15)
+        return resp.json() if resp.ok else None
+    except requests.RequestException:
+        return None
+
+
 @callback(
     Output("training-tab-body", "children"),
     Input("results-store", "data"),
 )
 def render_training_body(data):
-    return training_view.render_training_tab(data, default_profile=_training_default_profile())
+    profile = _training_default_profile()
+    est = None
+    if data and data.get("_stage5"):
+        est = _fetch_train_estimate(data.get("run_id"),
+                                    training_view.default_selection(data), profile)
+    return training_view.render_training_controls(data, default_profile=profile,
+                                                  initial_estimate=est)
 
 
 @callback(
@@ -478,10 +673,10 @@ def _cicon(name, **style):
 def _no_data_placeholder():
     return html.Div(
         [
-            _cicon("bi-arrow-left-circle", fontSize="2rem", color="#334155",
+            _cicon("bi-arrow-left-circle", fontSize="2rem", color="var(--ink-ghost)",
                    display="block", marginBottom="12px", marginRight="0"),
             html.P("Select a data source and click Run Ingestion.",
-                   style={"color": "#64748b", "fontSize": "0.9rem"}),
+                   style={"color": "var(--ink-faint)", "fontSize": "0.9rem"}),
         ],
         className="text-center mt-5 pt-4",
     )
@@ -501,8 +696,8 @@ def _render_data_results(data):
     def _metric(icon, label, value, col_width=2):
         return dbc.Col([
             html.Div(
-                [html.I(className=f"bi {icon}", style={"color": "#64748b", "marginRight": "4px", "fontSize": "0.7rem"}),
-                 html.Span(label, style={"fontSize": "0.65rem", "color": "#94a3b8", "textTransform": "uppercase",
+                [html.I(className=f"bi {icon}", style={"color": "var(--ink-faint)", "marginRight": "4px", "fontSize": "0.7rem"}),
+                 html.Span(label, style={"fontSize": "0.65rem", "color": "var(--ink-muted)", "textTransform": "uppercase",
                                          "letterSpacing": "0.06em"})],
                 className="d-flex align-items-center mb-1",
             ),
@@ -594,7 +789,7 @@ def _cleaning_hint(data):
             [
                 html.P(
                     "Pre-clean EDA hasn't run for this dataset yet.",
-                    style={"color": "#94a3b8", "fontSize": "0.85rem", "marginBottom": "8px"},
+                    style={"color": "var(--ink-muted)", "fontSize": "0.85rem", "marginBottom": "8px"},
                 ),
                 dcc.Loading(
                     dbc.Button(
@@ -624,29 +819,31 @@ def _cleaning_hint(data):
 @callback(
     Output("results-store", "data", allow_duplicate=True),
     Output("stage-tabs", "value", allow_duplicate=True),
+    Output("auto-run-store", "data", allow_duplicate=True),
     Input("btn-clear-results", "n_clicks"),
     running=[(Output("btn-clear-results", "disabled"), True, False)],
     prevent_initial_call=True,
 )
 def clear_results(n_clicks):
     if not n_clicks:
-        return no_update, no_update
+        return no_update, no_update, no_update
     _cancel_running()
-    return None, "tab-data"
+    return None, "tab-setup", None
 
 
 @callback(
     Output("results-store", "data", allow_duplicate=True),
     Output("stage-tabs", "value", allow_duplicate=True),
+    Output("auto-run-store", "data", allow_duplicate=True),
     Input("btn-new-run", "n_clicks"),
     running=[(Output("btn-new-run", "disabled"), True, False)],
     prevent_initial_call=True,
 )
 def new_dataset(n_clicks):
     if not n_clicks:
-        return no_update, no_update
+        return no_update, no_update, no_update
     _cancel_running()
-    return None, "tab-data"
+    return None, "tab-setup", None
 
 
 # ── 9. Past-runs list ─────────────────────────────────────────────────────
@@ -736,24 +933,29 @@ def delete_run(n_clicks_list):
 @callback(
     Output("results-store", "data", allow_duplicate=True),
     Output("cleaning-status", "children", allow_duplicate=True),
+    Output("auto-run-store", "data", allow_duplicate=True),
     Input({"type": "btn-past-run", "run_id": ALL}, "n_clicks"),
     running=_RUNS_LIST_LOCK,
     prevent_initial_call=True,
 )
 def load_past_run(n_clicks_list):
     if not ctx.triggered_id or not any(v for v in n_clicks_list if v):
-        return no_update, no_update
+        return no_update, no_update, no_update
     # Switching datasets stops any heavy stage still crunching for the current one.
     _cancel_running()
     run_id = ctx.triggered_id["run_id"]
     try:
         resp = requests.get(f"{API_URL}/runs/{run_id}/summary", timeout=10)
         if resp.ok:
-            return resp.json(), ""
-        detail = resp.json().get("detail", "Could not load this run.")
-        return no_update, dbc.Alert(detail, color="danger", dismissable=True, className="mb-2")
+            # None also clears any stale auto-run phase from a previous dataset.
+            return resp.json(), "", None
+        try:
+            detail = resp.json().get("detail", "Could not load this run.")
+        except ValueError:  # unhandled server error → plain-text body, not JSON
+            detail = f"Could not load this run (HTTP {resp.status_code})."
+        return no_update, dbc.Alert(detail, color="danger", dismissable=True, className="mb-2"), no_update
     except Exception as e:
-        return no_update, dbc.Alert(f"Could not load run: {e}", color="danger", dismissable=True, className="mb-2")
+        return no_update, dbc.Alert(f"Could not load run: {e}", color="danger", dismissable=True, className="mb-2"), no_update
 
 
 # ── Retry pre-clean EDA from the Data tab (auto-run after ingest can fail/get preempted) ──
@@ -763,7 +965,8 @@ def load_past_run(n_clicks_list):
     Output("cleaning-status", "children", allow_duplicate=True),
     Input("btn-run-eda", "n_clicks"),
     State("results-store", "data"),
-    running=[(Output("btn-run-eda", "disabled"), True, False)],
+    running=[(Output("btn-run-eda", "disabled"), True, False),
+             (Output("progress-interval", "disabled"), False, True)],
     prevent_initial_call=True,
 )
 def run_eda_retry(n_clicks, store_data):
@@ -800,7 +1003,7 @@ def _render_stage2(stage2: dict) -> list:
     if not dp:
         return []
 
-    _sh = {"color": "#94a3b8", "fontSize": "0.78rem", "textTransform": "uppercase", "letterSpacing": "0.06em"}
+    _sh = {"color": "var(--ink-muted)", "fontSize": "0.78rem", "textTransform": "uppercase", "letterSpacing": "0.06em"}
 
     sections = [
         html.Hr(className="my-4"),
@@ -837,7 +1040,7 @@ def _render_stage2(stage2: dict) -> list:
             [html.P(
                 "Temporal % uses rolling-window IQR — significantly lower than IQR % "
                 "signals seasonal inflation, not noise.",
-                style={"fontSize": "0.72rem", "color": "#64748b", "marginBottom": "6px"}),
+                style={"fontSize": "0.72rem", "color": "var(--ink-faint)", "marginBottom": "6px"}),
              _datatable(outlier_rows, ["Column", "IQR %", "Z-score %", "MAD %", "Temporal %"])],
             icon="bi-diagram-3"))
 
@@ -889,7 +1092,7 @@ def _datatable(rows, columns):
         style_header={
             "fontWeight": "600",
             "backgroundColor": "#1e2235",
-            "color": "#64748b",
+            "color": "var(--ink-faint)",
             "fontSize": "10px",
             "textTransform": "uppercase",
             "letterSpacing": "0.06em",
@@ -909,15 +1112,17 @@ def _fmt(v: float) -> str:
 
 
 # ── 11. Confirm intent → clean → validate → forecast EDA (one chain) ─────────
-# The Pipeline Setup tab's confirm button drives the whole pipeline through Stage 5.
+# The Setup section's confirm button drives the whole pipeline through Stage 5.
 # Outputs to cleaning-status (persistent in layout) instead of any dynamically rendered
 # component, so the store update always reaches the pane renderers regardless of
-# component lifecycle timing in Dash 4. On full success the UI lands on Forecast EDA.
+# component lifecycle timing in Dash 4. On full success the UI lands on the Pipeline
+# section; in auto mode it then hands off to auto_run_train via auto-run-store.
 
 @callback(
     Output("results-store", "data", allow_duplicate=True),
     Output("cleaning-status", "children"),
     Output("stage-tabs", "value", allow_duplicate=True),
+    Output("auto-run-store", "data", allow_duplicate=True),
     Input("btn-confirm-run", "n_clicks"),
     State("results-store", "data"),
     State("dropdown-intent-ts", "value"),
@@ -929,24 +1134,28 @@ def _fmt(v: float) -> str:
     State("dropdown-intent-freq", "value"),
     State("input-intent-horizon", "value"),
     State("switch-use-llm", "value"),
-    running=[(Output("btn-confirm-run", "disabled"), True, False)],
+    State("switch-auto-run", "value"),
+    running=[(Output("btn-confirm-run", "disabled"), True, False),
+             (Output("progress-interval", "disabled"), False, True)],
     prevent_initial_call=True,
 )
 def confirm_and_run(n_clicks, store_data, ts, target, agg, scope, group_cols,
-                    exog, freq, horizon, use_llm):
+                    exog, freq, horizon, use_llm, auto_run):
     if not n_clicks or not store_data:
-        return no_update, no_update, no_update
+        return no_update, no_update, no_update, no_update
     run_id = store_data.get("run_id")
+    _fail_auto = ({"mode": "auto", "run_id": run_id, "phase": "failed"}
+                  if auto_run else no_update)
     if not run_id:
-        return no_update, dbc.Alert("No active run found.", color="warning", className="mb-2"), no_update
+        return no_update, dbc.Alert("No active run found.", color="warning", className="mb-2"), no_update, no_update
     if not ts or not target:
         return no_update, dbc.Alert(
             "Confirm the timestamp and target columns first.",
-            color="warning", dismissable=True, className="mb-2"), no_update
+            color="warning", dismissable=True, className="mb-2"), no_update, no_update
     if scope == "per_series" and not group_cols:
         return no_update, dbc.Alert(
             "Per-series scope needs at least one series-key column (or switch to Overall).",
-            color="warning", dismissable=True, className="mb-2"), no_update
+            color="warning", dismissable=True, className="mb-2"), no_update, no_update
 
     body = {
         "timestamp_col": ts,
@@ -965,12 +1174,12 @@ def confirm_and_run(n_clicks, store_data, ts, target, agg, scope, group_cols,
         if clean_resp.status_code == 409:
             return no_update, dbc.Alert(
                 "This request was cancelled by a newer action. Click the run button again.",
-                color="warning", dismissable=True, className="mb-2"), no_update
+                color="warning", dismissable=True, className="mb-2"), no_update, _fail_auto
         if not clean_resp.ok:
             detail = clean_resp.json().get("detail", "Cleaning failed")
             return no_update, dbc.Alert(
                 f"Cleaning error: {detail}", color="danger", dismissable=True,
-                className="mb-2"), no_update
+                className="mb-2"), "tab-pipeline", _fail_auto
 
         stage3_data = clean_resp.json()
         validate_resp = requests.post(f"{API_URL}/runs/{run_id}/validate", timeout=300)
@@ -992,13 +1201,13 @@ def confirm_and_run(n_clicks, store_data, ts, target, agg, scope, group_cols,
         if eda_resp.status_code == 409:
             return new_store, dbc.Alert(
                 "Cleaning + validation finished, but forecast EDA was preempted by a "
-                "newer action — re-run it from the Forecast EDA tab.",
-                color="warning", dismissable=True, className="mb-2"), no_update
+                "newer action — re-run it from the Forecast EDA card on Pipeline.",
+                color="warning", dismissable=True, className="mb-2"), no_update, _fail_auto
         if not eda_resp.ok:
             detail = eda_resp.json().get("detail", "Forecast EDA failed")
             return new_store, dbc.Alert(
                 f"Cleaning + validation finished, but forecast EDA failed: {detail}",
-                color="danger", dismissable=True, className="mb-2"), no_update
+                color="danger", dismissable=True, className="mb-2"), "tab-pipeline", _fail_auto
 
         result = eda_resp.json()
         # run() may refine the selections (e.g. force nunique for a non-numeric target)
@@ -1011,7 +1220,10 @@ def confirm_and_run(n_clicks, store_data, ts, target, agg, scope, group_cols,
                                   json={"use_llm": bool(use_llm)}, timeout=300)
         if msel_resp.ok:
             new_store["_stage5"] = msel_resp.json().get("selection")
-            return new_store, "", "tab-fcst-eda"
+            # Auto mode: hand off to auto_run_train (fires on this store write).
+            next_auto = ({"mode": "auto", "run_id": run_id, "phase": "train_pending"}
+                         if auto_run else None)
+            return new_store, "", "tab-pipeline", next_auto
         # EDA succeeded — keep it, but surface the selection failure visibly (house
         # rule: a 409 must never look like "nothing happened").
         if msel_resp.status_code == 409:
@@ -1021,22 +1233,23 @@ def confirm_and_run(n_clicks, store_data, ts, target, agg, scope, group_cols,
                         + msel_resp.json().get("detail", "unknown error"))
         return new_store, dbc.Alert(
             f"Pipeline finished through forecast EDA, but {msel_msg} — "
-            "re-run it from the Model Select tab.",
-            color="warning", dismissable=True, className="mb-2"), "tab-fcst-eda"
+            "re-run it from the Model Selection card on Pipeline.",
+            color="warning", dismissable=True, className="mb-2"), "tab-pipeline", _fail_auto
 
     except requests.exceptions.Timeout:
         return no_update, dbc.Alert(
             "The pipeline timed out after 30 minutes.", color="danger",
-            dismissable=True, className="mb-2"), no_update
+            dismissable=True, className="mb-2"), no_update, _fail_auto
     except requests.exceptions.ConnectionError:
         return no_update, dbc.Alert(
             "Cannot reach API — is run_dev.bat running?", color="danger",
-            dismissable=True, className="mb-2"), no_update
+            dismissable=True, className="mb-2"), no_update, _fail_auto
     except Exception as e:
-        return no_update, dbc.Alert(str(e), color="danger", dismissable=True, className="mb-2"), no_update
+        return no_update, dbc.Alert(str(e), color="danger", dismissable=True,
+                                    className="mb-2"), no_update, _fail_auto
 
 
-# ── Tab 2: Cleaning ────────────────────────────────────────────────────────
+# ── Cleaning results (Pipeline section card body) ────────────────────────────
 
 def _llm_response_details(stage3: dict):
     """Collapsible, theme-matched view of the model's raw JSON response. Shown on
@@ -1049,7 +1262,7 @@ def _llm_response_details(stage3: dict):
         [
             html.Summary(
                 [_cicon("bi-chat-square-text", color="#6366f1"), "View LLM response"],
-                style={"cursor": "pointer", "fontSize": "0.78rem", "color": "#94a3b8",
+                style={"cursor": "pointer", "fontSize": "0.78rem", "color": "var(--ink-muted)",
                        "userSelect": "none"},
             ),
             html.Pre(
@@ -1119,52 +1332,11 @@ def _llm_status_banner(stage3: dict):
     )
 
 
-def _render_clean_tab(data):
-    """Pipeline Setup: the pipeline's single user checkpoint. Intent form (Stage 2.5
-    suggestions, LLM-refined) on top; cleaning recipe/results + validation gate below
-    once the confirm chain has run."""
-    if not data or "_stage2" not in data:
-        return html.Div(
-            [_cicon("bi-info-circle", fontSize="2rem", color="#334155",
-                    display="block", marginBottom="12px", marginRight="0"),
-             html.P("Run pre-clean EDA on the Data tab first.",
-                    style={"color": "#64748b", "fontSize": "0.9rem"})],
-            className="text-center mt-5 pt-4",
-        )
-
-    intent = data.get("_intent") or {}
-    suggestions = intent.get("suggestions")
-    stage3 = data.get("_stage3", {})
-
-    header = html.Div([
-        html.Span([_cicon("bi-sliders"), "Pipeline Setup"],
-                  className="fw-semibold section-title"),
-    ], className="mb-3")
-
-    if not suggestions:
-        # Auto-detection after Stage 2 failed or this is an older run — offer it here.
-        return html.Div([
-            header,
-            intent_view.detect_prompt_card(),
-            _llm_status_banner(stage3),
-            *(_render_stage3(stage3) if stage3 else []),
-        ])
-
-    return html.Div([
-        header,
-        intent_view.llm_intent_banner(suggestions),
-        intent_view.build_intent_form(suggestions, intent.get("selections"),
-                                      already_run=bool(stage3)),
-        _llm_status_banner(stage3),
-        *(_render_stage3(stage3) if stage3 else []),
-    ])
-
-
 def _render_stage3(stage3: dict) -> list:
     if not stage3:
         return []
 
-    _sh = {"color": "#94a3b8", "fontSize": "0.78rem", "textTransform": "uppercase", "letterSpacing": "0.06em"}
+    _sh = {"color": "var(--ink-muted)", "fontSize": "0.78rem", "textTransform": "uppercase", "letterSpacing": "0.06em"}
 
     rows_before = stage3.get("rows_before", "—")
     rows_after = stage3.get("rows_after", "—")
@@ -1186,28 +1358,28 @@ def _render_stage3(stage3: dict) -> list:
     sections.append(
         dbc.Card(dbc.CardBody(dbc.Row([
             dbc.Col([
-                html.Div([html.I(className="bi bi-table", style={"marginRight": "4px", "color": "#64748b", "fontSize": "0.7rem"}),
-                          html.Span("Rows before", style={"fontSize": "0.65rem", "color": "#94a3b8", "textTransform": "uppercase"})],
+                html.Div([html.I(className="bi bi-table", style={"marginRight": "4px", "color": "var(--ink-faint)", "fontSize": "0.7rem"}),
+                          html.Span("Rows before", style={"fontSize": "0.65rem", "color": "var(--ink-muted)", "textTransform": "uppercase"})],
                          className="d-flex align-items-center mb-1"),
                 html.Div(f"{rows_before:,}" if isinstance(rows_before, int) else str(rows_before),
                          style={"fontSize": "1rem", "fontWeight": "700", "color": _TEXT}),
             ], width=3),
             dbc.Col([
-                html.Div([html.I(className="bi bi-table", style={"marginRight": "4px", "color": "#64748b", "fontSize": "0.7rem"}),
-                          html.Span("Rows after", style={"fontSize": "0.65rem", "color": "#94a3b8", "textTransform": "uppercase"})],
+                html.Div([html.I(className="bi bi-table", style={"marginRight": "4px", "color": "var(--ink-faint)", "fontSize": "0.7rem"}),
+                          html.Span("Rows after", style={"fontSize": "0.65rem", "color": "var(--ink-muted)", "textTransform": "uppercase"})],
                          className="d-flex align-items-center mb-1"),
                 html.Div(f"{rows_after:,}" if isinstance(rows_after, int) else str(rows_after),
                          style={"fontSize": "1rem", "fontWeight": "700", "color": _TEXT}),
             ], width=3),
             dbc.Col([
-                html.Div([html.I(className="bi bi-percent", style={"marginRight": "4px", "color": "#64748b", "fontSize": "0.7rem"}),
-                          html.Span("Row loss", style={"fontSize": "0.65rem", "color": "#94a3b8", "textTransform": "uppercase"})],
+                html.Div([html.I(className="bi bi-percent", style={"marginRight": "4px", "color": "var(--ink-faint)", "fontSize": "0.7rem"}),
+                          html.Span("Row loss", style={"fontSize": "0.65rem", "color": "var(--ink-muted)", "textTransform": "uppercase"})],
                          className="d-flex align-items-center mb-1"),
                 html.Div(f"{row_loss_pct}%", style={"fontSize": "1rem", "fontWeight": "700", "color": _TEXT}),
             ], width=3),
             dbc.Col([
-                html.Div([html.I(className="bi bi-columns-gap", style={"marginRight": "4px", "color": "#64748b", "fontSize": "0.7rem"}),
-                          html.Span("Cols dropped", style={"fontSize": "0.65rem", "color": "#94a3b8", "textTransform": "uppercase"})],
+                html.Div([html.I(className="bi bi-columns-gap", style={"marginRight": "4px", "color": "var(--ink-faint)", "fontSize": "0.7rem"}),
+                          html.Span("Cols dropped", style={"fontSize": "0.65rem", "color": "var(--ink-muted)", "textTransform": "uppercase"})],
                          className="d-flex align-items-center mb-1"),
                 html.Div(str(len(cols_dropped)), style={"fontSize": "1rem", "fontWeight": "700", "color": _TEXT}),
             ], width=3),
@@ -1223,7 +1395,7 @@ def _render_stage3(stage3: dict) -> list:
         drift_color = "#e66767" if drift_bad else "#059669"
         sections.append(dbc.Card(dbc.CardBody(html.Div([
             html.Span(f"Target '{stage3.get('target_col')}' total: ",
-                      style={"fontSize": "0.8rem", "color": "#94a3b8"}),
+                      style={"fontSize": "0.8rem", "color": "var(--ink-muted)"}),
             html.Span(f"{stage3['target_total_before']:,.0f} → "
                       f"{(stage3.get('target_total_after') or 0):,.0f} ",
                       style={"fontSize": "0.85rem", "fontWeight": "600", "color": _TEXT}),
@@ -1308,7 +1480,8 @@ def _render_stage3(stage3: dict) -> list:
     Output("cleaning-status", "children", allow_duplicate=True),
     Input("btn-intent-redetect", "n_clicks"),
     State("results-store", "data"),
-    running=[(Output("btn-intent-redetect", "disabled"), True, False)],
+    running=[(Output("btn-intent-redetect", "disabled"), True, False),
+             (Output("progress-interval", "disabled"), False, True)],
     prevent_initial_call=True,
 )
 def run_intent_redetect(n_clicks, store_data):
@@ -1394,7 +1567,8 @@ def sync_fcst_horizon(date, freq, store_data, current):
     State("radio-fcst-scope", "value"),
     State("dropdown-fcst-exog", "value"),
     State("switch-use-llm", "value"),
-    running=[(Output("btn-fcst-rerun", "disabled"), True, False)],
+    running=[(Output("btn-fcst-rerun", "disabled"), True, False),
+             (Output("progress-interval", "disabled"), False, True)],
     prevent_initial_call=True,
 )
 def rerun_fcst_eda(n_clicks, store_data, freq, horizon, scope, exog, use_llm):
@@ -1465,7 +1639,8 @@ def rerun_fcst_eda(n_clicks, store_data, freq, horizon, scope, exog, use_llm):
     Input("btn-model-rerun", "n_clicks"),
     State("results-store", "data"),
     State("switch-model-llm", "value"),
-    running=[(Output("btn-model-rerun", "disabled"), True, False)],
+    running=[(Output("btn-model-rerun", "disabled"), True, False),
+             (Output("progress-interval", "disabled"), False, True)],
     prevent_initial_call=True,
 )
 def run_model_select(n_clicks, store_data, use_llm):
@@ -1519,7 +1694,8 @@ def run_model_select(n_clicks, store_data, use_llm):
 def update_train_estimate(models, profile, store_data):
     if not store_data:
         return no_update
-    return training_view.build_estimate_banner(store_data, models or [], profile)
+    est = _fetch_train_estimate(store_data.get("run_id"), models or [], profile)
+    return training_view.build_estimate_banner(store_data, models or [], profile, est=est)
 
 
 @callback(
@@ -1561,6 +1737,55 @@ def update_train_chart(model_id, series, store_data):
             training_view._insights_strip(entry))
 
 
+def _post_train(run_id, store_data, models, confirm, profile):
+    """POST /train with the full error mapping, shared by the manual Train button and
+    the auto-run orchestrator. Returns (new_store | None, alert | None) — exactly one
+    is non-None."""
+    body = {"models": models, "confirm_heavy": bool(confirm), "profile": profile or None}
+    try:
+        resp = requests.post(f"{API_URL}/runs/{run_id}/train", json=body, timeout=3600)
+        if resp.status_code == 409:
+            return None, dbc.Alert(
+                "This request was cancelled by a newer action. Click Train again.",
+                color="warning", dismissable=True, className="mb-2")
+        if resp.status_code == 400:
+            detail = resp.json().get("detail")
+            # The heavy-cost gate returns a dict detail carrying the estimate.
+            if isinstance(detail, dict) and detail.get("needs_confirm"):
+                est = detail.get("estimate", {})
+                eta = training_view._fmt_duration(est.get("est_seconds"))
+                return None, dbc.Alert(
+                    [_cicon("bi-exclamation-triangle"),
+                     f"{detail.get('message', 'Heavy training request.')} "
+                     f"Estimated ~{eta} across {est.get('n_series')} series. "
+                     "Enable “Confirm — train anyway” and click Train again."],
+                    color="warning", dismissable=True, className="mb-2")
+            msg = detail if isinstance(detail, str) else "Training request rejected."
+            return None, dbc.Alert(msg, color="danger", dismissable=True, className="mb-2")
+        if not resp.ok:
+            detail = resp.json().get("detail", "Training failed")
+            return None, dbc.Alert(
+                f"Training error: {detail}", color="danger", dismissable=True,
+                className="mb-2")
+        payload = resp.json()
+        new_store = {**store_data, "_stage7": payload.get("report")}
+        if payload.get("feature_report"):
+            new_store["_stage6"] = payload["feature_report"]
+        # A retrain invalidates the Stage 8 narrative (the route deleted it on disk).
+        new_store.pop("_stage8", None)
+        return new_store, None
+    except requests.exceptions.Timeout:
+        return None, dbc.Alert(
+            "Training timed out after 60 minutes.", color="danger",
+            dismissable=True, className="mb-2")
+    except requests.exceptions.ConnectionError:
+        return None, dbc.Alert(
+            "Cannot reach API — is run_dev.bat running?", color="danger",
+            dismissable=True, className="mb-2")
+    except Exception as e:
+        return None, dbc.Alert(str(e), color="danger", dismissable=True, className="mb-2")
+
+
 @callback(
     Output("results-store", "data", allow_duplicate=True),
     Output("cleaning-status", "children", allow_duplicate=True),
@@ -1570,12 +1795,13 @@ def update_train_chart(model_id, series, store_data):
     State("dropdown-train-models", "value"),
     State("switch-train-confirm", "value"),
     State("dropdown-train-profile", "value"),
-    running=[(Output("btn-train", "disabled"), True, False)],
+    running=[(Output("btn-train", "disabled"), True, False),
+             (Output("progress-interval", "disabled"), False, True)],
     prevent_initial_call=True,
 )
 def run_training(n_clicks, store_data, models, confirm, profile):
-    """Stages 6+7 for the user-selected models. Lands on the Training tab on success; a
-    heavy-cost 400 tells the user to enable the confirm switch and retry."""
+    """Stages 6+7 for the user-selected models (manual re-run path). Lands on the
+    Results section on success; a heavy-cost 400 prompts for the confirm switch."""
     if not n_clicks or not store_data:
         return no_update, no_update, no_update
     run_id = store_data.get("run_id")
@@ -1585,48 +1811,87 @@ def run_training(n_clicks, store_data, models, confirm, profile):
         return no_update, dbc.Alert(
             "Select at least one model to train.", color="warning",
             dismissable=True, className="mb-2"), no_update
-    body = {"models": models, "confirm_heavy": bool(confirm), "profile": profile or None}
+    new_store, alert = _post_train(run_id, store_data, models, confirm, profile)
+    if new_store is None:
+        return no_update, alert, no_update
+    return new_store, "", "tab-results"
+
+
+# ── Auto-run orchestrator (phase 3: train → report, zero clicks) ──────────────
+# Fires on auto-run-store writes; confirm_and_run sets phase="train_pending" in auto
+# mode. Guards are the store-Input analog of the n_clicks mount-fire guard — this
+# Input re-fires on every page load with persisted session data.
+
+@callback(
+    Output("results-store", "data", allow_duplicate=True),
+    Output("cleaning-status", "children", allow_duplicate=True),
+    Output("auto-run-store", "data", allow_duplicate=True),
+    Output("stage-tabs", "value", allow_duplicate=True),
+    Input("auto-run-store", "data"),
+    State("results-store", "data"),
+    running=[(Output("btn-train", "disabled"), True, False),
+             (Output("btn-confirm-run", "disabled"), True, False),
+             (Output("progress-interval", "disabled"), False, True)],
+    prevent_initial_call=True,
+)
+def auto_run_train(auto_state, store_data):
+    if not auto_state or auto_state.get("phase") != "train_pending":
+        return no_update, no_update, no_update, no_update
+    run_id = (store_data or {}).get("run_id")
+    if not run_id or run_id != auto_state.get("run_id") or not store_data.get("_stage5"):
+        return no_update, no_update, no_update, no_update
+
+    # Refresh-safety: if training is ALREADY running server-side (page reloaded
+    # mid-auto-run), re-POSTing would preempt and KILL it — track it instead.
     try:
-        resp = requests.post(f"{API_URL}/runs/{run_id}/train", json=body, timeout=3600)
-        if resp.status_code == 409:
+        prog = requests.get(f"{API_URL}/runs/{run_id}/progress", timeout=5).json()
+        train_st = ((prog.get("stages") or {}).get("train") or {}).get("status")
+        if train_st == "running" and prog.get("job_active"):
             return no_update, dbc.Alert(
-                "This request was cancelled by a newer action. Click Train again.",
-                color="warning", dismissable=True, className="mb-2"), no_update
-        if resp.status_code == 400:
-            detail = resp.json().get("detail")
-            # The heavy-cost gate returns a dict detail carrying the estimate.
-            if isinstance(detail, dict) and detail.get("needs_confirm"):
-                est = detail.get("estimate", {})
-                return no_update, dbc.Alert(
-                    [_cicon("bi-exclamation-triangle"),
-                     f"{detail.get('message', 'Heavy training request.')} "
-                     f"(~{est.get('units')} units across {est.get('n_series')} series). "
-                     "Enable “Confirm — train anyway” and click Train again."],
-                    color="warning", dismissable=True, className="mb-2"), no_update
-            msg = detail if isinstance(detail, str) else "Training request rejected."
-            return no_update, dbc.Alert(msg, color="danger", dismissable=True, className="mb-2"), no_update
-        if not resp.ok:
-            detail = resp.json().get("detail", "Training failed")
-            return no_update, dbc.Alert(
-                f"Training error: {detail}", color="danger", dismissable=True,
-                className="mb-2"), no_update
-        payload = resp.json()
-        new_store = {**store_data, "_stage7": payload.get("report")}
-        if payload.get("feature_report"):
-            new_store["_stage6"] = payload["feature_report"]
-        # A retrain invalidates the Stage 8 narrative (the route deleted it on disk).
-        new_store.pop("_stage8", None)
-        return new_store, "", "tab-training"
-    except requests.exceptions.Timeout:
+                "Training is already running on the server — the Pipeline rail is "
+                "tracking it. Reload the run from Past Runs when it finishes.",
+                color="info", dismissable=True, className="mb-2"), \
+                {**auto_state, "phase": "running_train"}, "tab-pipeline"
+    except requests.RequestException:
+        pass
+
+    models = training_view.default_selection(store_data)
+    if not models:
         return no_update, dbc.Alert(
-            "Training timed out after 60 minutes.", color="danger",
-            dismissable=True, className="mb-2"), no_update
-    except requests.exceptions.ConnectionError:
-        return no_update, dbc.Alert(
-            "Cannot reach API — is run_dev.bat running?", color="danger",
-            dismissable=True, className="mb-2"), no_update
-    except Exception as e:
-        return no_update, dbc.Alert(str(e), color="danger", dismissable=True, className="mb-2"), no_update
+            "Auto-run: no eligible models to train — pick models on the Pipeline "
+            "section's Training card.", color="warning", dismissable=True,
+            className="mb-2"), {**auto_state, "phase": "failed"}, no_update
+    profile = _training_default_profile()
+
+    # confirm_heavy=True: auto mode bypasses the heavy gate — the ETA is visible in
+    # the rail (the route seeds it into progress.json before dispatch).
+    new_store, alert = _post_train(run_id, store_data, models, True, profile)
+    if new_store is None:
+        return no_update, alert, {**auto_state, "phase": "failed"}, no_update
+
+    # Auto-generate the Stage 8 report (the auto-run switch is the explicit opt-in).
+    best = (new_store.get("_stage7") or {}).get("best_model")
+    report_note = ""
+    if best:
+        try:
+            resp = requests.post(f"{API_URL}/runs/{run_id}/report",
+                                 json={"model": best}, timeout=300)
+            if resp.ok:
+                new_store["_stage8"] = resp.json().get("report")
+            else:
+                report_note = (" The insight report failed ("
+                               + str(resp.json().get("detail", "LLM error"))[:200]
+                               + ") — generate it manually from the Results section.")
+        except requests.RequestException as e:
+            report_note = (f" The insight report failed ({e}) — generate it manually "
+                           "from the Results section.")
+
+    status = dbc.Alert(
+        [_cicon("bi-check-circle-fill"),
+         "Auto-run complete — models trained and results ready." + report_note],
+        color="success" if not report_note else "warning",
+        dismissable=True, className="mb-2")
+    return new_store, status, {**auto_state, "phase": "done"}, "tab-results"
 
 
 # ── Tab 6: Results (Stage 8) ─────────────────────────────────────────────────
@@ -1638,7 +1903,14 @@ def run_training(n_clicks, store_data, models, confirm, profile):
     Input("results-store", "data"),
 )
 def render_results_body(data):
-    return results_view.render_results_tab(data)
+    """Results section = training results (leaderboard/chart/insights, moved here from
+    the old Training tab) + the LLM report and forecast downloads."""
+    report = (data or {}).get("_stage7")
+    blocks = []
+    if data and report:
+        blocks.append(html.Div(training_view.results_block(data, report)))
+    blocks.append(results_view.render_results_tab(data))
+    return html.Div(blocks)
 
 
 @callback(
@@ -1647,7 +1919,8 @@ def render_results_body(data):
     Input("btn-generate-report", "n_clicks"),
     State("results-store", "data"),
     State("dropdown-results-model", "value"),
-    running=[(Output("btn-generate-report", "disabled"), True, False)],
+    running=[(Output("btn-generate-report", "disabled"), True, False),
+             (Output("progress-interval", "disabled"), False, True)],
     prevent_initial_call=True,
 )
 def generate_results_report(n_clicks, store_data, model):

@@ -7,6 +7,63 @@
 /* ── Typography ───────────────────────────────────────────── */
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
 
+/* ── Theme tokens ─────────────────────────────────────────────
+   The Python views reference these via className (.ink-muted …) or inline
+   style {"color": "var(--ink-muted)"} — inline var() resolves against the
+   cascade, so text theme-switches even when the style attribute is inline.
+   Light mode overrides live on body.light-mode (darker greys = the whole
+   light-mode contrast fix). Plotly figure paint CANNOT use these (canvas). */
+:root, body {
+  --ink-strong: #e2e8f0;   /* primary text */
+  --ink: #cbd5e1;
+  --ink-muted: #94a3b8;    /* labels, section headers, expander summaries */
+  --ink-faint: #64748b;    /* hints, footnotes */
+  --ink-ghost: #475569;    /* separators, big placeholder icons */
+  --surface-card: #161b2e;
+  --surface-inset: #1e2235;
+  --accent: #6366f1;
+  --accent-soft: rgba(99, 102, 241, 0.12);
+  --ok: #10b981;
+  --warn: #f59e0b;
+  --bad: #ef4444;
+}
+
+body.light-mode {
+  --ink-strong: #0f172a;
+  --ink: #1e293b;
+  --ink-muted: #475569;    /* darker than dark-mode's slate-400 — readable on white */
+  --ink-faint: #64748b;
+  --ink-ghost: #94a3b8;
+  --surface-card: #ffffff;
+  --surface-inset: #f8fafc;
+  --accent: #059669;       /* light theme accent is green (existing convention) */
+  --accent-soft: rgba(5, 150, 105, 0.10);
+}
+
+/* Utility text classes — replace inline grey hex in the Python views */
+.ink-muted { color: var(--ink-muted) !important; }
+.ink-faint { color: var(--ink-faint) !important; }
+.ink-ghost { color: var(--ink-ghost) !important; }
+.section-header {
+  color: var(--ink-muted);
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.stat-label {
+  color: var(--ink-muted);
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.stat-value {
+  color: var(--bs-body-color);
+  font-size: 1rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
+.hint-text { color: var(--ink-faint); font-size: 0.7rem; }
+
 body {
   font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif !important;
   background-color: #0d1117 !important;
@@ -881,3 +938,91 @@ body.light-mode .results-report-md blockquote {
   border-left-color: #059669;
   color: #475569;
 }
+
+/* ── Pipeline progress rail + log panel (both themes via tokens) ── */
+.stage-rail { font-size: 0.8rem; }
+.stage-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 4px;
+  border-radius: 6px;
+  color: var(--ink);
+}
+.stage-row--sub { margin-left: 22px; font-size: 0.72rem; padding: 2px 4px; }
+.stage-row--pending, .stage-row--queued { color: var(--ink-faint); }
+.stage-row--running {
+  background: var(--accent-soft);
+  color: var(--bs-body-color, var(--ink-strong));
+  font-weight: 600;
+}
+.stage-row--failed { color: var(--bad); }
+.stage-row--cancelled { color: var(--warn); }
+.stage-label { flex: 1 1 auto; min-width: 0; }
+.stage-eta {
+  margin-left: auto;
+  font-size: 0.68rem;
+  color: var(--ink-faint);
+  white-space: nowrap;
+}
+.stage-detail {
+  margin-left: 26px;
+  font-size: 0.68rem;
+  color: var(--ink-faint);
+  padding-bottom: 3px;
+}
+.stage-ico { font-size: 0.85rem; flex: 0 0 auto; }
+.stage-ico--pending { color: var(--ink-ghost); }
+.stage-ico--running { color: var(--accent); }
+.stage-ico--done { color: var(--ok); }
+.stage-ico--failed { color: var(--bad); }
+.stage-ico--cancelled { color: var(--warn); }
+@keyframes stage-spin { to { transform: rotate(360deg); } }
+.stage-ico.spin { animation: stage-spin 1.1s linear infinite; display: inline-block; }
+
+.pipeline-log {
+  background: var(--surface-inset);
+  border-radius: 8px;
+  padding: 8px 10px;
+  max-height: 260px;
+  overflow-y: auto;
+  font-family: 'JetBrains Mono', 'Fira Code', Consolas, monospace;
+  font-size: 0.7rem;
+  line-height: 1.5;
+}
+.log-line { color: var(--ink); word-break: break-word; }
+.log-line--empty { color: var(--ink-faint); font-style: italic; }
+.log-t { color: var(--ink-faint); margin-right: 8px; }
+.log-stage {
+  color: var(--accent);
+  margin-right: 8px;
+  text-transform: uppercase;
+  font-size: 0.62rem;
+  letter-spacing: 0.05em;
+}
+body.light-mode .pipeline-log { border: 1px solid #e2e8f0; }
+
+/* ── Pipeline stage cards (static expanders wrapping the stage bodies) ── */
+.stage-card {
+  background: var(--surface-card);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 12px;
+  padding: 0.9rem 1.1rem;
+}
+body.light-mode .stage-card {
+  border-color: #e2e8f0;
+  box-shadow: 0 1px 4px rgba(15, 23, 42, 0.06);
+}
+.stage-card-summary {
+  cursor: pointer;
+  user-select: none;
+  color: var(--ink-muted);
+  font-weight: 600;
+  font-size: 0.88rem;
+  display: flex;
+  align-items: center;
+}
+.stage-card-summary::marker { color: var(--ink-ghost); }
+.stage-card[open] > .stage-card-summary { margin-bottom: 12px; }
+.stage-card-title { margin-right: 4px; }
+.stage-badge { font-size: 0.62rem !important; }

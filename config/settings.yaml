@@ -115,11 +115,13 @@ training:
   max_train_rows: 1500000      # stratified (series, horizon) subsample cap for huge panels
   max_models_per_run: 5        # hard cap on models trained simultaneously (baseline excluded)
   chronos_variant: "amazon/chronos-bolt-small"  # HF model id for the zero-shot chronos backend
-  per_series_cap: 200          # per_series_local: model top-K series individually, tail -> aggregate
+  per_series_cap: 200          # any per-series-routed model fits only the top-K series by volume
   large_panel_series: 500      # n_series at/above this triggers the large-data reductions
-  # Cost tiers (units = policy_multiplier * n_series_effective * n_models):
-  moderate_tier_units: 200     # units above this -> "moderate"
-  heavy_tier_units: 2000       # units above this -> "heavy" (requires confirm_heavy)
+  # Cost tiers from ESTIMATED WALL-CLOCK MINUTES (trainer.estimate_cost — work-based
+  # priors calibrated by models/timing_calibration.json after every run):
+  tier_minutes:
+    moderate: 2                # above this -> "moderate"
+    heavy: 15                  # above this -> "heavy" (requires confirm_heavy)
   plot_max_points: 1500        # downsample cap for backtest/forecast arrays in the report
 
 # Stage 2: pre-cleaning EDA settings

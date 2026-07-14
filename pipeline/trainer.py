@@ -32,7 +32,7 @@ import yaml
 
 from models_lib import ml_models, registry
 from models_lib.base_model import conformal_intervals, future_index
-from pipeline import evaluator
+from pipeline import evaluator, progress
 from pipeline.forecasting_eda import _pandas_freq
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -102,30 +102,185 @@ def _json_safe_params(params) -> dict:
 
 
 # ── Cost estimate ─────────────────────────────────────────────────────────────
+# Wall-clock priors (seconds) for this machine class, self-corrected over time by
+# models/timing_calibration.json (median observed/predicted per model+route, appended
+# by record_timings after every training run). Tier thresholds are MINUTES:
+# settings.yaml → training.tier_minutes {moderate, heavy}. Prior anchors: Favorita
+# fast-profile run (lightgbm global 467s @1.5M capped rows / 1,782 series) and the
+# aggregate reference runs (max-profile xgboost 51s / 100 trials, fast lightgbm 3.5s).
 
-def estimate_cost(n_series: int, policy: str, model_ids, cfg: dict) -> dict:
-    """fast / moderate / heavy from policy × n_series × models. Per-series-local classical
-    is the multiplier that matters; global ML counts as one fit."""
+_FIT_S = {"seasonal_naive": 0.02, "croston": 0.05, "tsb": 0.05, "auto_theta": 0.25,
+          "auto_ets": 0.8, "prophet": 1.2, "auto_arima": 6.0}
+_PER_SERIES_OVERHEAD_S = 0.12   # harness cost per series (groupby/frames/metrics)
+_ML_GLOBAL_S_PER_MROW = 130.0   # per million capped direct-dataset rows (ES fit + refit)
+_ML_SINGLE_FIT_S = 1.0          # one aggregate direct-ML fit (no tuning)
+_OPTUNA_TRIAL_S = 0.4           # per tuning trial on a single series
+_OPTUNA_GLOBAL_TRIAL_S = 26.0   # per tuning trial on the sampled global dataset
+_NHITS_S_PER_EPOCH_MROW = 8.0   # per effective epoch per million frame rows
+_NHITS_MIN_S = 20.0
+_CHRONOS_LOAD_S = 20.0          # HF weights load once per process
+_CHRONOS_S_PER_KSERIES = 25.0   # one batched inference pass per 1000 series (h≈16)
+CALIBRATION_PATH = MODELS_DIR / "timing_calibration.json"
+
+
+def _load_calibration() -> dict:
+    try:
+        return json.loads(CALIBRATION_PATH.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def _route_of(mid: str, scope: str, policy: str) -> str:
+    """Mirror of run()'s routing: which execution path a model takes."""
+    if scope != "per_series":
+        return "single"
+    if registry.is_global_capable(mid) and (policy == "global" or registry.always_global(mid)):
+        return "global"
+    return "per_series"
+
+
+def _model_base_seconds(mid: str, route: str, n_series: int, length: int, horizon: int,
+                        period: int, tcfg: dict, knobs: dict) -> float:
+    """Prior wall-clock seconds for one model, before calibration."""
+    n_series = max(int(n_series or 1), 1)
+    length = max(int(length or 100), 10)
+    horizon = max(int(horizon or 1), 1)
+    n_fits = (1 if n_series >= int(tcfg.get("large_panel_series", 500))
+              else int(tcfg.get("cv_windows", 3))) + 1  # CV windows + final refit
+    n_routed = (min(n_series, int(tcfg.get("per_series_cap", 200)))
+                if route == "per_series" else n_series)
+
+    if mid in registry.CHRONOS_IDS:
+        n_eff = n_series if route == "global" else 1
+        return (_CHRONOS_LOAD_S
+                + 2 * _CHRONOS_S_PER_KSERIES * max(n_eff, 1) / 1000.0
+                * max(horizon / 16.0, 0.5))
+    if mid in registry.NHITS_IDS:
+        rows_m = (n_series if route == "global" else 1) * length / 1e6
+        epochs_eff = 0.5 * int(knobs.get("nhits_max_epochs", 150))
+        # ×2: truncated-data backtest model + fresh full-data final model
+        return max(_NHITS_MIN_S, 2 * epochs_eff * _NHITS_S_PER_EPOCH_MROW * max(rows_m, 0.01))
+    if registry.is_ml(mid):
+        if route == "global":
+            expanded = n_series * max(length - period - 12, 10) * horizon
+            rows = min(expanded, int(tcfg.get("max_train_rows") or 1_500_000))
+            s = rows / 1e6 * _ML_GLOBAL_S_PER_MROW + n_series * _PER_SERIES_OVERHEAD_S
+            s += int(knobs.get("optuna_trials_global", 0)) * _OPTUNA_GLOBAL_TRIAL_S
+            return s
+        if route == "per_series":
+            return n_routed * (n_fits * _ML_SINGLE_FIT_S + _PER_SERIES_OVERHEAD_S)
+        return (n_fits * _ML_SINGLE_FIT_S
+                + int(knobs.get("optuna_trials", 0)) * _OPTUNA_TRIAL_S)
+    # classical / intermittent — per-series fan-out or a single aggregate series
+    fit_s = _FIT_S.get(mid, 1.0)
+    if route == "per_series":
+        return n_routed * (n_fits * fit_s + _PER_SERIES_OVERHEAD_S)
+    return n_fits * fit_s + 1.0  # +1s import/setup
+
+
+def estimate_cost(n_series: int, policy: str, model_ids, cfg: dict, *,
+                  scope: str | None = None, length: int | None = None,
+                  horizon: int | None = None, period: int | None = None,
+                  profile: str | None = None, include_baseline: bool = True) -> dict:
+    """Wall-clock estimate for a training request. Seconds per model from work-based
+    priors × a per-(model, route) calibration factor learned from past runs on this
+    machine; tier from estimated minutes. The always-trained baseline is included so
+    the total honestly covers the whole job."""
     t = cfg["training"]
-    units = 0.0
-    for mid in model_ids:
-        if mid in registry.CHRONOS_IDS:
-            units += 0.5  # zero-shot: no fit at all, one batched inference pass
-        elif mid in registry.NHITS_IDS:
-            units += 3.0  # always ONE global network, but epochs make it ~2× an ML fit
-        elif registry.is_ml(mid):
-            units += 1.5 if policy == "global" else (n_series * 1.5 if policy == "per_series_local" else 1.5)
-        else:
-            units += n_series if policy == "per_series_local" else 1
-    moderate = t.get("moderate_tier_units", 200)
-    heavy = t.get("heavy_tier_units", 2000)
-    tier = "heavy" if units > heavy else ("moderate" if units > moderate else "fast")
+    scope = scope or ("per_series" if int(n_series or 1) > 1 else "aggregate")
+    knobs = _resolve_profile(t, profile)
+    cal = _load_calibration()
+
+    ids = [m for m in dict.fromkeys(model_ids) if m in registry.KNOWN_IDS]
+    if include_baseline and BASELINE not in ids:
+        ids = [*ids, BASELINE]
+
+    per_model, total = [], 0.0
+    for mid in ids:
+        route = _route_of(mid, scope, policy)
+        base = _model_base_seconds(mid, route, n_series, length, horizon,
+                                   int(period or 1), t, knobs)
+        factors = cal.get(f"{mid}|{route}") or []
+        factor = float(np.median(factors)) if factors else 1.0
+        secs = base * factor
+        per_model.append({"model": mid, "route": route,
+                          "seconds": round(secs, 1), "base_seconds": round(base, 1),
+                          "calibrated": bool(factors),
+                          "is_baseline": mid == BASELINE and mid not in model_ids})
+        total += secs
+
+    tiers = t.get("tier_minutes") or {}
+    mod_min = float(tiers.get("moderate", 2))
+    heavy_min = float(tiers.get("heavy", 15))
+    minutes = total / 60.0
+    tier = "heavy" if minutes > heavy_min else ("moderate" if minutes > mod_min else "fast")
+
     rec = None
-    if tier == "heavy" and policy == "per_series_local":
-        rec = ("Consider the global LightGBM policy or reduce the per-series fan-out "
-               f"(currently {n_series} series).")
-    return {"tier": tier, "units": round(units, 1), "n_series": int(n_series),
-            "policy": policy, "n_models": len(list(model_ids)), "recommendation": rec}
+    slow_ps = [p for p in per_model
+               if p["route"] == "per_series" and p["seconds"] > 120
+               and not p["is_baseline"]]
+    if slow_ps:
+        names = ", ".join(p["model"] for p in slow_ps)
+        rec = (f"{names}: fits each series individually (capped at "
+               f"{int(t.get('per_series_cap', 200))} of {n_series}) — the slow path. "
+               "Global models (LightGBM/XGBoost/NHITS/Chronos) cover every series in "
+               "one pass.")
+    return {"tier": tier, "n_series": int(n_series), "policy": policy, "scope": scope,
+            "profile": knobs["profile_name"],
+            "n_models": len([m for m in per_model if not m["is_baseline"]]),
+            "est_seconds": round(total, 1),
+            "est_low_seconds": round(total * 0.5, 1),
+            "est_high_seconds": round(total * 2.0, 1),
+            "per_model": per_model, "recommendation": rec}
+
+
+def record_timings(estimate: dict, results: list) -> None:
+    """After a run: store observed/predicted per (model, route) so the next estimate
+    on this machine starts from reality. Factors clipped to [0.2, 5]; last 6 kept."""
+    try:
+        cal = _load_calibration()
+        by_model = {p["model"]: p for p in estimate.get("per_model") or []}
+        for r in results:
+            secs = r.get("train_seconds")
+            pm = by_model.get(r.get("model"))
+            if r.get("error") or not secs or not pm or pm.get("base_seconds", 0) <= 0:
+                continue
+            f = min(max(secs / pm["base_seconds"], 0.2), 5.0)
+            key = f"{r['model']}|{pm['route']}"
+            cal[key] = ((cal.get(key) or [])[-5:]) + [round(f, 3)]
+        CALIBRATION_PATH.parent.mkdir(exist_ok=True)
+        CALIBRATION_PATH.write_text(json.dumps(cal, indent=1))
+    except Exception:  # noqa: BLE001 — timing telemetry must never fail a training run
+        pass
+
+
+def estimate_for_run(run_id: str, model_ids, profile: str | None = None,
+                     cfg: dict | None = None) -> dict:
+    """Estimate from a run's persisted Stage 4/5 outputs — the one authoritative
+    entry point for the /train gate and the GET /train-estimate endpoint."""
+    if cfg is None:
+        cfg = _load_config()
+    run_dir = RUNS_DIR / run_id
+
+    def _read(name):
+        try:
+            return json.loads((run_dir / name).read_text())
+        except (OSError, ValueError):
+            return {}
+
+    payload = _read("model_selection_payload.json")
+    sel = _read("forecast_user_selections.json")
+    msel = _read("model_selection.json")
+    panel = payload.get("panel") or {}
+    n_series = int(panel.get("n_series") or 1)
+    length = int((panel.get("series_length") or {}).get("median")
+                 or payload.get("series_length") or 100)
+    horizon = int(sel.get("horizon") or payload.get("horizon") or 1)
+    scope = sel.get("scope") or payload.get("scope") or "aggregate"
+    policy = (msel.get("training_hints") or {}).get("policy") or "aggregate"
+    period = int(payload.get("seasonality_period") or 1)
+    return estimate_cost(n_series, policy, model_ids, cfg, scope=scope, length=length,
+                         horizon=horizon, period=period, profile=profile)
 
 
 # ── Walk-forward CV plan ──────────────────────────────────────────────────────
@@ -383,15 +538,23 @@ def run(run_id: str, models, confirm_heavy: bool = False, profile: str | None = 
     n_series = len(all_series)
     series_ids, reduced_from = all_series, None
     per_series_cap = int(tcfg.get("per_series_cap", 200))
-    if scope == "per_series" and policy != "global" and n_series > per_series_cap:
+    if scope == "per_series" and n_series > per_series_cap:
+        # Applies under EVERY policy: even with a global policy, non-global-capable
+        # models (prophet/theta/arima/... and the baseline) fan out per series — an
+        # uncapped prophet once ran 1,782 Stan fits for hours. Global-routed models
+        # read the full frame and are unaffected by series_ids.
         vol = frame.groupby("unique_id", observed=True)["y"].sum().sort_values(ascending=False)
         series_ids = vol.head(per_series_cap).index.tolist()
         reduced_from = n_series
         warnings_list.append(
-            f"per-series fan-out capped to top {per_series_cap} of {n_series} series by volume")
+            f"per-series model fan-out capped to top {per_series_cap} of {n_series} "
+            "series by volume (global models still train on all series)")
 
     # Cost gate.
-    estimate = estimate_cost(n_series, policy, requested, cfg)
+    med_len = int(frame.groupby("unique_id", observed=True).size().median() or 0)
+    estimate = estimate_cost(n_series, policy, requested, cfg, scope=scope,
+                             length=med_len, horizon=horizon, period=period,
+                             profile=profile)
     if estimate["tier"] == "heavy" and not confirm_heavy:
         raise TrainingHeavyError(estimate)
 
@@ -403,8 +566,13 @@ def run(run_id: str, models, confirm_heavy: bool = False, profile: str | None = 
     n_trials = (tcfg.get("optuna_trials_large", 8) if n_series >= tcfg.get("large_panel_series", 500)
                 else int(profile.get("optuna_trials", 30)))
 
+    # Per-model progress for the UI rail (estimate gives each model's ETA up front).
+    eta_by_model = {p["model"]: p["seconds"] for p in estimate.get("per_model") or []}
+
     results, fitted_objs, series_frames = [], {}, []
-    for mid in run_ids:
+    for model_i, mid in enumerate(run_ids, start=1):
+        progress.model_event(run_id, mid, model_i, len(run_ids), "running",
+                             eta_seconds=eta_by_model.get(mid))
         model_t0 = time.perf_counter()
         try:
             params, tuning, native_iv = None, None, None
@@ -459,7 +627,12 @@ def run(run_id: str, models, confirm_heavy: bool = False, profile: str | None = 
                 "backtest": _display_backtest(cv_df, scope),
                 "forecast": _display_forecast(fc_df, scope, cv_df, levels, native_iv),
             })
+            progress.model_event(run_id, mid, model_i, len(run_ids), "done",
+                                 seconds=time.perf_counter() - model_t0,
+                                 mase=metrics.get("mase"))
         except Exception as exc:  # noqa: BLE001 — isolate per-model failure
+            progress.model_event(run_id, mid, model_i, len(run_ids), "failed",
+                                 seconds=time.perf_counter() - model_t0)
             results.append({
                 "model": mid, "label": label_map.get(mid, mid), "category": cat_map.get(mid),
                 "requested": mid in requested, "is_baseline": mid == BASELINE and mid not in requested,
@@ -526,6 +699,9 @@ def run(run_id: str, models, confirm_heavy: bool = False, profile: str | None = 
         "trained_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
     (run_dir / "training_report.json").write_text(json.dumps(training_report, indent=2, default=str))
+    # Feed observed wall-clock back into the estimator's calibration store so the next
+    # cost estimate on this machine starts from reality instead of priors.
+    record_timings(estimate, results)
     return {"run_id": run_id, "status": "completed", "report": training_report}
 
 

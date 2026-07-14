@@ -409,8 +409,22 @@ def run_global(frame, recipe, model_id, cfg, horizon, freq_alias, transform, par
     ids = work["unique_id"].astype("category")
     code_of = {uid: i for i, uid in enumerate(ids.cat.categories)}
 
+    # Row budget applied PER SERIES inside the loop, not after concat: the old
+    # post-concat cap materialized the full origins×horizon expansion first (~50M rows
+    # × ~45 float64 cols on a Favorita-scale panel — several times physical RAM, and it
+    # hard-crashed an 8GB box). Sampling stratified by horizon within each series is
+    # equivalent to the old global (series_id, horizon) stratified sample, but the
+    # pre-concat peak now stays at ~max_rows regardless of panel size.
+    ser_budget = max(int(max_rows / max(len(code_of), 1)), horizon)
+
+    def _budget(df: pd.DataFrame) -> pd.DataFrame:
+        if len(df) <= ser_budget:
+            return df
+        return (df.groupby("horizon", group_keys=False)
+                .sample(frac=ser_budget / len(df), random_state=0))
+
     per_series, feats = {}, []
-    train_parts, hold_parts = [], []
+    train_parts, hold_parts, hold_region_parts = [], [], []
     for uid, g in work.groupby("unique_id", observed=True, sort=False):
         g = g.reset_index(drop=True)
         y = g["y_t"].to_numpy(dtype=float)
@@ -439,11 +453,16 @@ def run_global(frame, recipe, model_id, cfg, horizon, freq_alias, transform, par
         # forecast-origin backtest, not every overlapping origin)
         origin_last = int(n - horizon - 1)
         hp = dd[hold_mask & (dd["pos"].to_numpy(dtype=int) == origin_last)]
-        train_parts.append(dd[~hold_mask])
+        train_parts.append(_budget(dd[~hold_mask]))
         if not hp.empty:
             hold_parts.append((uid, hp))
-        per_series[uid] = {"g": gsup_in, "idx": idx, "y_ds": y_ds, "trainable": True,
-                           "full": dd}
+        # holdout-region rows kept separately (small: targets in the last h periods
+        # only) so the final refit can still see the most recent data without holding
+        # every series' full expansion in memory
+        hr = _budget(dd[hold_mask])
+        if not hr.empty:
+            hold_region_parts.append(hr)
+        per_series[uid] = {"g": gsup_in, "idx": idx, "y_ds": y_ds, "trainable": True}
     if not train_parts or not feats:
         return {"cv": None, "forecast": None, "params": {}, "tuning": None,
                 "strategy": "none", "error": "global ML: no series had enough history"}
@@ -451,6 +470,7 @@ def run_global(frame, recipe, model_id, cfg, horizon, freq_alias, transform, par
     feat_all = [*feats, "share_lag1", "pos", *_DIRECT_FEATS,
                 "series_id", "ser_mean", "ser_std"]
     train_df = pd.concat(train_parts, ignore_index=True)
+    train_parts.clear()  # per-series budgeting already capped this near max_rows
     if len(train_df) > max_rows:
         frac = max_rows / len(train_df)
         train_df = (train_df.groupby(["series_id", "horizon"], group_keys=False)
@@ -506,9 +526,10 @@ def run_global(frame, recipe, model_id, cfg, horizon, freq_alias, transform, par
             "predicted": invert_transform(pred_ds * sindex, transform)}))
     cv_df = pd.concat(cv_rows, ignore_index=True) if cv_rows else None
 
-    # Final model: refit at the found tree count on ALL rows (holdout included).
-    full_df = pd.concat([p["full"] for p in per_series.values() if p.get("trainable")],
-                        ignore_index=True)
+    # Final model: refit at the found tree count on all budgeted rows, holdout region
+    # included (train_df + hold_region_parts together cover every series' full history
+    # at the same per-series sampling rate).
+    full_df = pd.concat([train_df, *hold_region_parts], ignore_index=True)
     if len(full_df) > max_rows:
         frac = max_rows / len(full_df)
         full_df = (full_df.groupby(["series_id", "horizon"], group_keys=False)

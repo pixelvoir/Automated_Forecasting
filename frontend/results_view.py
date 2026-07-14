@@ -11,7 +11,7 @@ Reads ``_stage7`` for the model list and ``_stage8`` for a previously generated 
 import dash_bootstrap_components as dbc
 from dash import dcc, html
 
-_SH = {"color": "#94a3b8", "fontSize": "0.78rem", "textTransform": "uppercase",
+_SH = {"color": "var(--ink-muted)", "fontSize": "0.78rem", "textTransform": "uppercase",
        "letterSpacing": "0.06em"}
 _HIDDEN = {"display": "none"}
 
@@ -36,7 +36,7 @@ def _report_card(report):
         html.P("A plain-language forecast report: what's expected and when, in the "
                "target's real units — growth vs recent history, best/worst case, and "
                "what to keep in mind. No pipeline statistics.",
-               style={"fontSize": "0.82rem", "color": "#94a3b8"}),
+               style={"fontSize": "0.82rem", "color": "var(--ink-muted)"}),
         dbc.Row([
             dbc.Col(dcc.Dropdown(id="dropdown-results-model", options=options,
                                  value=default, clearable=False,
@@ -52,7 +52,7 @@ def _report_card(report):
                     "Opt-in: clicking Generate sends computed statistics, model metrics "
                     "and forecast summaries for this run to the configured report LLM — "
                     "never raw dataset rows. Nothing is sent until you click."],
-                   style={"color": "#64748b", "fontSize": "0.72rem"}),
+                   style={"color": "var(--ink-faint)", "fontSize": "0.72rem"}),
     ]), className="mb-3")
 
 
@@ -64,7 +64,7 @@ def _report_body(stage8):
         f"generated {str(stage8.get('generated_at', ''))[:19].replace('T', ' ')} UTC",
     ] if x)
     return dbc.Card(dbc.CardBody([
-        html.Div(meta, style={"fontSize": "0.72rem", "color": "#64748b"},
+        html.Div(meta, style={"fontSize": "0.72rem", "color": "var(--ink-faint)"},
                  className="mb-2"),
         dcc.Markdown(stage8.get("markdown") or "", className="results-report-md",
                      link_target="_blank"),
@@ -72,7 +72,8 @@ def _report_body(stage8):
 
 
 def _download_card(report):
-    per_series = bool(report.get("has_series_forecasts"))
+    per_series = bool(report.get("has_series_forecasts")) \
+        or report.get("scope") == "per_series"
     switch = dbc.Switch(id="switch-download-series", value=False,
                         label="Per-series rows instead of the aggregate",
                         style={"fontSize": "0.82rem"})
@@ -84,7 +85,7 @@ def _download_card(report):
                  className="mb-2"),
         html.P("The selected model's horizon forecast (dates, predicted values and "
                "interval bounds where available).",
-               style={"fontSize": "0.82rem", "color": "#94a3b8"}),
+               style={"fontSize": "0.82rem", "color": "var(--ink-muted)"}),
         switch_wrap,
         dbc.Row([
             dbc.Col(dbc.Button([_cicon("bi-filetype-csv"), "CSV"],
@@ -100,10 +101,10 @@ def _download_card(report):
 def render_results_tab(data):
     if not data:
         return html.Div(
-            [_cicon("bi-info-circle", fontSize="2rem", color="#334155",
+            [_cicon("bi-info-circle", fontSize="2rem", color="var(--ink-ghost)",
                     display="block", marginBottom="12px", marginRight="0"),
              html.P("Load a dataset on the Data tab first.",
-                    style={"color": "#64748b", "fontSize": "0.9rem"})],
+                    style={"color": "var(--ink-faint)", "fontSize": "0.9rem"})],
             className="text-center mt-5 pt-4")
 
     header = html.Div([html.Span([_cicon("bi-clipboard-check"), "Results"],

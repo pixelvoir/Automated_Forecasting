@@ -24,7 +24,7 @@ _C_HIST = "#6366f1"
 _C_FC = "#059669"
 _C_BT = "#d97706"
 
-_SH = {"color": "#94a3b8", "fontSize": "0.78rem", "textTransform": "uppercase",
+_SH = {"color": "var(--ink-muted)", "fontSize": "0.78rem", "textTransform": "uppercase",
        "letterSpacing": "0.06em"}
 _CAT_LABEL = {"baseline": "Baseline", "statistical": "Statistical",
               "intermittent": "Intermittent", "ml": "Machine learning",
@@ -35,7 +35,6 @@ _POLICY_LABEL = {"aggregate": "One aggregate series",
 _TIER = {"fast": ("success", "bi-lightning-charge", "Fast"),
          "moderate": ("info", "bi-hourglass-split", "Moderate"),
          "heavy": ("warning", "bi-exclamation-triangle", "Heavy")}
-_ML_IDS = {"lightgbm", "xgboost"}
 _MAX_MODELS = 5
 
 
@@ -51,71 +50,87 @@ def _fmt(v, nd=3):
     return str(v)
 
 
-# ── Cost estimate (client-side mirror of trainer.estimate_cost) ───────────────
+# ── Cost estimate banner ───────────────────────────────────────────────────────
+# The numbers come from GET /runs/{id}/train-estimate (trainer.estimate_for_run — the
+# same authoritative math as the /train heavy gate, wall-clock seconds calibrated from
+# past runs on this machine). This module only renders; callbacks.py does the fetch.
 
-def estimate_cost(n_series: int, policy: str, selected: list) -> dict:
-    """Advisory only — the /train route enforces the authoritative gate. Kept in sync with
-    pipeline/trainer.estimate_cost and the settings.yaml tier thresholds."""
-    units = 0.0
-    for m in selected or []:
-        if m == "chronos":
-            units += 0.5  # zero-shot: no fit, one batched inference pass
-        elif m == "nhits":
-            units += 3.0  # one global network, epochs ≈ 2× an ML fit
-        elif m in _ML_IDS:
-            units += 1.5 if policy == "global" else (n_series * 1.5 if policy == "per_series_local" else 1.5)
-        else:
-            units += n_series if policy == "per_series_local" else 1
-    tier = "heavy" if units > 2000 else ("moderate" if units > 200 else "fast")
-    return {"tier": tier, "units": round(units, 1), "n_series": int(n_series), "policy": policy}
+_ROUTE_LABEL = {"global": "global — one pass over all series",
+                "per_series": "per series",
+                "single": "single series"}
 
 
-def _panel_n_series(data) -> int:
-    payload = ((data.get("_stage4") or {}).get("eda") or {}).get("payload") or {}
-    return int((payload.get("panel") or {}).get("n_series") or 1)
+def _fmt_duration(seconds) -> str:
+    s = float(seconds or 0)
+    if s < 60:
+        return f"{max(int(round(s)), 1)}s"
+    if s < 3600:
+        return f"{s / 60:.0f} min"
+    return f"{s / 3600:.1f} h"
 
 
-# Display-only wall-clock hint per profile; the units/tier math above stays untouched —
-# the server-side trainer.estimate_cost remains the authoritative gate.
-_PROFILE_TIME_HINT = {"fast": "≈0.5× wall-clock vs balanced",
-                      "balanced": "the default budget",
-                      "max": "≈3×+ wall-clock — the 1-3h-class budget on big panels"}
+def default_selection(data) -> list:
+    """The model list the picker pre-selects — exported so callbacks.py can fetch the
+    initial estimate for exactly what the user will see selected."""
+    sel = (data or {}).get("_stage5") or {}
+    option_ids = [o["value"] for o in _eligible_options(sel)]
+    return _default_models(sel, option_ids)
 
 
-def build_estimate_banner(data, selected, profile=None):
-    """The live cost banner + (when heavy) the confirm switch. Rendered on load and by the
-    update_train_estimate callback when the model selection or profile changes."""
-    hints = (data.get("_stage5") or {}).get("training_hints") or {}
-    policy = hints.get("policy") or "aggregate"
-    n_series = _panel_n_series(data)
-    selected = [m for m in (selected or []) if m != "seasonal_naive"]
-    est = estimate_cost(n_series, policy, selected)
-    color, icon, label = _TIER[est["tier"]]
+def _hidden_confirm():
+    # keep the id in the tree so btn-train's State always resolves
+    return html.Div(dbc.Switch(id="switch-train-confirm", value=False),
+                    style={"display": "none"})
 
-    detail = (f"{n_series:,} series × {len(selected)} model(s) · "
-              f"{_POLICY_LABEL.get(policy, policy)}")
+
+def build_estimate_banner(data, selected, profile=None, est=None):
+    """The live cost banner + (when heavy) the confirm switch. `est` is the server
+    estimate fetched by callbacks.py; None means the API couldn't be reached."""
+    if est is None:
+        return dbc.Alert([
+            html.Div([_cicon("bi-question-circle"),
+                      html.Strong("Cost estimate unavailable"),
+                      html.Span("  (could not reach the API — is run_dev.bat running?)",
+                                style={"fontSize": "0.8rem", "marginLeft": "4px"})],
+                     className="d-flex align-items-center"),
+            _hidden_confirm(),
+        ], color="secondary", className="py-2 mb-3")
+
+    color, icon, label = _TIER.get(est.get("tier"), _TIER["fast"])
+    detail = (f"{est.get('n_series', 1):,} series · {est.get('n_models', 0)} model(s) · "
+              f"{_POLICY_LABEL.get(est.get('policy'), est.get('policy'))} · "
+              f"profile {est.get('profile')}")
     kids = [html.Div([
-        _cicon(icon), html.Strong(f"Estimated cost: {label}"),
-        html.Span(f"  ({detail})", style={"fontSize": "0.8rem", "marginLeft": "4px"}),
-    ], className="d-flex align-items-center")]
+        _cicon(icon),
+        html.Strong(f"Estimated training time: ~{_fmt_duration(est.get('est_seconds'))} "),
+        html.Span(f"(range {_fmt_duration(est.get('est_low_seconds'))}–"
+                  f"{_fmt_duration(est.get('est_high_seconds'))} · {label})",
+                  style={"fontSize": "0.8rem", "marginLeft": "4px"}),
+    ], className="d-flex align-items-center"),
+        html.Div(detail, style={"fontSize": "0.74rem", "marginTop": "4px", "opacity": 0.85})]
 
-    if profile:
-        kids.append(html.Div(
-            f"Accuracy profile: {profile} ({_PROFILE_TIME_HINT.get(profile, '')})",
-            style={"fontSize": "0.74rem", "marginTop": "4px", "opacity": 0.85}))
+    rows = []
+    for p in est.get("per_model") or []:
+        name = p["model"] + (" (baseline, always trained)" if p.get("is_baseline") else "")
+        cal = "" if p.get("calibrated") else " — first-run guess"
+        rows.append(html.Div(
+            f"• {name}: ~{_fmt_duration(p.get('seconds'))} "
+            f"({_ROUTE_LABEL.get(p.get('route'), p.get('route'))}{cal})",
+            style={"fontSize": "0.74rem", "marginTop": "2px"}))
+    if rows:
+        kids.append(html.Div(rows, className="mt-1"))
 
-    if est["tier"] == "heavy":
-        kids.append(html.Div(
-            "Training this many per-series models can take a while. Prefer the global "
-            "LightGBM policy or fewer series — or confirm to run it anyway.",
-            style={"fontSize": "0.78rem", "marginTop": "6px"}))
+    if est.get("recommendation"):
+        kids.append(html.Div([_cicon("bi-lightbulb", fontSize="0.72rem"),
+                              est["recommendation"]],
+                             style={"fontSize": "0.76rem", "marginTop": "6px"}))
+
+    if est.get("tier") == "heavy":
         kids.append(dbc.Switch(id="switch-train-confirm", value=False,
                                label="Confirm — train anyway",
                                style={"fontSize": "0.82rem", "marginTop": "6px"}))
     else:
-        # keep the id in the tree so btn-train's State always resolves
-        kids.append(html.Div(dbc.Switch(id="switch-train-confirm", value=False),
-                             style={"display": "none"}))
+        kids.append(_hidden_confirm())
     return dbc.Alert(kids, color=color, className="py-2 mb-3")
 
 
@@ -145,7 +160,7 @@ def _excluded_note(sel):
     if not excluded:
         return None
     return html.Div(
-        [html.Div(f"· {label}: {reason}", style={"fontSize": "0.72rem", "color": "#64748b"})
+        [html.Div(f"· {label}: {reason}", style={"fontSize": "0.72rem", "color": "var(--ink-faint)"})
          for label, reason in excluded],
         className="mb-2",
     )
@@ -158,7 +173,7 @@ _PROFILE_OPTS = [
 ]
 
 
-def _picker_card(data, sel, default_profile="balanced"):
+def _picker_card(data, sel, default_profile="balanced", initial_estimate=None):
     options = _eligible_options(sel)
     option_ids = [o["value"] for o in options]
     default = _default_models(sel, option_ids)
@@ -171,13 +186,13 @@ def _picker_card(data, sel, default_profile="balanced"):
                 html.Strong(str(_MAX_MODELS)),
                 " models. Your selection is final: the best of YOUR models is crowned; "
                 "the always-trained seasonal-naive baseline is only the MASE reference."],
-               style={"fontSize": "0.82rem", "color": "#94a3b8"}),
+               style={"fontSize": "0.82rem", "color": "var(--ink-muted)"}),
         dcc.Dropdown(id="dropdown-train-models", multi=True, options=options, value=default,
                      placeholder="Choose one or more models…", className="mb-3",
                      style={"fontSize": "0.85rem"}),
         *([excluded_note] if excluded_note is not None else []),
         html.Div([
-            html.Span("Accuracy profile", style={"fontSize": "0.74rem", "color": "#64748b",
+            html.Span("Accuracy profile", style={"fontSize": "0.74rem", "color": "var(--ink-faint)",
                                                  "textTransform": "uppercase",
                                                  "letterSpacing": "0.05em"}),
             dcc.Dropdown(id="dropdown-train-profile", options=_PROFILE_OPTS,
@@ -185,7 +200,8 @@ def _picker_card(data, sel, default_profile="balanced"):
                          style={"fontSize": "0.82rem"}),
         ], className="mb-3"),
         html.Div(id="train-estimate-banner",
-                 children=build_estimate_banner(data, default, default_profile)),
+                 children=build_estimate_banner(data, default, default_profile,
+                                                est=initial_estimate)),
         dcc.Loading(
             dbc.Button([_cicon("bi-play-fill"), "Train Models"], id="btn-train",
                        color="primary", className="w-100", style={"fontWeight": "600"}),
@@ -233,13 +249,13 @@ def _leaderboard(report):
                     "backgroundColor": "#161b2e", "color": "#e2e8f0", "border": "none",
                     "borderBottom": "1px solid rgba(255,255,255,0.05)",
                     "fontFamily": "Inter, sans-serif", "whiteSpace": "normal", "height": "auto"},
-        style_header={"fontWeight": "600", "backgroundColor": "#1e2235", "color": "#64748b",
+        style_header={"fontWeight": "600", "backgroundColor": "#1e2235", "color": "var(--ink-faint)",
                       "fontSize": "10px", "textTransform": "uppercase", "letterSpacing": "0.06em",
                       "border": "none", "borderBottom": "1px solid rgba(255,255,255,0.10)"},
         style_data_conditional=[
             {"if": {"filter_query": "{Notes} contains 'best'"},
              "backgroundColor": "rgba(5,150,105,0.14)"},
-            {"if": {"filter_query": "{Notes} contains 'baseline'"}, "color": "#94a3b8"},
+            {"if": {"filter_query": "{Notes} contains 'baseline'"}, "color": "var(--ink-muted)"},
         ],
         page_size=12)
 
@@ -305,13 +321,13 @@ def _details(report, data):
     recipe = stage6.get("recipe") or {}
     rat = recipe.get("rationale") or {}
     feat_kids = [html.Div([html.Strong(f"{k}: "), html.Span(str(v))],
-                          style={"fontSize": "0.76rem", "color": "#94a3b8", "marginBottom": "3px"})
+                          style={"fontSize": "0.76rem", "color": "var(--ink-muted)", "marginBottom": "3px"})
                  for k, v in rat.items()]
     n_feat = stage6.get("n_features", 0)
     feat_kids.append(html.Div(
         f"{n_feat} features materialized" if n_feat else
         "Feature matrix is materialized only when an ML model (LightGBM/XGBoost) is trained.",
-        style={"fontSize": "0.72rem", "color": "#64748b", "marginTop": "4px"}))
+        style={"fontSize": "0.72rem", "color": "var(--ink-faint)", "marginTop": "4px"}))
 
     params_rows = []
     for e in report.get("results") or []:
@@ -334,14 +350,14 @@ def _details(report, data):
                  f"({report.get('accuracy_profile') or 'balanced'} profile)")
     return html.Details([
         html.Summary("Feature recipe, hyperparameters & CV detail",
-                     style={"cursor": "pointer", "color": "#64748b", "fontSize": "0.8rem"}),
-        html.Div(meta, style={"fontSize": "0.74rem", "color": "#64748b", "margin": "8px 0"}),
+                     style={"cursor": "pointer", "color": "var(--ink-faint)", "fontSize": "0.8rem"}),
+        html.Div(meta, style={"fontSize": "0.74rem", "color": "var(--ink-faint)", "margin": "8px 0"}),
         html.Div(html.Span([_cicon("bi-diagram-3"), "EDA-seeded features"], style=_SH),
                  className="mt-2 mb-1"),
         html.Div(feat_kids),
         html.Div(html.Span([_cicon("bi-sliders"), "Model parameters"], style=_SH),
                  className="mt-3 mb-1"),
-        html.Div(params_rows or [html.Span("—", style={"color": "#64748b"})]),
+        html.Div(params_rows or [html.Span("—", style={"color": "var(--ink-faint)"})]),
     ], className="mb-2")
 
 
@@ -357,9 +373,9 @@ def history_for(data, report):
 def _tile(icon, label, value, sub=None, width=3):
     kids = [
         html.Div([html.I(className=f"bi {icon}",
-                         style={"color": "#64748b", "marginRight": "4px",
+                         style={"color": "var(--ink-faint)", "marginRight": "4px",
                                 "fontSize": "0.7rem"}),
-                  html.Span(label, style={"fontSize": "0.65rem", "color": "#94a3b8",
+                  html.Span(label, style={"fontSize": "0.65rem", "color": "var(--ink-muted)",
                                           "textTransform": "uppercase",
                                           "letterSpacing": "0.06em"})],
                  className="d-flex align-items-center mb-1"),
@@ -367,7 +383,7 @@ def _tile(icon, label, value, sub=None, width=3):
                                "letterSpacing": "-0.02em", "color": _TEXT}),
     ]
     if sub:
-        kids.append(html.Div(sub, style={"fontSize": "0.68rem", "color": "#64748b"}))
+        kids.append(html.Div(sub, style={"fontSize": "0.68rem", "color": "var(--ink-faint)"}))
     return dbc.Col(kids, width=width, className="mb-2")
 
 
@@ -399,6 +415,13 @@ def _insights_strip(entry):
                     style={"borderLeft": "3px solid #d97706"})
 
 
+def results_block(data, report):
+    """The post-training results (hero card, insights strip, model/series-switchable
+    chart, leaderboard, details). Rendered on the RESULTS section — exported for
+    render_results_body in callbacks.py."""
+    return _results_block(data, report)
+
+
 def _results_block(data, report):
     results = report.get("results") or []
     trained = [e for e in results if not e.get("error")]
@@ -420,7 +443,7 @@ def _results_block(data, report):
             html.P("MASE < 1 means the model beats the seasonal-naive reference. The crown "
                    "goes to the best of the models you selected — the baseline can rank "
                    "higher in the table without winning.",
-                   className="mb-0 mt-1", style={"fontSize": "0.78rem", "color": "#64748b"}),
+                   className="mb-0 mt-1", style={"fontSize": "0.78rem", "color": "var(--ink-faint)"}),
         ]), className="mb-3", style={"borderLeft": "3px solid #059669"}))
 
         # Target insights follow the chart-model dropdown (update_train_chart re-renders
@@ -443,7 +466,7 @@ def _results_block(data, report):
                      className="mb-2"),
             dbc.Row([
                 dbc.Col([
-                    html.Div("Model", style={"fontSize": "0.68rem", "color": "#94a3b8",
+                    html.Div("Model", style={"fontSize": "0.68rem", "color": "var(--ink-muted)",
                                              "textTransform": "uppercase"}),
                     dcc.Dropdown(id="dropdown-train-chart-model", options=model_options,
                                  value=hero["model"], clearable=False,
@@ -451,7 +474,7 @@ def _results_block(data, report):
                 ], md=5),
                 dbc.Col([
                     html.Div("Series (per-series runs)",
-                             style={"fontSize": "0.68rem", "color": "#94a3b8",
+                             style={"fontSize": "0.68rem", "color": "var(--ink-muted)",
                                     "textTransform": "uppercase"}),
                     dcc.Dropdown(id="dropdown-train-chart-series",
                                  options=[{"label": s, "value": s} for s in series_ids],
@@ -478,36 +501,33 @@ def _results_block(data, report):
 
 # ── Tab entry point ───────────────────────────────────────────────────────────
 
-def render_training_tab(data, default_profile="balanced"):
+def render_training_controls(data, default_profile="balanced", initial_estimate=None):
+    """The training CONTROLS only (model picker + estimate banner + Train button) —
+    lives inside the Pipeline section's Train card. The results (leaderboard, chart,
+    hero) render on the Results section via results_block()."""
     if not data:
-        return html.Div(
-            [_cicon("bi-info-circle", fontSize="2rem", color="#334155",
-                    display="block", marginBottom="12px", marginRight="0"),
-             html.P("Load a dataset on the Data tab first.",
-                    style={"color": "#64748b", "fontSize": "0.9rem"})],
-            className="text-center mt-5 pt-4")
+        return html.P("Load a dataset on the Setup section first.",
+                      style={"color": "var(--ink-faint)", "fontSize": "0.85rem"}, className="mb-0")
 
     sel = data.get("_stage5")
     if not sel:
-        return html.Div([
-            html.Div([html.Span([_cicon("bi-lightning-fill"), "Training"],
-                                className="fw-semibold section-title")], className="mb-3"),
-            dbc.Alert([_cicon("bi-info-circle"),
-                       "Run model selection first (Pipeline Setup → confirm, or the Model "
-                       "Select tab) — training needs the recommendation and eligibility list."],
-                      color="secondary", className="py-2"),
-        ])
+        return dbc.Alert([_cicon("bi-info-circle"),
+                          "Run model selection first (confirm the forecast setup on Setup, "
+                          "or re-run it from the Model Selection card above)."],
+                         color="secondary", className="py-2 mb-0")
 
-    header = html.Div([html.Span([_cicon("bi-lightning-fill"), "Training"],
-                                 className="fw-semibold section-title")], className="mb-3")
     report = data.get("_stage7")
-    blocks = [header, _picker_card(data, sel, default_profile)]
+    blocks = [_picker_card(data, sel, default_profile, initial_estimate)]
     if report:
-        blocks += _results_block(data, report)
+        blocks.append(dbc.Alert(
+            [_cicon("bi-check-circle"),
+             f"Trained {len([e for e in report.get('results') or [] if not e.get('error')])} "
+             "model(s) — see the Results section for the leaderboard, charts and report."],
+            color="success", className="py-2 mb-0"))
     else:
         blocks.append(dbc.Alert(
             [_cicon("bi-arrow-up-circle"),
              "Choose your models above and click Train — walk-forward backtest, a "
-             "seasonal-naive baseline and a horizon forecast will appear here."],
-            color="secondary", className="py-2"))
+             "seasonal-naive baseline and a horizon forecast will appear on Results."],
+            color="secondary", className="py-2 mb-0"))
     return html.Div(blocks)
