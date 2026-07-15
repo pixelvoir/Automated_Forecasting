@@ -10,7 +10,7 @@ Writers are deliberately non-fatal: a progress write must never fail a pipeline 
 """
 import json
 import os
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -24,7 +24,9 @@ _LOG_CAP = 200  # ring buffer: keep the newest N log events
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    # Local-aware, not UTC: the UI log panel slices the wall-clock time straight out of
+    # this string, and UTC read as local time was hours off for anyone not in UTC.
+    return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
 def _path(run_id: str) -> Path:
@@ -68,6 +70,15 @@ def _log(prog: dict, stage: str, msg: str) -> None:
 def stage_start(run_id: str, stage: str, detail: str | None = None,
                 total: int | None = None, eta_seconds: float | None = None) -> None:
     def fn(prog):
+        # Single-slot job manager: a new job stage starting means any OTHER stage still
+        # marked "running" was killed/preempted and its stage_finish never ran — without
+        # this sweep the rail showed two stages running at once (e.g. a preempted intent
+        # job stuck "running" for the rest of the run while cleaning re-ran). "report"
+        # is exempt both ways: it runs in-process and can legitimately overlap a job.
+        if stage != "report":
+            for other, e in prog["stages"].items():
+                if other not in (stage, "report") and (e or {}).get("status") == "running":
+                    e["status"] = "cancelled"
         entry = {"status": "running", "started_at": _now()}
         if detail:
             entry["detail"] = detail
@@ -108,9 +119,11 @@ def stage_finish(run_id: str, stage: str, status: str = "done",
         started = entry.get("started_at")
         if started:
             try:
+                # Both sides are timezone-aware, so this stays correct even across a
+                # mix of old UTC-stamped and new local-stamped entries on disk.
                 t0 = datetime.fromisoformat(started)
                 entry["seconds"] = round(
-                    (datetime.now(timezone.utc) - t0).total_seconds(), 1)
+                    (datetime.now().astimezone() - t0).total_seconds(), 1)
             except ValueError:
                 pass
         if detail:

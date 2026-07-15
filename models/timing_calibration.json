@@ -2,24 +2,71 @@
  "seasonal_naive|per_series": [
   0.654,
   0.701,
-  0.706
+  0.706,
+  0.2,
+  0.2,
+  0.2
  ],
  "prophet|single": [
-  0.295
+  0.295,
+  0.566,
+  0.502,
+  0.559
  ],
  "seasonal_naive|single": [
+  0.2,
+  0.2,
+  0.2,
+  0.2,
+  0.2,
   0.2
  ],
  "lightgbm|single": [
-  3.145
+  3.145,
+  2.074,
+  2.059,
+  5.0,
+  1.942
  ],
  "prophet|per_series": [
-  0.45
+  0.45,
+  0.605,
+  0.2
  ],
  "xgboost|global": [
   3.813
  ],
  "lightgbm|global": [
-  1.289
+  1.289,
+  0.492
+ ],
+ "auto_arima|single": [
+  0.408,
+  0.348
+ ],
+ "auto_ets|single": [
+  0.233
+ ],
+ "xgboost|single": [
+  4.746,
+  4.84,
+  4.668
+ ],
+ "chronos|global": [
+  0.854
+ ],
+ "nhits|global": [
+  0.87
+ ],
+ "nhits|single": [
+  0.842,
+  3.641,
+  0.217
+ ],
+ "croston|per_series": [
+  0.2
+ ],
+ "tsb|per_series": [
+  0.2
  ]
 }

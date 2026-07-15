@@ -1,5 +1,6 @@
 """Stage 1: pull data from PostgreSQL, save locally as Parquet, extract metadata."""
 import json
+import math
 import os
 import re
 from datetime import datetime
@@ -225,6 +226,15 @@ def _stream_csv_to_parquet(
         raw_path, source_bytes=Path(file_path).stat().st_size, top_n=top_n)}
 
 
+def _finite(v) -> float | None:
+    """JSON-safe float: NaN/±inf → None. pandas returns NaN for undefined moments
+    (kurtosis needs ≥4 points, skew ≥3, std ≥2); json.dump writes that as a literal
+    ``NaN`` token, which FastAPI's strict response serializer (allow_nan=False)
+    rejects — a single low-cardinality column once 500'd /summary for the whole run."""
+    v = float(v)
+    return v if math.isfinite(v) else None
+
+
 def _count_duplicates_parquet(pf, batch_rows: int = 131_072) -> int:
     """Exact duplicate-row count with bounded memory: hash each row (batched) and keep only
     the uint64 hashes (8 bytes/row), not the rows themselves. 64-bit collisions are
@@ -271,11 +281,12 @@ def extract_metadata_from_parquet(raw_path: Path, source_bytes: int, top_n: int 
                 if len(sn):
                     q1, q3 = float(np.percentile(sn, 25)), float(np.percentile(sn, 75))
                     numeric_stats[col] = {
-                        "min": float(sn.min()), "max": float(sn.max()),
-                        "mean": float(sn.mean()), "median": float(sn.median()),
-                        "std": float(sn.std()), "skew": float(sn.skew()),
-                        "kurtosis": float(sn.kurtosis()),
-                        "q1": q1, "q3": q3, "iqr": round(q3 - q1, 6),
+                        "min": _finite(sn.min()), "max": _finite(sn.max()),
+                        "mean": _finite(sn.mean()), "median": _finite(sn.median()),
+                        "std": _finite(sn.std()), "skew": _finite(sn.skew()),
+                        "kurtosis": _finite(sn.kurtosis()),
+                        "q1": _finite(q1), "q3": _finite(q3),
+                        "iqr": _finite(round(q3 - q1, 6)),
                     }
             del s
 
@@ -398,11 +409,12 @@ def extract_metadata(df: pd.DataFrame, top_n: int = 5) -> dict:
                 continue
             q1, q3 = float(np.percentile(s, 25)), float(np.percentile(s, 75))
             numeric_stats[col] = {
-                "min": float(s.min()), "max": float(s.max()),
-                "mean": float(s.mean()), "median": float(s.median()),
-                "std": float(s.std()), "skew": float(s.skew()),
-                "kurtosis": float(s.kurtosis()),
-                "q1": q1, "q3": q3, "iqr": round(q3 - q1, 6),
+                "min": _finite(s.min()), "max": _finite(s.max()),
+                "mean": _finite(s.mean()), "median": _finite(s.median()),
+                "std": _finite(s.std()), "skew": _finite(s.skew()),
+                "kurtosis": _finite(s.kurtosis()),
+                "q1": _finite(q1), "q3": _finite(q3),
+                "iqr": _finite(round(q3 - q1, 6)),
             }
 
     return {

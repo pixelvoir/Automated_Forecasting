@@ -9,11 +9,23 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
 RUNS_DIR = ROOT / "runs"
 RAW_DIR = ROOT / "data" / "raw"
 CLEANED_DIR = ROOT / "data" / "cleaned"
+CONFIG_PATH = ROOT / "config" / "settings.yaml"
+
+
+def _target_drift_threshold() -> float:
+    """The validation gate's max_target_sum_drift_pct — shared so the execution-time
+    target-level guard below and the gate can never disagree."""
+    try:
+        cfg = yaml.safe_load(CONFIG_PATH.read_text()) or {}
+        return float(cfg.get("validation_gate", {}).get("max_target_sum_drift_pct", 5))
+    except Exception:
+        return 5.0
 
 
 # ── Missing-value handlers ────────────────────────────────────────────────────
@@ -28,8 +40,14 @@ def _apply_missing(df: pd.DataFrame, col: str, strategy: str,
     s = df[col]
     grouped = bool(group_cols)
 
+    # dropna=False everywhere a series key groups rows: pandas' default (dropna=True)
+    # EXCLUDES rows whose key is null from the result, and the index-aligned assignment
+    # back then writes NaN into every excluded row — observed real failure: a 99.94%-null
+    # series key (WARDNAME) turned per-series forward_fill into a mass ERASE of four
+    # columns' real values (6% null → 99.94% null, no_null_regression gate failure).
+    # Null-key rows form their own "(unknown)" series instead.
     def _gb():
-        return df.groupby(group_cols, sort=False)
+        return df.groupby(group_cols, sort=False, dropna=False)
 
     if strategy == "interpolate":
         # Interpolation is only defined for numerics — a recipe (LLM or fallback) can
@@ -46,8 +64,8 @@ def _apply_missing(df: pd.DataFrame, col: str, strategy: str,
             # Per-series positional interpolation (rows already time-ordered inside each
             # series). Time-weighted interpolation per series would need a reindex per
             # group for marginal gain on regular grids.
-            df[col] = df.groupby(group_cols, sort=False, group_keys=False)[col].apply(
-                lambda x: x.interpolate())
+            df[col] = df.groupby(group_cols, sort=False, group_keys=False,
+                                 dropna=False)[col].apply(lambda x: x.interpolate())
         # time-based interpolation requires a DatetimeIndex.
         # Raw parquet has a RangeIndex, so temporarily align the series on the
         # timestamp column so pandas uses actual time gaps between rows.
@@ -215,8 +233,10 @@ def _apply_outlier(df: pd.DataFrame, col: str, strategy: str,
 
     def _per_series(fn):
         # rows are pre-sorted by (group, time) in run(); group_keys=False keeps the
-        # original row index so the assignment aligns
-        return df.groupby(group_cols, sort=False, group_keys=False)[col].apply(fn)
+        # original row index so the assignment aligns. dropna=False: a null series key
+        # must not exclude its rows (the assignment would NaN them — see _apply_missing)
+        return df.groupby(group_cols, sort=False, group_keys=False,
+                          dropna=False)[col].apply(fn)
 
     if strategy == "winsorize":
         # distribution-level cap — deliberately global even on panels
@@ -237,7 +257,8 @@ def _apply_outlier(df: pd.DataFrame, col: str, strategy: str,
     elif strategy == "stl_residuals":
         period = max(_period_from_recipe(recipe), 2)
         if grouped:
-            n_groups = df.groupby(group_cols, sort=False, observed=True).ngroups
+            n_groups = df.groupby(group_cols, sort=False, observed=True,
+                                  dropna=False).ngroups
             allow_stl = n_groups <= _STL_MAX_GROUPS
             df[col] = _per_series(lambda x: _seasonal_replace_series(x, period, allow_stl))
         else:
@@ -359,7 +380,17 @@ def run(run_id: str) -> dict:
         df = df.sort_values([*group_cols, ts_col], kind="stable").reset_index(drop=True)
     drop_rows_mask = pd.Series(False, index=df.index)
 
-    # 3. Collect outlier-remove rows; apply other outlier strategies in-place
+    # 3. Collect outlier-remove rows; apply other outlier strategies in-place.
+    # Target-level guard: the sanitizer allows nominally level-neutral repairs
+    # (rolling_iqr / stl_residuals) on a sum/mean target, but "level-neutral" is an
+    # assumption, not a guarantee — on a target riddled with huge junk sentinels the
+    # repair can move the total enormously (observed: rolling_iqr shifted a sum-target
+    # +182%, hard-failing the gate with no way forward). So VERIFY: measure the target
+    # total around the treatment and revert it when the drift alone would breach the
+    # gate's threshold — the run then proceeds with the target untouched, and the
+    # reversion is surfaced in the cleaning report instead of a dead-end gate failure.
+    target_agg = str(recipe.get("target_agg") or "sum")
+    target_outlier_reverted: dict | None = None
     for col, col_rec in cols_recipe.items():
         if col not in df.columns:
             continue
@@ -368,7 +399,7 @@ def run(run_id: str) -> dict:
             if group_cols:
                 # per-series fences — a small series' normal values are outliers only
                 # relative to ITS OWN distribution, not the whole panel's
-                gb = df.groupby(group_cols, sort=False)
+                gb = df.groupby(group_cols, sort=False, dropna=False)
                 q1 = gb[col].transform("quantile", 0.25)
                 q3 = gb[col].transform("quantile", 0.75)
                 iqr = q3 - q1
@@ -383,7 +414,24 @@ def run(run_id: str) -> dict:
                     mask = (df[col] < q1 - 1.5 * iqr) | (df[col] > q3 + 1.5 * iqr)
                     drop_rows_mask = drop_rows_mask | mask.reindex(df.index, fill_value=False)
         elif strategy not in ("keep", "remove"):
+            guarded = col == target_col and target_agg in ("sum", "mean")
+            if guarded:
+                before_vals = df[col].copy()
+                before_tot = float(pd.to_numeric(before_vals, errors="coerce").sum())
             df = _apply_outlier(df, col, strategy, recipe=recipe, group_cols=group_cols)
+            if guarded and np.isfinite(before_tot) and before_tot != 0:
+                after_tot = float(pd.to_numeric(df[col], errors="coerce").sum())
+                threshold = _target_drift_threshold()
+                drift = (abs(after_tot - before_tot) / abs(before_tot) * 100
+                         if np.isfinite(after_tot) else float("inf"))
+                if drift > threshold:
+                    df[col] = before_vals
+                    target_outlier_reverted = {
+                        "column": col,
+                        "strategy": strategy,
+                        "would_be_drift_pct": round(drift, 2) if np.isfinite(drift) else None,
+                        "threshold_pct": threshold,
+                    }
 
     # 4. Collect missing drop_row rows; apply other missing strategies in-place
     for col, col_rec in cols_recipe.items():
@@ -438,6 +486,7 @@ def run(run_id: str) -> dict:
         "target_total_before": target_total_before,
         "target_total_after": target_total_after,
         "target_total_drift_pct": target_drift_pct,
+        "target_outlier_reverted": target_outlier_reverted,
         "cols_dropped": removed_cols,
         "recipe_applied": recipe,
     }
@@ -452,6 +501,7 @@ def run(run_id: str) -> dict:
         "target_total_before": target_total_before,
         "target_total_after": target_total_after,
         "target_total_drift_pct": target_drift_pct,
+        "target_outlier_reverted": target_outlier_reverted,
         "cols_dropped": removed_cols,
         "cleaned_path": str(cleaned_path),
         "snapshot": snapshot,

@@ -410,6 +410,12 @@ h5.fw-semibold, h6.fw-semibold {
 ._dash-loading-callback { opacity: 0.6; transition: opacity 0.2s ease; }
 .spinner-border { border-color: rgba(99, 102, 241, 0.25) !important; border-top-color: #6366f1 !important; }
 
+/* dcc.Loading (type=circle) ships the spinkit circle with `margin: 1rem auto`:
+   40px spinner + 32px margin needs 72px, but the overlay centers it inside the
+   wrapped content's own height — inside a ~38px button wrapper it clips top and
+   bottom. Trim the margin so the spinner fits small wrappers. */
+.dash-sk-circle { margin: 2px auto !important; }
+
 /* ── Theme toggle button ──────────────────────────────────── */
 #btn-theme-toggle {
   color: #64748b !important;

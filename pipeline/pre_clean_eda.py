@@ -272,11 +272,14 @@ def _constant_from_meta(stage1: dict, variance_threshold: float = 0.001) -> list
     for col, info in stage1.get("cardinality", {}).items():
         if info.get("unique_count", 2) <= 1:
             constant.append(col)
-    # From numeric_stats: std is near zero
+    # From numeric_stats: std is near zero. Stats can be None (undefined moment on a
+    # tiny/degenerate column, stored as null) — treat like missing, i.e. don't flag.
     for col, stats in stage1.get("numeric_stats", {}).items():
         if col not in constant:
-            std = stats.get("std", 1.0)
-            mean = abs(stats.get("mean", 1.0))
+            std = stats.get("std")
+            std = 1.0 if std is None else std
+            mean = stats.get("mean")
+            mean = abs(1.0 if mean is None else mean)
             if mean > 0 and std / mean < variance_threshold:
                 constant.append(col)
             elif mean == 0 and std < 1e-9:
@@ -366,7 +369,7 @@ def _column_profile(df: pd.DataFrame, stage1: dict) -> dict:
         if stats is not None and col in df.columns:
             s = pd.to_numeric(df[col], errors="coerce")
             p["zero_pct"] = round(float((s == 0).mean() * 100), 2)
-            p["skew"] = round(stats.get("skew", 0), 2)
+            p["skew"] = round(stats.get("skew") or 0, 2)
         profile[col] = p
     return profile
 

@@ -161,7 +161,7 @@ def run(run_id: str) -> dict:
     stage1_stats = stage1.get("numeric_stats", {})
     zero_variance = [
         col for col, var in numeric_variance.items()
-        if var == 0.0 and stage1_stats.get(col, {}).get("std", 0) > 0
+        if var == 0.0 and (stage1_stats.get(col, {}).get("std") or 0) > 0
     ]
     checks["numeric_variance"] = {
         "passed": len(zero_variance) == 0,

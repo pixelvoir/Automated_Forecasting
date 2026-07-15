@@ -421,13 +421,40 @@ def render_data_pane(data):
     Input("results-store", "data"),
 )
 def render_clean_body(data):
-    """Cleaning & Validation card body (Pipeline section) — results only; the intent
-    form lives on Setup (render_intent_form)."""
+    """Cleaning & Validation card body (Pipeline section) — results plus a re-run
+    button (rerun_cleaning re-fires the whole clean → validate → EDA → model-select
+    chain with the confirmed setup, so a failed gate can be retried without a trip
+    back to Setup); the intent form itself lives on Setup (render_intent_form)."""
     stage3 = (data or {}).get("_stage3") or {}
+    selections = ((data or {}).get("_intent") or {}).get("selections") or {}
+    rerun_row = None
+    if selections.get("target_col"):
+        rerun_row = html.Div([
+            dcc.Loading(
+                dbc.Button(
+                    [_cicon("bi-arrow-clockwise"),
+                     "Re-run Cleaning" if stage3 else "Run Cleaning"],
+                    id="btn-clean-rerun", color="primary", size="sm",
+                    style={"fontWeight": "600"},
+                ),
+                type="circle", color="#6366f1", delay_show=100,
+                target_components={"cleaning-status": "children"},
+            ),
+            html.Small(
+                "Re-runs the chain (clean → validate → forecast EDA → model select) "
+                "with the confirmed setup. To change the setup itself, use the "
+                "Setup section.",
+                style={"color": "var(--ink-faint)", "fontSize": "0.72rem",
+                       "marginLeft": "10px"}),
+        ], className="d-flex align-items-center mb-3")
     if not stage3:
-        return html.P("Runs when you confirm the forecast setup on the Setup section.",
-                      style={"color": "var(--ink-faint)", "fontSize": "0.85rem"}, className="mb-0")
-    return html.Div([_llm_status_banner(stage3), *_render_stage3(stage3)])
+        return html.Div([
+            html.P("Runs when you confirm the forecast setup on the Setup section.",
+                   style={"color": "var(--ink-faint)", "fontSize": "0.85rem"},
+                   className="mb-0" if not rerun_row else "mb-2"),
+            rerun_row,
+        ])
+    return html.Div([rerun_row, _llm_status_banner(stage3), *_render_stage3(stage3)])
 
 
 @callback(
@@ -444,9 +471,7 @@ def render_intent_form(data, auto_state):
     suggestions = intent.get("suggestions")
     stage3 = data.get("_stage3", {})
 
-    header = html.Div([html.Span([_cicon("bi-sliders"), "Forecast setup"],
-                                 className="fw-semibold section-title")], className="mb-3")
-    kids = [header]
+    kids = []
     if (auto_state or {}).get("phase") == "await_intent":
         kids.append(dbc.Alert(
             [_cicon("bi-pause-circle"),
@@ -461,7 +486,9 @@ def render_intent_form(data, auto_state):
         kids += [intent_view.llm_intent_banner(suggestions),
                  intent_view.build_intent_form(suggestions, intent.get("selections"),
                                                already_run=bool(stage3))]
-    return html.Div(kids)
+    # Same expander chrome as the Dataset / Pre-clean EDA cards above it, so the three
+    # Setup headings read as one family. Open — this is the pipeline's user checkpoint.
+    return ui.stage_card("intent", "Forecast Setup", "bi-sliders", kids, open=True)
 
 
 # ── Pipeline progress rail + log (polled while any chain callback is in flight) ──
@@ -749,87 +776,62 @@ def _render_data_results(data):
                                       "Skew", "Kurtosis", "IQR"]),
             icon="bi-bar-chart-line")]
 
+    dataset_card = ui.stage_card(
+        "dataset", "Dataset", "bi-database-check",
+        [
+            shape_card,
+            ui.collapse_section(
+                f"Schema ({len(schema_rows)} columns)",
+                _datatable(schema_rows, ["Column", "Inferred type", "DB dtype", "Null count",
+                                         "Null %", "Frequency"]),
+                icon="bi-table"),
+            *numeric_section,
+        ],
+        summary_extra=f"{shape.get('rows', 0):,} rows × {shape.get('cols', 0)} cols",
+    )
+
     stage2 = data.get("_stage2", {})
-    stage2_section = _render_stage2(stage2) if stage2 else []
+    if stage2:
+        stage2_body = _render_stage2(stage2) or [html.P(
+            "No profile payload available for this run.",
+            style={"color": "var(--ink-faint)", "fontSize": "0.85rem"}, className="mb-0")]
+        profile_card = ui.stage_card("pre_clean_eda", "Pre-clean EDA", "bi-search",
+                                     stage2_body)
+    else:
+        # Open so the retry button is visible — pre-clean EDA normally auto-runs after
+        # ingestion but can fail or get preempted.
+        profile_card = ui.stage_card("pre_clean_eda", "Pre-clean EDA", "bi-search",
+                                     _eda_retry_prompt(), open=True)
 
-    header = html.Div([
-        html.H5(
-            [_cicon("bi-database-check", color="#10b981", marginRight="7px"), "Dataset"],
-            className="fw-semibold mb-0 section-title",
-        ),
-        dbc.Button(
-            [html.I(className="bi bi-arrow-counterclockwise", style={"marginRight": "4px"}), "New Run"],
-            id="btn-clear-results",
-            color="outline-secondary",
-            size="sm",
-            className="text-decoration-none",
-        ),
-    ], className="d-flex justify-content-between align-items-center mb-3")
-
-    return html.Div([
-        header,
-        shape_card,
-        ui.collapse_section(
-            f"Schema ({len(schema_rows)} columns)",
-            _datatable(schema_rows, ["Column", "Inferred type", "DB dtype", "Null count",
-                                     "Null %", "Frequency"]),
-            icon="bi-table"),
-        *numeric_section,
-        *stage2_section,
-        _cleaning_hint(data),
-    ])
+    return html.Div([dataset_card, profile_card])
 
 
-def _cleaning_hint(data):
-    """Below the schema/stats: either a retry button (pre-clean EDA hasn't run — this
-    normally happens automatically after ingestion, but can fail or get preempted) or a
-    prompt to move on to the Cleaning tab."""
-    if "_stage2" not in data:
-        return html.Div(
-            [
-                html.P(
-                    "Pre-clean EDA hasn't run for this dataset yet.",
-                    style={"color": "var(--ink-muted)", "fontSize": "0.85rem", "marginBottom": "8px"},
+def _eda_retry_prompt():
+    """Pre-clean EDA card body when Stage 2 hasn't produced results — a retry button
+    (the stage normally runs automatically after ingestion, but can fail or get
+    preempted)."""
+    return html.Div(
+        [
+            html.P(
+                "Pre-clean EDA hasn't run for this dataset yet.",
+                style={"color": "var(--ink-muted)", "fontSize": "0.85rem", "marginBottom": "8px"},
+            ),
+            dcc.Loading(
+                dbc.Button(
+                    [_cicon("bi-play-fill"), "Run Pre-clean EDA"],
+                    id="btn-run-eda", color="primary", size="sm",
                 ),
-                dcc.Loading(
-                    dbc.Button(
-                        [_cicon("bi-play-fill"), "Run Pre-clean EDA"],
-                        id="btn-run-eda", color="primary", size="sm",
-                    ),
-                    type="circle", color="#6366f1", delay_show=100,
-                    target_components={"cleaning-status": "children"},
-                ),
-            ],
-            className="mt-4",
-        )
-    return dbc.Alert(
-        [_cicon("bi-arrow-right-circle", color="#6366f1"),
-         "Pre-clean EDA complete — open the ", html.Strong("Cleaning"), " tab to continue."],
-        color="info", className="mt-4 py-2",
+                type="circle", color="#6366f1", delay_show=100,
+                target_components={"cleaning-status": "children"},
+            ),
+        ],
     )
 
 
-# ── 6. New Run / reset — clears the store; render_data_pane restores the form ──
-# Both the right-panel "New Run" button and the left "Load Different Dataset" button
-# reset everything. The n_clicks guards are load-bearing: btn-clear-results is rendered
-# dynamically, so this callback also fires when the button MOUNTS (see module
-# docstring) — without the guard that spurious fire wipes the store and cancels
-# whatever job is running.
-
-@callback(
-    Output("results-store", "data", allow_duplicate=True),
-    Output("stage-tabs", "value", allow_duplicate=True),
-    Output("auto-run-store", "data", allow_duplicate=True),
-    Input("btn-clear-results", "n_clicks"),
-    running=[(Output("btn-clear-results", "disabled"), True, False)],
-    prevent_initial_call=True,
-)
-def clear_results(n_clicks):
-    if not n_clicks:
-        return no_update, no_update, no_update
-    _cancel_running()
-    return None, "tab-setup", None
-
+# ── 6. New dataset / reset — clears the store; render_data_pane restores the form ──
+# The left-column "Load Different Dataset" button resets everything. The n_clicks guard
+# is load-bearing (see module docstring — mount-fires would wipe the store and cancel
+# whatever job is running).
 
 @callback(
     Output("results-store", "data", allow_duplicate=True),
@@ -1005,12 +1007,9 @@ def _render_stage2(stage2: dict) -> list:
 
     _sh = {"color": "var(--ink-muted)", "fontSize": "0.78rem", "textTransform": "uppercase", "letterSpacing": "0.06em"}
 
-    sections = [
-        html.Hr(className="my-4"),
-        html.H5([html.I(className="bi bi-search", style={"marginRight": "7px", "color": "#10b981"}),
-                 "Pre-clean EDA"],
-                className="fw-semibold mb-3 section-title"),
-    ]
+    # No heading here — the Setup section wraps this in a stage_card expander whose
+    # summary row is the heading.
+    sections = []
 
     missing = dp.get("missing", {})
     if missing:
@@ -1107,7 +1106,9 @@ def _datatable(rows, columns):
     )
 
 
-def _fmt(v: float) -> str:
+def _fmt(v) -> str:
+    if v is None:
+        return "—"  # undefined statistic (e.g. kurtosis on a near-constant column)
     return f"{v:,.4f}" if abs(v) < 1e6 else f"{v:,.2f}"
 
 
@@ -1116,7 +1117,10 @@ def _fmt(v: float) -> str:
 # Outputs to cleaning-status (persistent in layout) instead of any dynamically rendered
 # component, so the store update always reaches the pane renderers regardless of
 # component lifecycle timing in Dash 4. On full success the UI lands on the Pipeline
-# section; in auto mode it then hands off to auto_run_train via auto-run-store.
+# section. The auto-train handoff happens ONLY on the auto-run flow's one pause
+# (phase == "await_intent") — a later re-confirm (fixing the series key, changing the
+# target…) is always manual and stops after model selection: training is expensive and
+# must never fire as a side effect of iterating on the setup.
 
 @callback(
     Output("results-store", "data", allow_duplicate=True),
@@ -1134,18 +1138,23 @@ def _fmt(v: float) -> str:
     State("dropdown-intent-freq", "value"),
     State("input-intent-horizon", "value"),
     State("switch-use-llm", "value"),
+    State("switch-skip-clean", "value"),
     State("switch-auto-run", "value"),
+    State("auto-run-store", "data"),
     running=[(Output("btn-confirm-run", "disabled"), True, False),
              (Output("progress-interval", "disabled"), False, True)],
     prevent_initial_call=True,
 )
 def confirm_and_run(n_clicks, store_data, ts, target, agg, scope, group_cols,
-                    exog, freq, horizon, use_llm, auto_run):
+                    exog, freq, horizon, use_llm, skip_clean, auto_run, auto_state):
     if not n_clicks or not store_data:
         return no_update, no_update, no_update, no_update
     run_id = store_data.get("run_id")
-    _fail_auto = ({"mode": "auto", "run_id": run_id, "phase": "failed"}
-                  if auto_run else no_update)
+    # Auto-train only when this confirm IS the auto-run flow's pending pause AND the
+    # switch is still on (flipping it off during the pause cancels the handoff).
+    auto_continue = (bool(auto_run)
+                     and (auto_state or {}).get("phase") == "await_intent"
+                     and (auto_state or {}).get("run_id") == run_id)
     if not run_id:
         return no_update, dbc.Alert("No active run found.", color="warning", className="mb-2"), no_update, no_update
     if not ts or not target:
@@ -1167,7 +1176,17 @@ def confirm_and_run(n_clicks, store_data, ts, target, agg, scope, group_cols,
         "forecast_frequency": freq,
         "horizon": int(horizon) if horizon else None,
         "use_llm": bool(use_llm),
+        "skip_cleaning": bool(skip_clean),
     }
+    return _run_clean_chain(run_id, store_data, body, bool(use_llm), auto_continue)
+
+
+def _run_clean_chain(run_id, store_data, body, use_llm, auto_run):
+    """The one pipeline chain: POST /clean → /validate → /forecast-eda → /model-select.
+    Shared by confirm_and_run (Setup form) and rerun_cleaning (Pipeline card button).
+    Returns the 4-tuple (store, cleaning-status alert, tab value, auto-run state)."""
+    _fail_auto = ({"mode": "auto", "run_id": run_id, "phase": "failed"}
+                  if auto_run else no_update)
     try:
         clean_resp = requests.post(f"{API_URL}/runs/{run_id}/clean", json=body,
                                    timeout=1800)  # 30 min — large datasets take time
@@ -1189,7 +1208,8 @@ def confirm_and_run(n_clicks, store_data, ts, target, agg, scope, group_cols,
         new_store = {**store_data, "_stage3": stage3_data}
         new_store["_intent"] = {
             **(store_data.get("_intent") or {}),
-            "selections": {k: v for k, v in body.items() if k != "use_llm"},
+            "selections": {k: v for k, v in body.items()
+                           if k not in ("use_llm", "skip_cleaning")},
         }
         # The cleaned parquet was just rewritten — earlier Stage 4-8 results describe
         # data that no longer exists (the backend purged them on disk too).
@@ -1249,6 +1269,44 @@ def confirm_and_run(n_clicks, store_data, ts, target, agg, scope, group_cols,
                                     className="mb-2"), no_update, _fail_auto
 
 
+# ── Re-run cleaning from the Pipeline card (no trip back to Setup) ───────────
+# Same chain as confirm_and_run, but with the already-confirmed selections from the
+# store — for iterating on a failed gate without re-filling the Setup form. Always
+# manual (auto_run=False): someone debugging cleaning doesn't want training to
+# auto-fire the moment the gate passes.
+
+@callback(
+    Output("results-store", "data", allow_duplicate=True),
+    Output("cleaning-status", "children", allow_duplicate=True),
+    Output("stage-tabs", "value", allow_duplicate=True),
+    Output("auto-run-store", "data", allow_duplicate=True),
+    Input("btn-clean-rerun", "n_clicks"),
+    State("results-store", "data"),
+    State("switch-use-llm", "value"),
+    State("switch-skip-clean", "value"),
+    running=[(Output("btn-clean-rerun", "disabled"), True, False),
+             (Output("progress-interval", "disabled"), False, True)],
+    prevent_initial_call=True,
+)
+def rerun_cleaning(n_clicks, store_data, use_llm, skip_clean):
+    if not n_clicks or not store_data:
+        return no_update, no_update, no_update, no_update
+    run_id = store_data.get("run_id")
+    selections = (store_data.get("_intent") or {}).get("selections") or {}
+    if not run_id or not selections.get("target_col"):
+        return no_update, dbc.Alert(
+            "No confirmed forecast setup to re-run — confirm it on the Setup section "
+            "first.", color="warning", dismissable=True, className="mb-2"), \
+            no_update, no_update
+    # The switches live on the Setup pane; their State is None when not mounted —
+    # use-llm defaults True (the house pattern), skip-clean defaults False.
+    body = {**selections,
+            "use_llm": True if use_llm is None else bool(use_llm),
+            "skip_cleaning": bool(skip_clean)}
+    return _run_clean_chain(run_id, store_data, body,
+                            use_llm=body["use_llm"], auto_run=False)
+
+
 # ── Cleaning results (Pipeline section card body) ────────────────────────────
 
 def _llm_response_details(stage3: dict):
@@ -1289,6 +1347,15 @@ def _llm_status_banner(stage3: dict):
     err = stage3.get("recipe_error")
     model = stage3.get("llm_model")
     details = _llm_response_details(stage3)
+    if src == "skipped":
+        return dbc.Alert(
+            [_cicon("bi-skip-forward", color="#6366f1"),
+             html.Strong("Cleaning skipped"),
+             html.Span(" — essentials only: dtype casts, timestamp parse & sort. "
+                       "No fills, no outlier treatment, no column drops.",
+                       style={"fontSize": "0.85rem", "marginLeft": "4px"})],
+            color="info", className="py-2 mb-2",
+        )
     if src == "llm":
         return html.Div([
             dbc.Alert(
@@ -1407,6 +1474,23 @@ def _render_stage3(stage3: dict) -> list:
             if drift_bad else None,
         ])), className="mb-3",
             style={"borderLeft": f"3px solid {drift_color}"}))
+
+    # Execution-time target-level guard: the cleaner measured the recipe's outlier
+    # treatment on the target, found it would breach the gate's drift threshold, and
+    # reverted it — say so, or the recipe table would claim a treatment that never ran.
+    reverted = stage3.get("target_outlier_reverted")
+    if reverted:
+        sections.append(dbc.Alert(
+            [_cicon("bi-shield-check"),
+             html.Strong("Target protected: "),
+             f"'{reverted.get('strategy')}' on '{reverted.get('column')}' was "
+             f"automatically reverted — it would have shifted the target total by "
+             f"{reverted.get('would_be_drift_pct')}% (allowed: "
+             f"{reverted.get('threshold_pct')}%). The target keeps its raw values, so "
+             "extreme/junk values may remain — consider excluding them at the source "
+             "if forecasts look off.",
+            ],
+            color="warning", className="py-2 mb-3"))
 
     # Cleaning recipe table
     col_recipes = recipe.get("columns", {})

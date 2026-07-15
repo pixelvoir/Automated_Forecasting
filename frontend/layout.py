@@ -369,11 +369,17 @@ def create_layout():
             ),
 
             # ── Persistent status area (targeted by run_cleaning; must stay mounted) ──
+            # overlay_style applies to the (hidden) children div ONLY while loading: the
+            # status div is normally empty (~0px tall), and dcc.Loading centers its 40px
+            # spinner within the wrapped content's height — without the reserved height
+            # the spinner straddled the container's top edge, half-hidden under the tab
+            # bar on every section.
             dcc.Loading(
                 html.Div(id="cleaning-status", className="mb-2 mt-3"),
                 type="circle",
                 color="#6366f1",
                 delay_show=100,
+                overlay_style={"minHeight": "44px"},
                 target_components={"cleaning-status": "children"},
             ),
 

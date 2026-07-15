@@ -74,7 +74,8 @@ def build_intent_form(suggestions: dict, selections: dict | None, already_run: b
     ts_default = selections.get("timestamp_col") or ts_info.get("suggested")
     ts_options = [
         {"label": f"{c['col']}  ({c.get('frequency', '?')})"
-                  + ("  — ETL/audit" if c.get("is_audit") else ""),
+                  + ("  — ETL/audit" if c.get("is_audit") else "")
+                  + ("  — ⚠ time-of-day only, no date" if c.get("is_time_only") else ""),
          "value": c["col"]}
         for c in ts_info.get("candidates", [])
     ]
@@ -121,14 +122,15 @@ def build_intent_form(suggestions: dict, selections: dict | None, already_run: b
 
     return dbc.Card(
         dbc.CardBody([
+            # No card title — the Setup section's "Forecast Setup" expander summary is
+            # the heading; this row carries the detection note + the Re-detect action.
             html.Div([
-                html.P([_cicon("bi-sliders"), "Confirm Forecast Setup"],
-                       className="fw-semibold mb-0 section-title"),
+                html.P(note, style={"fontSize": "0.75rem", "color": "var(--ink-faint)"},
+                       className="mb-0 me-3"),
                 dbc.Button([_cicon("bi-arrow-clockwise"), "Re-detect"],
                            id="btn-intent-redetect", color="link", size="sm",
-                           className="p-0 text-decoration-none"),
-            ], className="d-flex justify-content-between align-items-center mb-2"),
-            html.P(note, style={"fontSize": "0.75rem", "color": "var(--ink-faint)"}, className="mb-3"),
+                           className="p-0 text-decoration-none flex-shrink-0"),
+            ], className="d-flex justify-content-between align-items-center mb-3"),
 
             dbc.Row([
                 dbc.Col([
@@ -223,6 +225,14 @@ def build_intent_form(suggestions: dict, selections: dict | None, already_run: b
                 dbc.Col([
                     dbc.Switch(id="switch-use-llm", value=True,
                                label="Use LLM for pipeline (cleaning recipe + model selection)",
+                               className="mt-1",
+                               style={"fontSize": "0.82rem", "color": "var(--ink-muted)"}),
+                ], md=6),
+                dbc.Col([
+                    dbc.Switch(id="switch-skip-clean", value=False,
+                               label="Skip cleaning — essentials only (parse types & "
+                                     "timestamp, sort; no fills, no outlier treatment, "
+                                     "no drops)",
                                className="mt-1",
                                style={"fontSize": "0.82rem", "color": "var(--ink-muted)"}),
                 ], md=6),

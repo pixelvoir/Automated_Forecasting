@@ -160,19 +160,6 @@ def _decomposition_fig(decomp, series):
     return _style_fig(fig, height=560)
 
 
-def _acf_fig(values, conf_bound, title):
-    lags = list(range(1, len(values) + 1))
-    fig = go.Figure()
-    if conf_bound:
-        fig.add_hrect(y0=-conf_bound, y1=conf_bound,
-                      fillcolor="rgba(148,163,184,0.12)", line_width=0)
-    fig.add_trace(go.Bar(x=lags, y=values, name=title,
-                         marker=dict(color=_C_SERIES), width=0.5))
-    fig.update_layout(showlegend=False, bargap=0.4)
-    fig.update_xaxes(title_text="lag", title_font=dict(size=10))
-    return _style_fig(fig, height=230)
-
-
 def _overlay_fig(deep_dives, target):
     fig = go.Figure()
     for i, d in enumerate(deep_dives[:4]):
@@ -384,37 +371,6 @@ def _payload_details(payload):
     ], className="mb-3")
 
 
-def _seasonality_section(agg_stats):
-    seas = agg_stats.get("seasonality", {})
-    rows = [
-        {"Period": c["period"],
-         "Seasonal strength": _fmt(c.get("seasonal_strength")),
-         "Trend strength": _fmt(c.get("trend_strength")),
-         "SNR": _fmt(c.get("snr"), 1)}
-        for c in seas.get("candidates", [])
-    ]
-    fft_rows = [
-        {"FFT period": p["period"], "Power share": _fmt(p.get("power_share"))}
-        for p in seas.get("fft_peaks", [])
-    ]
-    if not rows and not fft_rows:
-        return []
-    cols = []
-    if rows:
-        cols.append(dbc.Col([
-            html.H6([_cicon("bi-arrow-repeat"), "Seasonal Periods Tested (STL)"],
-                    className="fw-semibold mb-2", style=_SH),
-            _datatable(rows, ["Period", "Seasonal strength", "Trend strength", "SNR"]),
-        ], md=7))
-    if fft_rows:
-        cols.append(dbc.Col([
-            html.H6([_cicon("bi-broadcast"), "FFT Dominant Cycles"],
-                    className="fw-semibold mb-2", style=_SH),
-            _datatable(fft_rows, ["FFT period", "Power share"]),
-        ], md=5))
-    return [dbc.Row(cols, className="mb-3")]
-
-
 def _detail_tables(agg_stats, payload):
     st = agg_stats.get("stationarity", {})
     fc = agg_stats.get("forecastability", {})
@@ -479,9 +435,8 @@ def _exog_section(exog):
          "Collinear": "yes — drop or combine" if (r.get("vif") or 0) > 10 else "no"}
         for r in exog.get("vif", [])
     ]
+    # No heading — rendered inside a collapse_section whose summary is the heading.
     out = [
-        html.H6([_cicon("bi-diagram-3"), "Exogenous Drivers"],
-                className="fw-semibold mb-2 mt-3", style=_SH),
         html.P(exog.get("note") or "", style={"fontSize": "0.72rem", "color": "var(--ink-faint)",
                                               "marginBottom": "6px"}),
     ]
@@ -548,13 +503,17 @@ def _panel_section(full):
     ]
     if deep:
         target = full.get("selections", {}).get("target_col", "")
-        out.append(_chart_card(
-            "Top Series by Volume", "bi-graph-up",
-            _graph(_overlay_fig(deep, target)),
-            subtitle="The highest-volume individual series, for comparison against the aggregate.",
-        ))
-        out.append(_datatable(deep_rows, ["Series", "Pattern", "Seasonal strength",
-                                          "Trend strength", "Forecastability", "CV"]))
+        out.append(collapse_section(
+            f"Top series by volume ({len(deep)} deep-dived)",
+            [html.P("The highest-volume individual series, for comparison against "
+                    "the aggregate.",
+                    style={"fontSize": "0.72rem", "color": "var(--ink-faint)",
+                           "marginBottom": "6px"}),
+             _graph(_overlay_fig(deep, target)),
+             html.Div(_datatable(deep_rows, ["Series", "Pattern", "Seasonal strength",
+                                             "Trend strength", "Forecastability", "CV"]),
+                      className="mt-3")],
+            icon="bi-graph-up"))
     return out
 
 
@@ -595,35 +554,21 @@ def _results_section(stage4):
                      f"({scope_label}).",
         ))
 
+    # Deep-dive material lives behind expanders — the visible page is just the verdict
+    # tiles and the analysis series; a reader who wants the evidence opens it.
     if plot_data.get("decomposition"):
         d = plot_data["decomposition"]
-        sections.append(_chart_card(
-            f"Decomposition (period = {d.get('period')})", "bi-layers",
+        sections.append(collapse_section(
+            f"Decomposition — trend / seasonal / residual (period = {d.get('period')})",
             _graph(_decomposition_fig(d, plot_data["series"])),
-            subtitle="Trend + seasonal + residual split behind the strength scores above.",
-        ))
-
-    ac = agg.get("autocorrelation", {})
-    if ac.get("acf"):
-        acf_col = dbc.Col([_graph(_acf_fig(ac["acf"], ac.get("conf_bound"), "ACF"))], md=6)
-        cols = [acf_col]
-        if ac.get("pacf"):
-            cols.append(dbc.Col([_graph(_acf_fig(ac["pacf"], ac.get("conf_bound"), "PACF"))],
-                                md=6))
-        sections.append(_chart_card(
-            "Autocorrelation (ACF / PACF)", "bi-bar-chart-line",
-            dbc.Row(cols),
-            subtitle="Bars outside the gray band are statistically significant lags.",
-        ))
-
-    seas_rows = _seasonality_section(agg)
-    if seas_rows:
-        sections.append(collapse_section("Seasonality tables (STL periods + FFT)",
-                                         seas_rows, icon="bi-arrow-repeat"))
+            icon="bi-layers"))
     sections.append(collapse_section("Statistical detail (16 tests)",
                                      _detail_tables(agg, payload),
                                      icon="bi-clipboard-data"))
-    sections += _exog_section(full.get("exogenous"))
+    exog_rows = _exog_section(full.get("exogenous"))
+    if exog_rows:
+        sections.append(collapse_section("Exogenous drivers (lead/lag correlation + VIF)",
+                                         exog_rows, icon="bi-diagram-3"))
     sections += _panel_section(full)
     sections.append(html.Hr(className="my-3"))
     sections.append(_payload_details(payload))

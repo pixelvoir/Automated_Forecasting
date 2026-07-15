@@ -397,7 +397,42 @@ def _sanitize_recipe(recipe: dict, meta: dict, payload: dict | None = None,
 
 # ── Stage 3 entry point ───────────────────────────────────────────────────────
 
-def run(run_id: str, use_llm: bool = True) -> dict:
+def _minimal_recipe(all_cols: list[str]) -> dict:
+    """Skip-cleaning mode: a pass-through recipe — every column kept untouched."""
+    return {
+        "columns": {
+            col: {"missing_strategy": "none", "outlier_strategy": "keep",
+                  "type_fix": "none", "action": "keep"}
+            for col in all_cols
+        },
+        "drop_duplicates": False,
+        "sort_by_timestamp": True,
+        "timestamp_col": None,
+    }
+
+
+def _apply_essentials(recipe: dict, meta: dict) -> None:
+    """Skip-cleaning mode's replacement for _sanitize_recipe: ONLY what the pipeline
+    cannot function without, nothing opinionated. Real dtypes (string-stored dates sort
+    lexicographically; string-stored numerics silently zero out every downstream stat)
+    and usable timestamps (rows whose ts is null/unparseable can't be placed on the
+    time grid). No drops, no fills, no outlier treatment — that is the point of skip."""
+    dtypes = {s["col"]: s.get("dtype_inferred") for s in meta.get("schema", [])}
+    raw_dtypes = {s["col"]: s.get("dtype_raw", "") for s in meta.get("schema", [])}
+    ts_col = recipe.get("timestamp_col")
+    for col, cr in recipe.get("columns", {}).items():
+        raw = raw_dtypes.get(col, "")
+        if cr.get("type_fix") == "none":
+            if dtypes.get(col) == "datetime" and "datetime" not in raw:
+                cr["type_fix"] = "parse_datetime"
+            elif dtypes.get(col) == "numeric" and not any(t in raw for t in ("int", "float")):
+                cr["type_fix"] = "cast_numeric"
+        if col == ts_col:
+            cr["missing_strategy"] = "drop_row"
+            cr["action"] = "keep"
+
+
+def run(run_id: str, use_llm: bool = True, skip: bool = False) -> dict:
     """Stage 3 entry point: decide cleaning strategy via LLM (with rule-based fallback).
 
     Reads:  runs/{run_id}/cleaning_decision_payload.json  (Stage 2 output)
@@ -406,7 +441,11 @@ def run(run_id: str, use_llm: bool = True) -> dict:
     Writes: runs/{run_id}/cleaning_recipe.json
             runs/{run_id}/cleaning_status.json            (recipe_source + recipe_error)
     Set use_llm=False to skip the LLM entirely and use the rule-based recipe directly.
-    Returns {run_id, recipe, recipe_source: "llm" | "fallback", recipe_error: str | None}.
+    Set skip=True to skip cleaning decisions altogether: a pass-through recipe with only
+    the essentials (dtype casts, timestamp parse/drop-null, sort) — for data that is
+    already clean or when cleaning causes more trouble than it prevents.
+    Returns {run_id, recipe, recipe_source: "llm" | "fallback" | "skipped",
+    recipe_error: str | None}.
     """
     run_dir = RUNS_DIR / run_id
     payload_path = run_dir / "cleaning_decision_payload.json"
@@ -432,7 +471,11 @@ def run(run_id: str, use_llm: bool = True) -> dict:
     llm_cfg = llm_client._load_llm_config()
     llm_model = f"{llm_cfg.get('provider', '?')}/{llm_cfg.get('model', '?')}"
 
-    if not use_llm:
+    if skip:
+        # Deliberate pass-through — no LLM, no rules, essentials only (applied below).
+        recipe_source = "skipped"
+        recipe = _minimal_recipe(all_cols)
+    elif not use_llm:
         # Deliberate rule-based-only run — not a failure, so no error is recorded.
         recipe_source = "fallback"
         recipe = _rule_based_fallback(payload, all_cols, rows=rows)
@@ -535,7 +578,10 @@ def run(run_id: str, use_llm: bool = True) -> dict:
         recipe["period"] = _FREQ_PERIOD.get(user_freq_str, 7) if user_freq_str else 7
 
     # Runs after the user timestamp override so the ts-col rule targets the final choice.
-    _sanitize_recipe(recipe, meta, payload, intent=intent)
+    if skip:
+        _apply_essentials(recipe, meta)
+    else:
+        _sanitize_recipe(recipe, meta, payload, intent=intent)
 
     # Thread the intent into the recipe so the executor stays recipe-driven: cleaner.py
     # uses group_cols to run temporal strategies per series instead of across
@@ -547,11 +593,12 @@ def run(run_id: str, use_llm: bool = True) -> dict:
     (run_dir / "cleaning_recipe.json").write_text(json.dumps(recipe, indent=2))
     # Persist status so a reloaded run (/summary) can show the real source + error,
     # plus the model identity and its raw response for the Cleaning tab display.
+    llm_used = use_llm and not skip
     (run_dir / "cleaning_status.json").write_text(
         json.dumps({
             "recipe_source": recipe_source,
             "recipe_error": recipe_error,
-            "llm_model": llm_model if use_llm else None,
+            "llm_model": llm_model if llm_used else None,
             "llm_response": llm_response,
         }, indent=2)
     )
@@ -561,6 +608,6 @@ def run(run_id: str, use_llm: bool = True) -> dict:
         "recipe": recipe,
         "recipe_source": recipe_source,
         "recipe_error": recipe_error,
-        "llm_model": llm_model if use_llm else None,
+        "llm_model": llm_model if llm_used else None,
         "llm_response": llm_response,
     }

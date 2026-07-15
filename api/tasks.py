@@ -51,14 +51,15 @@ def eda_task(run_id: str) -> dict:
                    detail="profiling data (pre-clean EDA)")
 
 
-def clean_task(run_id: str, use_llm: bool = True) -> dict:
-    """Decide the cleaning recipe (LLM or rule-based) then execute it on the parquet.
-    Returns the merged agent + cleaner result (without run_id/status, which the route adds)."""
+def clean_task(run_id: str, use_llm: bool = True, skip_cleaning: bool = False) -> dict:
+    """Decide the cleaning recipe (LLM or rule-based; skip_cleaning → pass-through
+    essentials-only recipe) then execute it on the parquet. Returns the merged agent +
+    cleaner result (without run_id/status, which the route adds)."""
     from agents import cleaning_agent
     from pipeline import cleaner
 
     def _run():
-        agent = cleaning_agent.run(run_id, use_llm=use_llm)
+        agent = cleaning_agent.run(run_id, use_llm=use_llm, skip=skip_cleaning)
         progress.stage_update(run_id, "clean",
                               f"recipe decided ({agent['recipe_source']}) — executing")
         clean = cleaner.run(run_id)

@@ -212,11 +212,15 @@ def _read_stage_json(path) -> dict | list | None:
     machine dying under memory pressure during training) can leave a file whose size was
     committed to NTFS but whose data blocks are all NUL bytes — json.loads then raises
     and, before this helper, 500'd the whole /summary so the run could never be reloaded.
-    A corrupt optional stage file now just means that stage shows as not-run in the UI."""
+    A corrupt optional stage file now just means that stage shows as not-run in the UI.
+
+    parse_constant maps literal ``NaN``/``Infinity`` tokens (Python's json.dump writes
+    them for non-finite floats; older runs have them on disk) to null — FastAPI's
+    response serializer uses allow_nan=False and would otherwise 500 the endpoint."""
     if not path.exists():
         return None
     try:
-        return json.loads(path.read_text())
+        return json.loads(path.read_text(), parse_constant=lambda _: None)
     except (OSError, ValueError) as e:
         logger.warning("Skipping corrupt stage file %s: %s", path, e)
         return None
@@ -329,7 +333,11 @@ def get_metadata(run_id: str):
     meta_path = RUNS_DIR / run_id / "metadata.json"
     if not meta_path.exists():
         raise HTTPException(status_code=404, detail=f"Metadata for run '{run_id}' not found.")
-    return json.loads(meta_path.read_text())
+    data = _read_stage_json(meta_path)
+    if data is None:
+        raise HTTPException(status_code=500,
+                            detail=f"Run '{run_id}' has a corrupt metadata.json.")
+    return data
 
 
 @router.get("/{run_id}/series-forecast")
@@ -502,6 +510,7 @@ class CleanRequest(BaseModel):
     forecast_frequency: str | None = None
     horizon: int | None = None
     use_llm: bool = True
+    skip_cleaning: bool = False        # pass-through recipe: dtype/ts essentials only
 
 
 @router.post("/{run_id}/clean")
@@ -512,7 +521,8 @@ def run_clean(run_id: str, req: CleanRequest = CleanRequest()):
     run_dir = RUNS_DIR / run_id
     if not run_dir.exists():
         raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found.")
-    selections = {k: v for k, v in req.model_dump().items() if k != "use_llm"}
+    selections = {k: v for k, v in req.model_dump().items()
+                  if k not in ("use_llm", "skip_cleaning")}
     (run_dir / "forecast_user_selections.json").write_text(json.dumps(selections, indent=2))
     # A re-clean invalidates every decision made on the old cleaned data (model selection,
     # features, training) — remove them so /summary can't resurrect a stale result if the
@@ -520,7 +530,8 @@ def run_clean(run_id: str, req: CleanRequest = CleanRequest()):
     _purge_downstream(run_id)
     progress.reset_downstream(run_id, "clean")
 
-    result = _run_job(tasks.clean_task, run_id, use_llm=req.use_llm, track_id=run_id)
+    result = _run_job(tasks.clean_task, run_id, use_llm=req.use_llm,
+                      skip_cleaning=req.skip_cleaning, track_id=run_id)
     return {"run_id": run_id, "status": "completed", **result}
 
 

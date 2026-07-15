@@ -111,8 +111,9 @@ def stage_rail(statuses: dict) -> html.Div:
 
 
 def log_panel(events: list) -> html.Div:
-    """Scrolling pipeline log — newest last (auto-scrolled to the bottom via CSS
-    column-reverse trick is unreliable; we simply render newest-last and cap height)."""
+    """Scrolling pipeline log — newest FIRST: the panel re-renders every 1.5s poll,
+    which resets its scroll position to the top, so the top must be where the current
+    activity is (newest-last forced a scroll after every poll to see the latest line)."""
     if not events:
         lines = [html.Div("No pipeline activity yet.", className="log-line log-line--empty")]
     else:
@@ -122,21 +123,29 @@ def log_panel(events: list) -> html.Div:
                 html.Span(e.get("stage", ""), className="log-stage"),
                 html.Span(e.get("msg", "")),
             ], className="log-line")
-            for e in events
+            for e in reversed(events)
         ]
     return html.Div(lines, className="pipeline-log")
 
 
-def stage_card(key: str, title: str, icon: str, body, open=False):
-    """A Pipeline-section expander wrapping one stage's full results body. The chrome is
-    static (defined once in layout.py); only the badge span (`stage-badge-{key}`) and the
-    body div inside are updated by callbacks."""
+def stage_card(key: str, title: str, icon: str, body, open=False, summary_extra=None):
+    """A stage expander wrapping one stage's full results body. In the Pipeline section
+    the chrome is static (defined once in layout.py) and only the badge span
+    (`stage-badge-{key}`) and the body div inside are updated by callbacks; the Setup
+    section reuses the same chrome for its dynamically rendered Dataset / Pre-clean EDA /
+    Forecast Setup expanders (their badge spans are simply never targeted).
+    ``summary_extra`` renders right-aligned muted text in the summary row."""
+    summary_kids = [
+        _cicon(icon, fontSize="0.85rem"),
+        html.Span(title, className="stage-card-title"),
+        html.Span(id=f"stage-badge-{key}", className="ms-2"),
+    ]
+    if summary_extra:
+        summary_kids.append(html.Span(
+            summary_extra, className="ms-auto",
+            style={"fontSize": "0.72rem", "color": "var(--ink-ghost)", "fontWeight": "400"}))
     return html.Details([
-        html.Summary([
-            _cicon(icon, fontSize="0.85rem"),
-            html.Span(title, className="stage-card-title"),
-            html.Span(id=f"stage-badge-{key}", className="ms-2"),
-        ], className="stage-card-summary"),
+        html.Summary(summary_kids, className="stage-card-summary"),
         html.Div(body, className="stage-card-body"),
     ], className="stage-card mb-3", open=open)
 

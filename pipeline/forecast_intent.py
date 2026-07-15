@@ -104,10 +104,33 @@ def _is_audit_ts(name: str) -> bool:
 
 # ── Timestamp candidates ─────────────────────────────────────────────────────
 
-def _timestamp_candidates(meta: dict) -> tuple[list[dict], str | None, str]:
+def _is_time_only(df: pd.DataFrame, col: str, sample_n: int = 5000) -> bool:
+    """A 'timestamp' whose values all parse onto a single calendar date is a
+    time-of-day-only column (e.g. RECVDTIME='11:05:33' stored beside RECVDDATE —
+    a common split-date/time DB schema). pandas stamps bare times with TODAY's date,
+    so the parsed span collapses to one day: useless as the forecast timeline (the
+    gate's series_length check would count 1 distinct daily period). Detected here
+    so it gets demoted and labeled instead of winning the granularity ranking."""
+    if col not in df.columns:
+        return False
+    s = df[col].dropna()
+    if len(s) == 0:
+        return False
+    if len(s) > sample_n:
+        s = s.iloc[:: len(s) // sample_n]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        parsed = pd.to_datetime(s, errors="coerce").dropna()
+    if len(parsed) < 2:
+        return False
+    return int(parsed.dt.normalize().nunique()) <= 1
+
+
+def _timestamp_candidates(meta: dict, df: pd.DataFrame) -> tuple[list[dict], str | None, str]:
     """Rank datetime columns: business/event timestamps above ETL audit ones, then by
-    granularity. Multiple business candidates (vet data has 3 event timestamps) → the
-    user must pick, so confidence drops to low."""
+    granularity; time-of-day-only columns rank below everything. Multiple business
+    candidates (vet data has 3 event timestamps) → the user must pick, so confidence
+    drops to low."""
     frequency = meta.get("frequency", {})
     cands = []
     for col in meta.get("datetime_cols", []):
@@ -115,17 +138,19 @@ def _timestamp_candidates(meta: dict) -> tuple[list[dict], str | None, str]:
             "col": col,
             "frequency": frequency.get(col, "unknown"),
             "is_audit": _is_audit_ts(col),
+            "is_time_only": _is_time_only(df, col),
         })
-    cands.sort(key=lambda c: (c["is_audit"],
+    cands.sort(key=lambda c: (c["is_time_only"], c["is_audit"],
                               _FREQ_GRANULARITY.get(c["frequency"], 9)))
+    usable = [c for c in cands if not c["is_audit"] and not c["is_time_only"]]
     business = [c for c in cands if not c["is_audit"]]
-    suggested = (business or cands)[0]["col"] if cands else None
+    suggested = (usable or business or cands)[0]["col"] if cands else None
     if not cands:
         confidence = "low"
-    elif len(business) == 1:
+    elif len(usable) == 1:
         confidence = "high"
-    elif len(business) == 0:
-        confidence = "low"      # only audit timestamps — something is off, user decides
+    elif len(usable) == 0:
+        confidence = "low"      # only audit/time-only timestamps — user decides
     else:
         confidence = "low"      # several plausible event timestamps — only the user knows
     return cands, suggested, confidence
@@ -325,7 +350,7 @@ def detect(run_id: str) -> dict:
     nunique = df.nunique()
 
     # ── Timestamp ────────────────────────────────────────────────────────────
-    ts_cands, ts_suggested, ts_conf = _timestamp_candidates(meta)
+    ts_cands, ts_suggested, ts_conf = _timestamp_candidates(meta, df)
     ts_cols = {c["col"] for c in ts_cands}
 
     # Panel evidence needs parsed timestamps of the suggested column
