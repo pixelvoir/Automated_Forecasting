@@ -1642,6 +1642,29 @@ def sync_fcst_horizon(date, freq, store_data, current):
 
 
 @callback(
+    Output("dropdown-fcst-exclude", "options"),
+    Output("dropdown-fcst-exclude", "value"),
+    Output("date-fcst-exclude-pick", "start_date"),
+    Output("date-fcst-exclude-pick", "end_date"),
+    Input("btn-fcst-exclude-add", "n_clicks"),
+    State("date-fcst-exclude-pick", "start_date"),
+    State("date-fcst-exclude-pick", "end_date"),
+    State("dropdown-fcst-exclude", "value"),
+    prevent_initial_call=True,
+)
+def add_fcst_exclusion(n_clicks, start, end, current):
+    """Append the picked window to the exclusion list (a multi-dropdown doubling as a
+    removable-chip list — its built-in tag × removes entries, so no pattern-matching
+    remove buttons are needed) and reset the picker."""
+    if not n_clicks or not start or not end:
+        return no_update, no_update, no_update, no_update
+    entry = f"{str(start)[:10]}..{str(end)[:10]}"
+    values = list(dict.fromkeys([*(current or []), entry]))
+    options = [{"label": v.replace("..", " → "), "value": v} for v in values]
+    return options, values, None, None
+
+
+@callback(
     Output("results-store", "data", allow_duplicate=True),
     Output("cleaning-status", "children", allow_duplicate=True),
     Input("btn-fcst-rerun", "n_clicks"),
@@ -1650,12 +1673,16 @@ def sync_fcst_horizon(date, freq, store_data, current):
     State("input-fcst-horizon", "value"),
     State("radio-fcst-scope", "value"),
     State("dropdown-fcst-exog", "value"),
+    State("date-fcst-train-range", "start_date"),
+    State("date-fcst-train-range", "end_date"),
+    State("dropdown-fcst-exclude", "value"),
     State("switch-use-llm", "value"),
     running=[(Output("btn-fcst-rerun", "disabled"), True, False),
              (Output("progress-interval", "disabled"), False, True)],
     prevent_initial_call=True,
 )
-def rerun_fcst_eda(n_clicks, store_data, freq, horizon, scope, exog, use_llm):
+def rerun_fcst_eda(n_clicks, store_data, freq, horizon, scope, exog,
+                   train_start, train_end, exclude_vals, use_llm):
     """Stage-4-only re-run with scope / frequency / horizon / exog overrides — none of
     these affect cleaning (cleaner.py never reads them), so adjusting them must NOT force
     a re-clean. Model selection is re-chained afterward (fresh evidence invalidates the
@@ -1670,7 +1697,13 @@ def rerun_fcst_eda(n_clicks, store_data, freq, horizon, scope, exog, use_llm):
     use_llm = True if use_llm is None else bool(use_llm)
     body = {"forecast_frequency": freq, "horizon": int(horizon) if horizon else None,
             "scope": scope or None,
-            "exog_cols": list(exog) if exog is not None else None}
+            "exog_cols": list(exog) if exog is not None else None,
+            # Training window — always sent: presence in the body is authoritative on
+            # the API side, so a cleared picker (null) resets back to full data.
+            "train_start": str(train_start)[:10] if train_start else None,
+            "train_end": str(train_end)[:10] if train_end else None,
+            "exclude_ranges": [v.split("..") for v in (exclude_vals or [])
+                               if isinstance(v, str) and ".." in v]}
     try:
         resp = requests.post(f"{API_URL}/runs/{run_id}/forecast-eda", json=body, timeout=1800)
         if resp.status_code == 409:

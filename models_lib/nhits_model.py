@@ -90,6 +90,8 @@ def _build_net(input_size: int, h: int, n_q: int, hidden: int):
 
 def _train_net(net, X, Y, val_mask, quantiles, epochs, lr=1e-3, batch=256, seed=0):
     import torch
+    from pipeline import resource_limits
+    torch.set_num_threads(resource_limits.thread_cap())  # keep a core free for the OS
     torch.manual_seed(seed)
     q = torch.tensor(quantiles, dtype=torch.float32).view(1, -1, 1)
 

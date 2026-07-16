@@ -571,6 +571,12 @@ class ForecastEDARequest(BaseModel):
     horizon: int | None = None
     scope: str | None = None               # "aggregate" | "per_series"
     exog_cols: list[str] | None = None     # None = keep current; [] = clear
+    # Training window (advanced options). Presence-in-body is authoritative — sending
+    # null CLEARS the bound back to full data (checked via model_fields_set), so these
+    # three don't use the "truthy = set" convention of the fields above.
+    train_start: str | None = None         # "YYYY-MM-DD" | null
+    train_end: str | None = None           # "YYYY-MM-DD" | null
+    exclude_ranges: list[list[str]] | None = None  # [["YYYY-MM-DD","YYYY-MM-DD"], ...]
 
 
 @router.post("/{run_id}/forecast-eda")
@@ -582,9 +588,20 @@ def run_forecast_eda(run_id: str, req: ForecastEDARequest = ForecastEDARequest()
     run_dir = RUNS_DIR / run_id
     if not run_dir.exists():
         raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found.")
-    if req.forecast_frequency or req.horizon or req.scope or req.exog_cols is not None:
+    range_fields = {"train_start", "train_end", "exclude_ranges"} & req.model_fields_set
+    if (req.forecast_frequency or req.horizon or req.scope or req.exog_cols is not None
+            or range_fields):
         sel_path = run_dir / "forecast_user_selections.json"
         sel = json.loads(sel_path.read_text()) if sel_path.exists() else {}
+        # Training-window sanity — reject inverted bounds before persisting anything.
+        ts, te = req.train_start, req.train_end
+        if ts and te and ts > te:
+            raise HTTPException(status_code=400,
+                                detail="Training range start must be before its end.")
+        for pair in (req.exclude_ranges or []):
+            if len(pair) != 2 or not pair[0] or not pair[1] or pair[0] > pair[1]:
+                raise HTTPException(status_code=400,
+                                    detail=f"Invalid exclusion window: {pair}.")
         # Per-series forecasting needs a series key; if none was ever confirmed, per-series
         # cleaning never ran, so this genuinely requires a re-clean on Pipeline Setup.
         if req.scope == "per_series" and not (sel.get("group_cols")):
@@ -610,6 +627,13 @@ def run_forecast_eda(run_id: str, req: ForecastEDARequest = ForecastEDARequest()
             sel["horizon"] = req.horizon
         if req.scope:
             sel["scope"] = req.scope
+        # Presence in the request body is authoritative (null = clear back to full data).
+        if "train_start" in range_fields:
+            sel["train_start"] = req.train_start
+        if "train_end" in range_fields:
+            sel["train_end"] = req.train_end
+        if "exclude_ranges" in range_fields:
+            sel["exclude_ranges"] = req.exclude_ranges or []
         sel_path.write_text(json.dumps(sel, indent=2))
     progress.reset_downstream(run_id, "forecast_eda")
     return _run_job(tasks.forecast_eda_task, run_id, track_id=run_id)

@@ -28,7 +28,7 @@ RUNS_DIR = ROOT / "runs"
 class IntentSuggestion(BaseModel):
     timestamp_col: str
     target_col: str
-    target_agg: Literal["sum", "mean", "nunique"]
+    target_agg: Literal["sum", "mean", "nunique", "count"]
     scope: Literal["aggregate", "per_series"]
     group_cols: list[str] = []
     exog_cols: list[str] = []
@@ -37,11 +37,13 @@ class IntentSuggestion(BaseModel):
     rationale: str
     confidence: Literal["high", "medium", "low"]
 
-    # Models write count aliases freely — normalize instead of rejecting.
+    # Models write count aliases freely — normalize instead of rejecting. "count"
+    # itself is now a real agg (row count — the right choice for recycled event
+    # serials where nunique saturates); only distinct-count aliases map to nunique.
     @field_validator("target_agg", mode="before")
     @classmethod
     def _count_aliases(cls, v):
-        if isinstance(v, str) and v.lower() in ("count", "count_distinct", "distinct_count"):
+        if isinstance(v, str) and v.lower() in ("count_distinct", "distinct_count", "n_unique"):
             return "nunique"
         return v
 
@@ -64,7 +66,7 @@ Return STRICT JSON with exactly these fields:
 {
   "timestamp_col":      "<column>",
   "target_col":         "<column>",
-  "target_agg":         "sum" | "mean" | "nunique",
+  "target_agg":         "sum" | "mean" | "nunique" | "count",
   "scope":              "aggregate" | "per_series",
   "group_cols":         ["<column>", ...] or [],
   "exog_cols":          ["<column>", ...] or [],
@@ -82,6 +84,9 @@ Rules:
   * event/entity ID column (visit id, order id, ticket no) -> "nunique"
     = number of distinct events per period. Use this for transactional/event-log
     data with no numeric measure — e.g. "number of visits per day".
+  * event ID column with LOW distinct_pct (a recycled serial — e.g. a complaint
+    number that restarts daily, so global distinct is tiny vs row count) -> "count"
+    = rows per period. nunique on a recycled serial saturates at the serial range.
   * Prefer continuous, TIME-VARYING volume/amount measures — high distinct_pct and cv
     comfortably above ~0.2 — over near-constant attribute or headcount columns (tiny
     distinct_pct AND low cv). A supplier/member/farmer headcount describes who

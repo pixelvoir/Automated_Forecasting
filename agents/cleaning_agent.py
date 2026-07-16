@@ -305,7 +305,7 @@ def _sanitize_recipe(recipe: dict, meta: dict, payload: dict | None = None,
     ts_col = recipe.get("timestamp_col")
 
     target_col = (intent or {}).get("target_col")
-    count_target = target_col if (intent or {}).get("agg") == "nunique" else None
+    count_target = target_col if (intent or {}).get("agg") in ("nunique", "count") else None
     protected = {c for c in [
         target_col, (intent or {}).get("timestamp_col"),
         *((intent or {}).get("group_cols") or []),
@@ -494,8 +494,8 @@ def run(run_id: str, use_llm: bool = True, skip: bool = False) -> dict:
                     "group_cols", "exog_cols", "forecast_frequency")}, indent=2)
                 + "\nIntent rules:\n"
                 "- NEVER set action=drop on the target, exogenous, group, or timestamp columns.\n"
-                "- If agg is 'nunique', the target is an event ID being COUNTED: use "
-                "missing_strategy 'none' and outlier_strategy 'keep' for it.\n"
+                "- If agg is 'nunique' or 'count', the target is an event ID being "
+                "COUNTED: use missing_strategy 'none' and outlier_strategy 'keep' for it.\n"
                 "- Use 'drop_row'/'remove' ONLY on the timestamp or target columns — "
                 "dropping rows for nulls/outliers in an irrelevant column deletes real "
                 "target signal.\n"

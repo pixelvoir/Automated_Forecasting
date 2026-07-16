@@ -37,6 +37,13 @@ llm_report:
 # Confidence thresholds
 confidence_threshold: 0.85
 
+# CPU throttling (pipeline/resource_limits.py) — keeps heavy stages from freezing the
+# machine. Jobs run slightly slower but the desktop stays responsive.
+resources:
+  job_priority: below_normal   # below_normal | normal — OS priority of the job subprocess
+  max_threads: auto            # auto = all cores minus one; or an integer (BLAS/OpenMP,
+                               # LightGBM/XGBoost n_jobs, torch threads all use this cap)
+
 # Validation gate thresholds
 validation_gate:
   max_row_loss_pct: 15
@@ -114,6 +121,8 @@ training:
   optuna_trials_large: 8       # override once n_series >= large_panel_series (any profile)
   max_train_rows: 1500000      # stratified (series, horizon) subsample cap for huge panels
   max_models_per_run: 5        # hard cap on models trained simultaneously (baseline excluded)
+  ensemble_top2: true          # free leaderboard row: mean of the two best requested models'
+                               # forecasts (backtested honestly; crownable if it wins MASE)
   chronos_variant: "amazon/chronos-bolt-small"  # HF model id for the zero-shot chronos backend
   per_series_cap: 200          # any per-series-routed model fits only the top-K series by volume
   large_panel_series: 500      # n_series at/above this triggers the large-data reductions

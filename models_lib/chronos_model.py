@@ -48,6 +48,8 @@ def _load_pipeline(variant: str):
     if variant not in _PIPELINES:
         import torch
         from chronos import BaseChronosPipeline  # lazy: transformers is a heavy import
+        from pipeline import resource_limits
+        torch.set_num_threads(resource_limits.thread_cap())  # keep a core free for the OS
         _PIPELINES[variant] = BaseChronosPipeline.from_pretrained(
             variant, torch_dtype=torch.float32)
     return _PIPELINES[variant]

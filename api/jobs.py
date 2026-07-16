@@ -13,6 +13,12 @@ import queue as _queue
 import threading
 from typing import Any, Callable
 
+from pipeline import resource_limits
+
+# The spawn child re-imports this module before unpickling the task function, so
+# capping BLAS/OpenMP threads here lands in the child BEFORE numpy/pandas load.
+resource_limits.apply()
+
 _ctx = mp.get_context("spawn")
 _lock = threading.Lock()
 _active: dict[str, Any] = {"proc": None, "track_id": None}
@@ -28,6 +34,9 @@ class JobError(Exception):
 
 def _entry(func, args, kwargs, q):
     """Child-process entry point: run the task and report result/error back through the queue."""
+    # Below-normal priority: the OS keeps the desktop/editor responsive even when the
+    # job saturates its thread budget (see pipeline/resource_limits.py).
+    resource_limits.lower_priority()
     try:
         q.put({"ok": True, "value": func(*args, **kwargs)})
     except Exception as exc:  # noqa: BLE001 — surface any failure text to the parent

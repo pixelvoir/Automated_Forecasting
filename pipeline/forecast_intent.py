@@ -241,18 +241,24 @@ def _count_candidates(meta: dict, nunique: pd.Series, n_rows: int,
         if col in ts_cols or item.get("dtype_inferred") == "datetime":
             continue
         distinct_pct = float(nunique.get(col, 0)) / max(n_rows, 1) * 100
+        event_named = bool(_EVENT_HINTS.search(col))
         if distinct_pct < 30:
-            continue  # too repetitive to be an event identity
-        score = 0.0
-        if _EVENT_HINTS.search(col):
-            score += 3
+            # Low-distinct + event-identity NAME = a RECYCLED serial (observed real
+            # case: COMPLAINTNO cycles 1001-9999 daily, so nunique per month
+            # saturates at exactly the serial range — a flat, wrong series). Each
+            # row is still one event, so the countable aggregate is the ROW count.
+            if not event_named:
+                continue  # low-cardinality without identity naming — a dimension, not events
+            agg_hint, score = "count", 2.5
+        elif event_named:
+            agg_hint, score = "nunique", 3.0
         elif re.search(r"\b(id|no|number)\b|_id$|_no$", col, re.I):
-            score += 1.5
+            agg_hint, score = "nunique", 1.5
         else:
             continue  # high-cardinality but no identity naming — not offered
         out.append({
             "col": col, "kind": "count", "score": score,
-            "agg_hint": "nunique",
+            "agg_hint": agg_hint,
             "distinct_pct": _f(distinct_pct, 2),
         })
     out.sort(key=lambda c: (-c["score"], -(c["distinct_pct"] or 0)))

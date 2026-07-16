@@ -245,6 +245,12 @@ def _setup_summary(selections):
     if group_cols:
         parts.append("key " + " × ".join(group_cols))
     parts.append("exog: " + (", ".join(exog) if exog else "none"))
+    ts_, te_ = selections.get("train_start"), selections.get("train_end")
+    excl = selections.get("exclude_ranges") or []
+    if ts_ or te_:
+        parts.append(f"window {ts_ or '…'} → {te_ or '…'}")
+    if excl:
+        parts.append(f"{len(excl)} excluded period{'s' if len(excl) > 1 else ''}")
     return html.Div([
         html.Span([_cicon("bi-sliders"), "  ·  ".join(parts)],
                   style={"fontSize": "0.78rem", "color": "var(--ink-muted)"}),
@@ -261,6 +267,33 @@ def _data_end(data):
     stage4_end = ((((data.get("_stage4") or {}).get("eda") or {}).get("full") or {})
                   .get("aggregate") or {}).get("end")
     return stage4_end or (data.get("_intent") or {}).get("suggestions", {}).get("data_end")
+
+
+def _data_span(data):
+    """(start, end) of the FULL cleaned data for the training-range picker bounds.
+    Stage 4's train_filter report always records the pre-cut span, so the picker keeps
+    its original bounds even after a range is applied (aggregate.start/end shrink with
+    the cut — using those would trap the user inside their own filter)."""
+    full = (((data.get("_stage4") or {}).get("eda") or {}).get("full") or {})
+    tf = full.get("train_filter") or {}
+    agg = full.get("aggregate") or {}
+    start = tf.get("data_start") or agg.get("start")
+    end = tf.get("data_end") or agg.get("end") or _data_end(data)
+    return (str(start)[:10] if start else None, str(end)[:10] if end else None)
+
+
+def _break_hint(data):
+    """Non-binding structural-break hint next to the range picker: when Stage 4's
+    ruptures pass found level shifts, suggest (never apply) training from the last one."""
+    breaks = (((((data.get("_stage4") or {}).get("eda") or {}).get("full") or {})
+               .get("aggregate") or {}).get("structural_breaks") or {}).get("break_dates") or []
+    if not breaks:
+        return None
+    return html.Small(
+        [_cicon("bi-lightbulb", color="#d97706", fontSize="0.72rem"),
+         f"level shift detected around {breaks[-1]} — if the older regime no longer "
+         "applies, consider starting training there"],
+        className="d-block mt-1", style={"color": "var(--ink-faint)", "fontSize": "0.7rem"})
 
 
 def _adjust_form(data, eda_exists):
@@ -297,6 +330,61 @@ def _adjust_form(data, eda_exists):
     exog_current = selections.get("exog_cols") or []
     exog_opts = sorted({*(suggestions.get("exogenous", {}).get("candidates") or []),
                         *exog_current} - {target_col, None})
+
+    # Advanced: training window. Default = full data; both controls are optional and
+    # live in a collapsed expander so the visible form stays as simple as before.
+    span_start, span_end = _data_span(data)
+    excl_current = ["..".join(p) for p in (selections.get("exclude_ranges") or [])
+                    if p and len(p) == 2]
+    _excl_lbl = lambda v: v.replace("..", " → ")  # noqa: E731
+    advanced = collapse_section(
+        "Advanced: training window", [
+            html.P("By default models train on ALL history. Cut the start to drop an old "
+                   "regime (e.g. before a level shift), or exclude anomalous windows "
+                   "(e.g. a disrupted year) — excluded periods become gaps and are filled "
+                   "by the standard rules.",
+                   style={"fontSize": "0.72rem", "color": "var(--ink-faint)",
+                          "marginBottom": "8px"}),
+            dbc.Row([
+                dbc.Col([
+                    _lbl("Training range (empty = full data)"),
+                    dcc.DatePickerRange(
+                        id="date-fcst-train-range",
+                        start_date=selections.get("train_start"),
+                        end_date=selections.get("train_end"),
+                        min_date_allowed=span_start, max_date_allowed=span_end,
+                        clearable=True, display_format="YYYY-MM-DD",
+                        start_date_placeholder_text="data start",
+                        end_date_placeholder_text="data end",
+                        className="horizon-datepicker"),
+                    _break_hint(data),
+                ], md=6),
+                dbc.Col([
+                    _lbl("Exclude a period"),
+                    html.Div([
+                        dcc.DatePickerRange(
+                            id="date-fcst-exclude-pick",
+                            start_date=None, end_date=None,
+                            min_date_allowed=span_start, max_date_allowed=span_end,
+                            clearable=True, display_format="YYYY-MM-DD",
+                            start_date_placeholder_text="from",
+                            end_date_placeholder_text="to",
+                            className="horizon-datepicker"),
+                        dbc.Button([_cicon("bi-plus-lg"), "Add"],
+                                   id="btn-fcst-exclude-add", size="sm",
+                                   color="secondary", outline=True, className="ms-2"),
+                    ], className="d-flex align-items-center"),
+                    dcc.Dropdown(
+                        id="dropdown-fcst-exclude", multi=True, searchable=False,
+                        options=[{"label": _excl_lbl(v), "value": v} for v in excl_current],
+                        value=excl_current, placeholder="No excluded periods",
+                        className="mt-2", style={"fontSize": "0.8rem"}),
+                ], md=6),
+            ]),
+        ], icon="bi-calendar-range",
+        open=bool(selections.get("train_start") or selections.get("train_end")
+                  or excl_current),
+        summary_extra="applies on re-run, no re-clean needed")
 
     return dbc.Card(dbc.CardBody([
         html.P("Scope, frequency, horizon and exogenous drivers re-run from here "
@@ -338,6 +426,7 @@ def _adjust_form(data, eda_exists):
                          placeholder="No exogenous drivers",
                          style={"fontSize": "0.85rem"}),
         ])], className="mt-2"),
+        html.Div(advanced, className="mt-3"),
         dcc.Loading(
             dbc.Button(
                 [_cicon("bi-graph-up"),

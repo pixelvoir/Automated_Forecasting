@@ -39,7 +39,7 @@ import pandas as pd
 import yaml
 
 from pipeline.forecasting_eda import (
-    _build_series, _f, _pandas_freq, _resolve_selections,
+    _build_series, _f, _pandas_freq, _resolve_selections, apply_train_filter,
 )
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -394,6 +394,9 @@ def run(run_id: str, build_ml_matrix: bool | None = None) -> dict:
     df = df.loc[df[ts_col].notna() & df[target].notna()]
     if df.empty:
         raise ValueError(f"No usable rows for target '{target}'.")
+    # Same training-window cut as Stage 4 — the trained series must be identical to
+    # the one Stages 4/5 analyzed and decided on.
+    df, train_filter = apply_train_filter(df, ts_col, selections)
     if agg in ("sum", "mean") and not pd.api.types.is_numeric_dtype(df[target]):
         agg = "nunique"
         selections["agg"] = "nunique"
@@ -442,6 +445,7 @@ def run(run_id: str, build_ml_matrix: bool | None = None) -> dict:
         "target": target,
         "agg": agg,
         "n_series": frame_report.get("n_series", 1),
+        "train_filter": train_filter,
         "frame": frame_report,
         "recipe": recipe,
         "n_features": len(feature_names),

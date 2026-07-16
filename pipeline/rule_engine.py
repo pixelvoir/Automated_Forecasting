@@ -46,7 +46,7 @@ _FALLBACK_ORDER = ["lightgbm", "auto_theta", "seasonal_naive"]
 # Deterministic tie-break for equal suitability scores in the ranking (nothing more —
 # scores dominate). Roughly "observed general strength" order.
 _PREF_ORDER = ["lightgbm", "xgboost", "nhits", "chronos", "auto_theta", "auto_ets",
-               "auto_arima", "prophet", "croston", "tsb", "seasonal_naive"]
+               "auto_arima", "mstl", "prophet", "croston", "tsb", "seasonal_naive"]
 
 _RANK = {"low": 0, "medium": 1, "high": 2}
 _NAME = {0: "low", 1: "medium", 2: "high"}
@@ -282,6 +282,16 @@ def _suitability_scores(payload: dict, derived: dict, eligible: list, cfg: dict)
     if length > 1000:
         add("auto_arima", -1.0, "very long series — pmdarima search is slow")
 
+    # MSTL + Theta — the multi-seasonal classical specialist (catalog re-entry 2026-07-16)
+    if secondary:
+        add("mstl", 3.0, "multiple seasonal periods decomposed natively")
+    elif single_seasonal and period and period > cfg["sarima_max_period"]:
+        add("mstl", 1.5, f"long seasonal period ({period}) beyond SARIMA range")
+    if sparse:
+        add("mstl", -1.0, "sparse/zero-heavy demand breaks the decomposition")
+    if n_cycles is not None and n_cycles < 2:
+        add("mstl", -1.5, "needs ≥2 full cycles to estimate seasonal components")
+
     if secondary:
         add("prophet", 1.5, "multiple seasonal cycles decomposed natively")
     if tband == "strong":
@@ -436,14 +446,16 @@ def decide(payload: dict, catalog: dict, cfg: dict | None = None) -> dict:
                           f"(< {cfg['exog_route_min_length']}) — kept as a training hint")
             _skip("R4", detail)
 
-    # R5 — multiple seasonal periods (catalog trim 2026-07: MSTL removed — gradient
-    # boosting on deseasonalized targets + calendar/Fourier features covers this case)
+    # R5 — multiple seasonal periods. Gradient boosting stays the ladder pick (per-period
+    # Fourier/calendar features); MSTL — back in the catalog 2026-07-16 — is the natural
+    # classical runner-up since it decomposes every cycle natively.
     if pick is None:
         secondary = payload.get("secondary_seasonality_periods") or []
         if secondary:
+            runner = "mstl" if "mstl" in eligible else "auto_theta"
             _fire("R5", f"multiple seasonal periods ({period} + {secondary}) — "
                         "gradient boosting with per-period Fourier/calendar features",
-                  category="ml", model="lightgbm", runner_up="auto_theta",
+                  category="ml", model="lightgbm", runner_up=runner,
                   confidence="high" if seas >= cfg["seasonality_strong"] else "medium")
         else:
             _skip("R5", "single seasonal period")

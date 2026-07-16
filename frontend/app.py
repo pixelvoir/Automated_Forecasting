@@ -1,4 +1,11 @@
 """Dash application entry point."""
+import os
+
+from pipeline import resource_limits
+
+# Cap BLAS/OpenMP threads before dash/plotly pull in numpy.
+resource_limits.apply()
+
 import dash
 import dash_bootstrap_components as dbc
 from dotenv import load_dotenv
@@ -49,4 +56,7 @@ def _no_cache_html(resp):
 import frontend.callbacks  # noqa: E402, F401
 
 if __name__ == "__main__":
-    app.run(debug=True, host="127.0.0.1", port=8050)
+    # Debug (werkzeug reloader + debugger) is opt-in via APP_DEBUG=1 — run_frontend.bat
+    # sets it for development; the start_app.bat launcher leaves it off, which saves the
+    # constant file-watcher CPU on small machines.
+    app.run(debug=os.environ.get("APP_DEBUG", "0") == "1", host="127.0.0.1", port=8050)

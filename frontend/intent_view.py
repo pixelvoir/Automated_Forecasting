@@ -152,7 +152,11 @@ def build_intent_form(suggestions: dict, selections: dict | None, already_run: b
                         options=[
                             {"label": "Sum (totals, demand)", "value": "sum"},
                             {"label": "Mean (rates, percentages)", "value": "mean"},
-                            {"label": "Count of distinct values (events)", "value": "nunique"},
+                            {"label": "Count of distinct values (unique event IDs)", "value": "nunique"},
+                            # Row count: one row = one event. The right choice when the
+                            # ID column recycles (e.g. a daily serial 1001-9999, where
+                            # nunique saturates at the serial range per period).
+                            {"label": "Count of rows (records per period)", "value": "count"},
                         ],
                         value=agg_default, clearable=False, style={"fontSize": "0.85rem"},
                     ),

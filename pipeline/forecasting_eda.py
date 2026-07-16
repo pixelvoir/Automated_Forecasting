@@ -119,7 +119,52 @@ def _resolve_selections(run_dir: Path) -> dict:
         "horizon": int(sel.get("horizon") or intent.get("horizon", {}).get("suggested")
                        or _DEFAULT_HORIZON.get(fcst_freq, 12)),
         "data_frequency": data_freq,
+        # Training window (optional, default = full data). Set from the Forecast EDA
+        # tab's advanced options; consumed by Stage 4 AND Stage 6 via apply_train_filter.
+        "train_start": sel.get("train_start") or None,
+        "train_end": sel.get("train_end") or None,
+        "exclude_ranges": sel.get("exclude_ranges") or [],
     }
+
+
+def apply_train_filter(df: pd.DataFrame, ts_col: str, sel: dict) -> tuple[pd.DataFrame, dict]:
+    """Restrict the cleaned frame to the confirmed training window (Stage 4 + Stage 6).
+
+    ``train_start``/``train_end`` bound the series (inclusive, whole days);
+    ``exclude_ranges`` drops rows inside each [start, end] window — the resample grid
+    then has empty bins there and the standard empty-bin fill rules apply unchanged
+    (count/zero-inflated-sum → 0, else interpolate). Returns (filtered_df, report);
+    the report always carries the FULL data span so the UI's range picker keeps its
+    original bounds even after a cut is applied."""
+    start, end = sel.get("train_start"), sel.get("train_end")
+    excludes = [p for p in (sel.get("exclude_ranges") or []) if p and len(p) == 2]
+    report = {
+        "train_start": start, "train_end": end, "exclude_ranges": excludes,
+        "data_start": str(df[ts_col].min()), "data_end": str(df[ts_col].max()),
+        "rows_before": int(len(df)), "active": bool(start or end or excludes),
+    }
+    if not report["active"]:
+        report["rows_after"] = report["rows_before"]
+        return df, report
+    mask = pd.Series(True, index=df.index)
+    if start:
+        mask &= df[ts_col] >= pd.Timestamp(start)
+    if end:  # inclusive of the whole end day (timestamps may carry a time of day)
+        mask &= df[ts_col] < pd.Timestamp(end) + pd.Timedelta(days=1)
+    for pair in excludes:
+        try:
+            ex0 = pd.Timestamp(pair[0])
+            ex1 = pd.Timestamp(pair[1]) + pd.Timedelta(days=1)
+        except (ValueError, TypeError):
+            continue  # malformed pair — ignore rather than kill the run
+        mask &= ~((df[ts_col] >= ex0) & (df[ts_col] < ex1))
+    out = df.loc[mask]
+    report["rows_after"] = int(len(out))
+    if out.empty:
+        raise ValueError(
+            "The training range/exclusions filtered out every row — widen the range "
+            "or remove an exclusion.")
+    return out, report
 
 
 def _pandas_freq(label: str, sample_ts: pd.Series) -> str:
@@ -723,6 +768,8 @@ def run(run_id: str) -> dict:
     df = df.loc[df[ts_col].notna() & df[target].notna()]
     if df.empty:
         raise ValueError(f"No usable rows for target '{target}'.")
+    # User-confirmed training window (default = full data, report always written).
+    df, train_filter = apply_train_filter(df, ts_col, selections)
 
     # sum/mean of a non-numeric column is undefined — the intent for such targets is
     # counting events. Forced here as a backstop; the intent agent normally sets it.
@@ -773,10 +820,19 @@ def run(run_id: str) -> dict:
 
     progress.stage_update(run_id, "forecast_eda", "building decision payload", 4, 5)
     payload = _build_payload(stats, selections, exog_stats, fill_report, panel)
+    if train_filter["active"]:
+        payload["train_filter"] = {k: train_filter[k] for k in
+                                   ("train_start", "train_end", "exclude_ranges",
+                                    "rows_before", "rows_after")}
+        if len(y) < 2 * max(period, 1):
+            payload["warnings"].append(
+                "train_filter_short: the training window leaves fewer than 2 seasonal "
+                "cycles — consider widening it")
 
     full = {
         "run_id": run_id,
         "selections": selections,
+        "train_filter": train_filter,
         "fill_report": fill_report,
         "aggregate": stats,
         "exogenous": exog_stats,

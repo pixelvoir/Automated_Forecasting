@@ -1,9 +1,10 @@
-# Library versions should be revisited when each pipeline stage is implemented.
 psycopg2-binary>=2.9.0
 sqlalchemy>=2.0.0
 connectorx>=0.3.2
 dash>=2.14.0
 dash-bootstrap-components>=1.5.0
+# plotly is imported directly (fcst_eda_view / training_view), not only via dash
+plotly>=5.18.0
 requests>=2.31.0
 pandas>=2.0.0
 openpyxl>=3.1.0
@@ -17,11 +18,10 @@ statsmodels>=0.14.0
 ruptures>=1.1.8
 antropy>=0.1.6
 pmdarima>=2.0.3
-# statsforecast: installed for Stage 5's find_spec catalog check ONLY. Its compiled
-# coreforecast kernel SEGFAULTS under numpy 2.4.x on this machine, so Stage 7 does NOT
-# execute statsforecast models — classical models run on statsmodels + pmdarima instead
-# (see CLAUDE.md "statsforecast is UNUSABLE"). Never import it in an executing path.
-statsforecast>=1.6.0
+# statsforecast is deliberately NOT installed: its compiled coreforecast kernel
+# SEGFAULTS under numpy 2.4.x on this machine (see CLAUDE.md "statsforecast is
+# UNUSABLE"). The catalog cards that used to find_spec it now check statsmodels,
+# which is what actually executes those models. Never add it back as an import.
 # prophet 1.3 wheels install cleanly on Windows (cmdstanpy backend, no build tools);
 # if the install ever fails, the catalog's runtime find_spec gate simply marks the
 # prophet card unavailable — nothing else breaks.
@@ -40,10 +40,9 @@ lightgbm>=4.0.0
 # above. The pure-torch NHITS implementation replaces it.
 torch>=2.5.0
 optuna>=3.3.0
-shap>=0.42.1
 fastapi>=0.103.0
 uvicorn>=0.23.2
 pydantic>=2.3.0
-httpx>=0.24.0
-google-generativeai>=0.2.0
+# All LLM providers (ollama / openai / gemini / groq) go through the openai SDK
+# with a base_url swap (agents/llm_client.py) — no per-provider packages needed.
 openai>=1.3.0

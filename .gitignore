@@ -20,5 +20,9 @@ data/features/*
 !data/features/.gitkeep
 # Stage 7 serialized models (best_model.pkl / preprocessor.pkl per run)
 models/*/
-runs/*/
+# Everything under runs/ (run dirs AND stray top-level files) except the keep marker
+runs/*
 !runs/.gitkeep
+
+# Build artifacts from `pip install -e .`
+*.egg-info/

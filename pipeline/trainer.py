@@ -42,6 +42,7 @@ MODELS_DIR = ROOT / "models"
 CONFIG_PATH = ROOT / "config" / "settings.yaml"
 
 BASELINE = "seasonal_naive"
+ENSEMBLE = "ensemble_top2"
 
 
 class TrainingHeavyError(Exception):
@@ -110,7 +111,7 @@ def _json_safe_params(params) -> dict:
 # aggregate reference runs (max-profile xgboost 51s / 100 trials, fast lightgbm 3.5s).
 
 _FIT_S = {"seasonal_naive": 0.02, "croston": 0.05, "tsb": 0.05, "auto_theta": 0.25,
-          "auto_ets": 0.8, "prophet": 1.2, "auto_arima": 6.0}
+          "mstl": 0.6, "auto_ets": 0.8, "prophet": 1.2, "auto_arima": 6.0}
 _PER_SERIES_OVERHEAD_S = 0.12   # harness cost per series (groupby/frames/metrics)
 _ML_GLOBAL_S_PER_MROW = 130.0   # per million capped direct-dataset rows (ES fit + refit)
 _ML_SINGLE_FIT_S = 1.0          # one aggregate direct-ML fit (no tuning)
@@ -487,6 +488,70 @@ def _target_insights(entry, hist: pd.Series, horizon: int) -> dict | None:
             "pct_change": pct, "widest_interval_95": widest}
 
 
+def _ensemble_top2(results, requested, scale, levels) -> dict | None:
+    """Leaderboard row averaging the two best REQUESTED models' forecasts (2026-07-16).
+
+    A simple mean of two decorrelated forecasters is a well-known cheap win — the
+    components are already trained, so this costs nothing. Backtests are aligned on
+    the display arrays' shared timestamps (different routes can backtest different
+    windows, e.g. chronos' single holdout vs classical CV), metrics use the SAME
+    pooled MASE scale as every other row, and intervals are conformal from the
+    ensemble's own backtest residuals. Returns None when fewer than two requested
+    models produced comparable backtests."""
+    cands = [e for e in results
+             if e["model"] in requested and not e.get("error")
+             and (e.get("metrics") or {}).get("mase") is not None]
+    cands.sort(key=lambda e: e["metrics"]["mase"])
+    if len(cands) < 2:
+        return None
+    a, b = cands[0], cands[1]
+
+    bt_b = {ds: pred for ds, pred in zip(b["backtest"]["ds"], b["backtest"]["predicted"])}
+    ds_c, act_c, pred_c = [], [], []
+    for ds, act, pred in zip(a["backtest"]["ds"], a["backtest"]["actual"],
+                             a["backtest"]["predicted"]):
+        other = bt_b.get(ds)
+        if pred is not None and other is not None:
+            ds_c.append(ds)
+            act_c.append(act)
+            pred_c.append((float(pred) + float(other)) / 2.0)
+    if len(ds_c) < 3:
+        return None
+    metrics = evaluator.compute_metrics(pd.Series(act_c, dtype=float),
+                                        pd.Series(pred_c, dtype=float), scale)
+
+    fc_b = dict(zip(b["forecast"]["ds"], b["forecast"]["yhat"]))
+    f_ds, f_hat = [], []
+    for ds, v in zip(a["forecast"]["ds"], a["forecast"]["yhat"]):
+        w = fc_b.get(ds)
+        if v is not None and w is not None:
+            f_ds.append(ds)
+            f_hat.append((float(v) + float(w)) / 2.0)
+    point = np.asarray(f_hat, dtype=float)
+    resid = np.asarray(act_c, dtype=float) - np.asarray(pred_c, dtype=float)
+    res_by_step = {k + 1: resid for k in range(len(point))}
+    intervals = conformal_intervals(point, res_by_step, levels) if len(point) else {}
+    forecast = {"ds": f_ds, "yhat": _round_list(point), "interval_method": "conformal"}
+    for lvl in levels:
+        if lvl in intervals:
+            lo, hi = intervals[lvl]
+            forecast[f"lo{lvl}"] = _round_list(lo)
+            forecast[f"hi{lvl}"] = _round_list(hi)
+
+    return {
+        "model": ENSEMBLE, "label": f"Ensemble ({a['label']} + {b['label']})",
+        "category": "ensemble", "requested": True, "is_baseline": False,
+        "is_ensemble": True, "ensemble_of": [a["model"], b["model"]],
+        "metrics": metrics, "params": {"components": [a["model"], b["model"]],
+                                       "weights": [0.5, 0.5]},
+        "tuning": None, "strategy": "mean of the two best requested forecasts",
+        "error": None, "train_seconds": 0.0,
+        "backtest": {"ds": ds_c, "actual": _round_list(act_c),
+                     "predicted": _round_list(pred_c)},
+        "forecast": forecast,
+    }
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def run(run_id: str, models, confirm_heavy: bool = False, profile: str | None = None) -> dict:
@@ -643,16 +708,40 @@ def run(run_id: str, models, confirm_heavy: bool = False, profile: str | None = 
                 "forecast": {"ds": [], "yhat": []},
             })
 
+    # Top-2 ensemble row (free: components already trained). Derived exclusively from
+    # REQUESTED models, so it respects the "user's selection is ultimate" rule and is
+    # itself crownable. Configurable off via training.ensemble_top2.
+    if tcfg.get("ensemble_top2", True) and len(requested) >= 2:
+        ens = _ensemble_top2(results, requested, scale, levels)
+        if ens:
+            results.append(ens)
+            fitted_objs[ENSEMBLE] = {"ensemble_of": ens["ensemble_of"], "weights": [0.5, 0.5],
+                                     "components": {m: fitted_objs.get(m)
+                                                    for m in ens["ensemble_of"]}}
+            if scope == "per_series" and series_frames:
+                # Per-series viewer rows: mean of the two components where both exist.
+                sf_all = pd.concat(series_frames, ignore_index=True)
+                comp = sf_all[sf_all["model"].isin(ens["ensemble_of"])]
+                both = comp.groupby(["unique_id", "ds", "kind"], as_index=False, observed=True) \
+                    .agg(actual=("actual", "first"), predicted=("predicted", "mean"),
+                         n=("model", "nunique"))
+                both = both[both["n"] == 2].drop(columns="n")
+                both["model"] = ENSEMBLE
+                series_frames.append(
+                    both[["model", "unique_id", "ds", "kind", "actual", "predicted"]])
+
     # Rank by MASE (finite first), mark primary + best. The user's dropdown selection is
-    # the ULTIMATE choice: only a REQUESTED model can be crowned/serialized — the baseline
-    # is a reference row in the leaderboard, never the winner (unless explicitly selected).
+    # the ULTIMATE choice: only a REQUESTED model (or the ensemble derived from requested
+    # models) can be crowned/serialized — the baseline is a reference row in the
+    # leaderboard, never the winner (unless explicitly selected).
     def _mase(e):
         v = (e.get("metrics") or {}).get("mase")
         return v if v is not None else float("inf")
     results.sort(key=_mase)
     primary_model = requested[0]
     best_model = next((e["model"] for e in results
-                       if e["model"] in requested and np.isfinite(_mase(e))), primary_model)
+                       if (e["model"] in requested or e.get("is_ensemble"))
+                       and np.isfinite(_mase(e))), primary_model)
     for e in results:
         e["is_primary"] = e["model"] == primary_model
         e["is_best"] = e["model"] == best_model

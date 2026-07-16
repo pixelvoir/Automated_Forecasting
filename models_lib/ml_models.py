@@ -33,19 +33,24 @@ import numpy as np
 import pandas as pd
 
 from models_lib.base_model import Forecaster, apply_transform, invert_transform
+from pipeline import resource_limits
 from pipeline.feature_builder import _safe, build_supervised
 
 _ML_IDS = {"lightgbm", "xgboost"}
 
-# temp.txt-derived base params (the manual pipeline's settings, generalized). n_estimators
+# n_jobs used to be -1 (all cores) — on a small box a training run pinned 100% CPU and
+# froze the desktop. Capped to resources.max_threads (default cores − 1).
+_N_JOBS = resource_limits.thread_cap()
+
+# Base params derived from the manual milk-pipeline experiments, generalized. n_estimators
 # is a CAP — early stopping finds the real tree count.
 _BASE_LGBM = dict(n_estimators=800, learning_rate=0.025, num_leaves=63, max_depth=7,
                   min_child_samples=15, subsample=0.8, subsample_freq=1,
                   colsample_bytree=0.75, reg_alpha=0.3, reg_lambda=1.5,
-                  random_state=0, n_jobs=-1, verbose=-1)
+                  random_state=0, n_jobs=_N_JOBS, verbose=-1)
 _BASE_XGB = dict(n_estimators=800, learning_rate=0.025, max_depth=7,
                  min_child_weight=5, subsample=0.8, colsample_bytree=0.75,
-                 reg_alpha=0.3, reg_lambda=1.5, random_state=0, n_jobs=-1, verbosity=0)
+                 reg_alpha=0.3, reg_lambda=1.5, random_state=0, n_jobs=_N_JOBS, verbosity=0)
 
 _DIRECT_FEATS = ["horizon", "target_phase", "target_sindex"]
 

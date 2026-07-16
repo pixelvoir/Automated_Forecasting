@@ -190,7 +190,7 @@ def run(run_id: str) -> dict:
     # (Skipped when the confirmed target is a count-type event ID: an event log with
     # zero numeric measures is perfectly forecastable as counts per period.)
     usable_numeric = [col for col, var in numeric_variance.items() if var > 0]
-    if not (intent and intent.get("agg") == "nunique"):
+    if not (intent and intent.get("agg") in ("nunique", "count")):
         checks["forecastable_columns"] = {
             "passed": len(usable_numeric) > 0,
             "severity": "blocking",
@@ -208,7 +208,7 @@ def run(run_id: str) -> dict:
         agg = intent.get("agg", "sum")
         if target not in clean_nulls:
             passed_t, detail_t = False, f"Target '{target}' is missing from the cleaned data"
-        elif agg == "nunique":
+        elif agg in ("nunique", "count"):
             null_pct_t = clean_nulls.get(target, {}).get("pct", 0)
             passed_t = null_pct_t < 100
             detail_t = (f"Count target '{target}' retains non-null event IDs "

@@ -10,6 +10,12 @@ progress rail reads ``runs/{id}/progress.json``, and the filesystem is the only 
 that crosses the subprocess boundary (a kill leaves a stranded "running" entry, which
 the /progress route reconciles via the job-alive flag).
 """
+from pipeline import resource_limits
+
+# Must run before the first numpy/pandas import in this process — the spawn child
+# imports this module at startup, so the thread caps land before any BLAS loads.
+resource_limits.apply()
+
 from dotenv import load_dotenv
 
 from pipeline import progress

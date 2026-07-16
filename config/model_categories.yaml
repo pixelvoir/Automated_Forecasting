@@ -28,8 +28,8 @@ categories:
 models:
   - id: seasonal_naive
     label: "Seasonal Naive"
-    library: statsforecast          # statsforecast.models.SeasonalNaive
-    import_check: statsforecast
+    library: built-in               # models_lib/statistical.py::SeasonalNaiveForecaster (hand-rolled)
+    import_check: numpy
     categories: [baseline]
     min_length: 3
     supports_exog: false
@@ -39,8 +39,8 @@ models:
 
   - id: auto_theta
     label: "AutoTheta"
-    library: statsforecast          # statsforecast.models.AutoTheta
-    import_check: statsforecast
+    library: statsmodels            # models_lib/statistical.py::AutoThetaForecaster (ThetaModel)
+    import_check: statsmodels
     categories: [statistical]
     min_length: 10
     supports_exog: false
@@ -72,6 +72,19 @@ models:
       seasonal period <= 24; differencing handles trend. Slow on very long series and
       infeasible for weekly-52 / daily-365 seasonality.
 
+  - id: mstl
+    label: "MSTL + Theta"
+    library: statsmodels            # models_lib/statistical.py::MSTLForecaster
+    import_check: statsmodels
+    categories: [statistical]
+    min_length: 30
+    supports_exog: false
+    when_to_use: >-
+      Multiple strong seasonal periods (e.g. daily data with weekly AND yearly cycles):
+      MSTL decomposition strips every seasonal cycle, a damped Theta model extrapolates
+      the deseasonalized level, and the seasonal cycles are re-added over the horizon.
+      Prefer it over AutoETS/ARIMA when two or more seasonalities are detected.
+
   - id: prophet
     label: "Prophet"
     library: prophet
@@ -87,8 +100,8 @@ models:
 
   - id: croston
     label: "Croston (optimized)"
-    library: statsforecast          # statsforecast.models.CrostonOptimized
-    import_check: statsforecast
+    library: built-in               # models_lib/intermittent.py (hand-rolled)
+    import_check: numpy
     categories: [intermittent]
     min_length: 10
     supports_exog: false
@@ -98,8 +111,8 @@ models:
 
   - id: tsb
     label: "TSB"
-    library: statsforecast          # statsforecast.models.TSB
-    import_check: statsforecast
+    library: built-in               # models_lib/intermittent.py (hand-rolled)
+    import_check: numpy
     categories: [intermittent]
     min_length: 10
     supports_exog: false

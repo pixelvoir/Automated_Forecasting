@@ -1,87 +1,86 @@
 # Automated Forecasting
 
-An end-to-end pipeline that takes in a dataset — CSV upload or a live database table/query — and walks it through automated cleaning and (eventually) forecasting, with an LLM agent making the judgment calls a data scientist would normally make by hand: what to do with outliers, missing values, and bad dtypes, based on the statistical shape of the data rather than hardcoded rules.
+An end-to-end pipeline that takes any dataset — CSV/Excel upload, a local file path, or a live database table/query — and walks it through profiling, cleaning, forecast setup, model selection, training and reporting. An LLM agent makes the judgment calls a data scientist would normally make by hand (outlier strategy, missing-value fills, which model suits the data), always from computed **statistics only** — raw data never leaves the machine. Every LLM decision has a deterministic rule-based fallback, so the pipeline works with no LLM configured at all.
 
-The goal is "point it at a dataset, get a forecast" — minimal manual preprocessing, no per-dataset tuning.
+The goal: **point it at a dataset, get a forecast** — minimal manual preprocessing, no per-dataset tuning.
+
+## Quickstart
+
+**Double-click `start_app.bat`.** It creates the virtual environment on first run (one-time, downloads dependencies), starts both servers minimized, and opens the app in your browser at `http://localhost:8050`. Shut everything down with `stop_app.bat`.
+
+Prerequisite: Python 3.11+ on PATH. Everything binds to `127.0.0.1` only — nothing is exposed to the network.
+
+For development (auto-reload + debugger):
+```bat
+setup_venv.bat      # one-time
+run_dev.bat         # terminal 1: FastAPI on :8000 (auto-reload)
+run_frontend.bat    # terminal 2: Dash UI on :8050 (debug mode)
+```
 
 ## How it works
 
 ```
-Browser (Dash :8050)
-  │
-  ├─ Upload a file, or point at a DB table/query
+Browser (Dash :8050)  —  3 sections: Setup · Pipeline · Results
   │
   ▼
-FastAPI (:8000) — job-managed pipeline stages, run in a cancellable subprocess
+FastAPI (:8000) — heavy stages run in a cancellable, below-normal-priority subprocess
   │
-  ├─ 1. Ingest        → infer dtypes, profile the dataset
-  ├─ 2. Pre-clean EDA → compute outlier/missing/structural-break stats (no raw values)
-  ├─ 3. Cleaning      → LLM agent picks a cleaning recipe from the stats, cleaner executes it
-  ├─ 3.5 Validation   → gate on row loss / series length before continuing
-  └─ 4-8              → forecasting EDA, model selection, training, evaluation, results (in progress)
+  ├─ 1    Ingest          → stream to parquet, infer dtypes, profile
+  ├─ 2    Pre-clean EDA   → outlier/missing/structural stats (statistics only)
+  ├─ 2.5  Forecast intent → suggests timestamp/target/scope/series-key/frequency/
+  │                          horizon from the evidence; YOU confirm once
+  ├─ 3    Cleaning        → LLM (or rules) picks a recipe; deterministic sanitizer
+  │                          guards it; cleaner executes per-series where needed
+  ├─ 3.5  Validation gate → blocks data destruction (row loss, target drift, …)
+  ├─ 4    Forecast EDA    → seasonality/trend/stationarity/intermittency battery
+  ├─ 5    Model selection → rule ladder + optional LLM re-rank over the catalog
+  ├─ 6    Features        → EDA-seeded lags/rolling/Fourier/exog features (no LLM)
+  ├─ 7    Training        → walk-forward backtests, MASE leaderboard, intervals,
+  │                          top-2 ensemble row, best model serialized
+  └─ 8    Results         → opt-in LLM insight report + CSV/parquet forecast download
 ```
 
-Only computed statistics (~200 tokens) are ever sent to the LLM — raw data never leaves the machine. The LLM picks strategies (drop columns, cast dtypes, `clip_iqr` vs `rolling_iqr` vs `stl_residuals` for outliers, etc.) from what the stats imply; a rule-based fallback keeps things working if no LLM is configured or reachable.
+With **auto-run** on (default), the whole chain runs itself with exactly one pause — the forecast-setup confirmation — and lands on the Results tab.
 
-Heavy stages (ingest, EDA, cleaning, validation) run in a single-slot, preemptible subprocess so that large datasets doing pandas/STL work can't freeze the machine, and starting a new run cleanly kills whatever was in flight.
+## Model catalog
 
-## Current status
+12 models, selected per-dataset by a rule engine (an LLM can re-rank, never override eligibility): seasonal-naive baseline, AutoTheta, AutoETS, AutoARIMA, MSTL+Theta (multi-seasonal), Prophet, Croston/TSB (intermittent demand), LightGBM, XGBoost, NHITS (pure-torch), and Amazon Chronos (pretrained zero-shot). Classical models run on statsmodels/pmdarima; a seasonal-naive baseline is always trained as the MASE reference. Training also adds a free **Ensemble (top 2)** leaderboard row — the mean of your two best models' forecasts, honestly backtested.
 
-| Stage | Status |
-|---|---|
-| 1 — Ingestion | ✅ implemented |
-| 2 — Pre-clean EDA | ✅ implemented |
-| 3 — Cleaning (LLM agent + cleaner) | ✅ implemented |
-| 3.5 — Validation gate | ✅ implemented |
-| 4–8 — Forecasting EDA, model selection, training, evaluation, results | 🚧 stubs, not yet implemented |
+## Accuracy controls
 
-## Folder Structure
+- **Training range** (Forecast EDA tab → Advanced): train on a date sub-range (e.g. cut history before a detected level shift) and/or exclude anomalous windows (e.g. a disrupted year). Default is always the full data; a structural-break hint suggests — never applies — a start date. Changing the window re-runs Stage 4+ without re-cleaning.
+- **Accuracy profiles** (`fast` / `balanced` / `max`): the time-vs-accuracy budget for tuning trials and epochs, pickable per training run.
+- **Exogenous drivers**: leading indicators are detected in Stage 4 and fed to the ML models as leakage-free features.
 
-```text
-.
-├── agents/         # LLM-driven decision agents (cleaning, model selection, results, orchestrator)
-├── api/            # FastAPI routes + subprocess job manager
-├── config/         # settings.yaml — LLM provider, thresholds, per-stage tuning
-├── data/           # raw/cleaned parquet files
-├── frontend/       # Dash UI (tab-based, one tab per pipeline stage)
-├── models_lib/     # forecasting model implementations (statistical, ML, Prophet, intermittent)
-├── pipeline/       # stateless pipeline stages, chained via runs/{id}/*.json
-├── runs/           # per-run artifacts (metadata, EDA output, recipes, reports)
-├── tests/
-├── .env.example
-├── docker-compose.yml
-├── Dockerfile
-└── requirements.txt
-```
+## Security constraints
 
-## Prerequisites
-- Python 3.11+
+- Raw data **never** goes to any LLM or external API — only computed statistics (~200 tokens; the opt-in Stage 8 report additionally sends derived metrics/aggregates, never raw rows).
+- Client DB access is **read-only**; credentials live in RAM for the duration of a request and are never logged or stored.
+- Both servers bind to `127.0.0.1` only.
 
-## Quickstart
+## Performance on small machines
 
-**One-time setup** (creates `.venv` and installs dependencies):
-```bat
-setup_venv.bat
-```
-
-**Start the dev server** (auto-reloads on file changes):
-```bat
-run_dev.bat
-```
-
-**Health check:**
-```
-curl http://localhost:8000/health
-```
-
-**Start the Dash UI** (in a second terminal, after the API is running):
-```bat
-run_frontend.bat
-```
-Then open `http://localhost:8050` in your browser.
+Heavy stages run in a single-slot subprocess at **below-normal OS priority** with BLAS/LightGBM/XGBoost/torch capped to `cores − 1` threads (configurable under `resources:` in `config/settings.yaml`), so a big training run slows the machine down instead of freezing it. Starting a new run preempts (kills) the previous job immediately. `start_app.bat` runs both servers without dev file-watchers, which also saves constant background CPU.
 
 ## LLM configuration
 
-The LLM provider is set in `config/settings.yaml` and can be swapped between `ollama` (local, free), `groq`, `openai`, and `gemini` without touching code. Cloud providers need their API key in `.env`; Ollama runs locally with no key required.
+Provider is set in `config/settings.yaml → llm:` — swap between `ollama` (local, free), `groq`, `openai`, `gemini` without touching code; cloud providers need their key in `.env` (see `.env.example`). An optional `llm_report:` block runs the Stage 8 report on a bigger model. All providers go through the `openai` SDK with a `base_url` swap.
 
-> **Note on `prophet`:** It requires C++ build tools on Windows and is commented out of `requirements.txt`. See the comment there for install options. All other dependencies install cleanly via pip.
+## Folder structure
+
+```text
+.
+├── agents/         # LLM decision agents (cleaning, intent, model selection, results) + client
+├── api/            # FastAPI routes + single-slot subprocess job manager
+├── config/         # settings.yaml (all thresholds/knobs) + model_categories.yaml (catalog)
+├── data/           # raw / cleaned / feature parquet files (never committed)
+├── frontend/       # Dash UI (3 sections, live progress rail, session store)
+├── models_lib/     # model backends (statistical, intermittent, ML, NHITS, Chronos, Prophet)
+├── pipeline/       # stateless pipeline stages, chained via runs/{id}/*.json
+├── runs/           # per-run artifacts (metadata, EDA, recipes, reports, progress)
+├── models/         # per-run serialized best model + timing calibration
+├── start_app.bat   # one-click launcher (stop_app.bat shuts down)
+└── requirements.txt
+```
+
+Deeper architecture notes (stage contracts, JSON files, gotchas) live in `CLAUDE.md`.
