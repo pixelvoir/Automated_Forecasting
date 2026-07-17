@@ -33,6 +33,7 @@ prophet>=1.3.0
 chronos-forecasting>=2.0
 xgboost>=2.0.0
 lightgbm>=4.0.0
+catboost>=1.2.7   # first release with numpy 2.x support (verified working under numpy 2.4)
 # torch (CPU build) powers the hand-rolled NHITS backend (models_lib/nhits_model.py):
 #   pip install torch --index-url https://download.pytorch.org/whl/cpu
 # neuralforecast is deliberately NOT used: it depends on coreforecast, the same compiled

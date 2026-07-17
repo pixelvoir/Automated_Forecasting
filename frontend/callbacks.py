@@ -122,6 +122,46 @@ clientside_callback(
     Input("stage-tabs", "value"),
 )
 
+# Jump to the Pipeline section the moment the confirm chain is DISPATCHED, not when it
+# finishes. The live rail/log render there every 1.5s during the whole chain, but the
+# server callback can only switch sections in its final return — a user who stayed on
+# Setup watched a bare spinner for the entire multi-minute chain and then had the
+# fully-written log "appear all at once" on the landing. Clientside so it's instant;
+# confirm_and_run's validation failures return "tab-setup" to bounce straight back.
+#
+# Two-hop relay through the always-mounted jump-pipeline-store — BOTH hops are load-
+# bearing (2026-07-17, learned the hard way):
+#  * hop 1 must NOT write stage-tabs.value directly: Dash keys allow_duplicate outputs
+#    as `<id.prop>@sha256(inputs)`, and this hop's input signature is IDENTICAL to
+#    confirm_and_run's (which also dup-writes stage-tabs.value) → "Duplicate callback
+#    outputs" collision at startup;
+#  * padding hop 1 with a second, dynamically-rendered Input (btn-clean-rerun) fixes
+#    the hash but breaks dispatch — the renderer throws "A nonexistent object was used
+#    in an Input" whenever the other component isn't mounted.
+clientside_callback(
+    """
+    function(n) {
+        if (!n) { return window.dash_clientside.no_update; }
+        return n;
+    }
+    """,
+    Output("jump-pipeline-store", "data"),
+    Input("btn-confirm-run", "n_clicks"),
+    prevent_initial_call=True,
+)
+
+clientside_callback(
+    """
+    function(d) {
+        if (!d) { return window.dash_clientside.no_update; }
+        return "tab-pipeline";
+    }
+    """,
+    Output("stage-tabs", "value", allow_duplicate=True),
+    Input("jump-pipeline-store", "data"),
+    prevent_initial_call=True,
+)
+
 
 def _fetch_intent(run_id: str) -> dict | None:
     """Stage 2.5 auto-chain: detect + LLM-refine the forecast-intent suggestions right
@@ -1155,16 +1195,18 @@ def confirm_and_run(n_clicks, store_data, ts, target, agg, scope, group_cols,
     auto_continue = (bool(auto_run)
                      and (auto_state or {}).get("phase") == "await_intent"
                      and (auto_state or {}).get("run_id") == run_id)
+    # "tab-setup" (not no_update): the clientside jump already moved the user to the
+    # Pipeline section on click — a rejected form must bounce them back to fix it.
     if not run_id:
-        return no_update, dbc.Alert("No active run found.", color="warning", className="mb-2"), no_update, no_update
+        return no_update, dbc.Alert("No active run found.", color="warning", className="mb-2"), "tab-setup", no_update
     if not ts or not target:
         return no_update, dbc.Alert(
             "Confirm the timestamp and target columns first.",
-            color="warning", dismissable=True, className="mb-2"), no_update, no_update
+            color="warning", dismissable=True, className="mb-2"), "tab-setup", no_update
     if scope == "per_series" and not group_cols:
         return no_update, dbc.Alert(
             "Per-series scope needs at least one series-key column (or switch to Overall).",
-            color="warning", dismissable=True, className="mb-2"), no_update, no_update
+            color="warning", dismissable=True, className="mb-2"), "tab-setup", no_update
 
     body = {
         "timestamp_col": ts,

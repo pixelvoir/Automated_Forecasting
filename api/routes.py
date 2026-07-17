@@ -28,6 +28,18 @@ def _run_job(func, *args, track_id=None, **kwargs):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def _seed_stage(run_id: str, stage: str, detail: str) -> None:
+    """Mark a job-managed stage 'running' from the parent BEFORE the worker dispatches.
+
+    The spawn child re-imports the scientific stack before it can write its own
+    stage_start (seconds warm, tens of seconds on a cold file cache), and without this
+    seed the rail/log sit blank for that whole boot window. The child's stage_start
+    replaces this entry (so stage `seconds` still measure real work, not boot) and the
+    log keeps both lines — the gap between them IS the worker boot time."""
+    progress.stage_start(run_id, stage, detail=detail,
+                         log_msg=f"{detail} — starting worker")
+
+
 def _purge_downstream(run_id: str):
     """Remove Stage 5/6/7 artifacts that describe data about to be replaced (re-clean or a
     fresh forecast EDA) so /summary can never resurrect a decision/training made on data
@@ -204,6 +216,7 @@ def run_pre_clean_eda(run_id: str):
     run_dir = RUNS_DIR / run_id
     if not run_dir.exists():
         raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found.")
+    _seed_stage(run_id, "pre_clean_eda", "profiling data (pre-clean EDA)")
     return _run_job(tasks.eda_task, run_id, track_id=run_id)
 
 
@@ -529,6 +542,7 @@ def run_clean(run_id: str, req: CleanRequest = CleanRequest()):
     # chain aborts early.
     _purge_downstream(run_id)
     progress.reset_downstream(run_id, "clean")
+    _seed_stage(run_id, "clean", "cleaning")
 
     result = _run_job(tasks.clean_task, run_id, use_llm=req.use_llm,
                       skip_cleaning=req.skip_cleaning, track_id=run_id)
@@ -541,6 +555,7 @@ def run_validate(run_id: str):
     run_dir = RUNS_DIR / run_id
     if not run_dir.exists():
         raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found.")
+    _seed_stage(run_id, "validate", "validation gate")
     return _run_job(tasks.validate_task, run_id, track_id=run_id)
 
 
@@ -557,6 +572,7 @@ def run_forecast_intent(run_id: str, req: ForecastIntentRequest = ForecastIntent
     run_dir = RUNS_DIR / run_id
     if not run_dir.exists():
         raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found.")
+    _seed_stage(run_id, "intent", "detecting forecast intent")
     return _run_job(tasks.forecast_intent_task, run_id, use_llm=req.use_llm, track_id=run_id)
 
 
@@ -636,6 +652,7 @@ def run_forecast_eda(run_id: str, req: ForecastEDARequest = ForecastEDARequest()
             sel["exclude_ranges"] = req.exclude_ranges or []
         sel_path.write_text(json.dumps(sel, indent=2))
     progress.reset_downstream(run_id, "forecast_eda")
+    _seed_stage(run_id, "forecast_eda", "forecast EDA")
     return _run_job(tasks.forecast_eda_task, run_id, track_id=run_id)
 
 
@@ -655,6 +672,7 @@ def run_model_select(run_id: str, req: ModelSelectRequest = ModelSelectRequest()
         raise HTTPException(
             status_code=400,
             detail="Run forecast EDA first — model selection needs its evidence payload.")
+    _seed_stage(run_id, "model_select", "model selection")
     return _run_job(tasks.model_select_task, run_id, use_llm=req.use_llm, track_id=run_id)
 
 

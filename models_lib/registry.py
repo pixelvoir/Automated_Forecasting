@@ -8,8 +8,9 @@ from __future__ import annotations
 
 from models_lib import intermittent, ml_models, statistical
 
-ML_IDS = {"lightgbm", "xgboost"}
+ML_IDS = {"lightgbm", "xgboost", "catboost"}
 NHITS_IDS = {"nhits"}
+PATCHTST_IDS = {"patchtst"}
 CHRONOS_IDS = {"chronos"}
 STATISTICAL_IDS = set(statistical.IDS)
 INTERMITTENT_IDS = set(intermittent.IDS)
@@ -17,7 +18,8 @@ PROPHET_IDS = {"prophet"}
 
 # Every model this training layer knows how to build (must be a superset of the catalog's
 # selectable models).
-KNOWN_IDS = STATISTICAL_IDS | INTERMITTENT_IDS | ML_IDS | NHITS_IDS | CHRONOS_IDS | PROPHET_IDS
+KNOWN_IDS = (STATISTICAL_IDS | INTERMITTENT_IDS | ML_IDS | NHITS_IDS | PATCHTST_IDS
+             | CHRONOS_IDS | PROPHET_IDS)
 
 
 def is_ml(model_id: str) -> bool:
@@ -27,14 +29,15 @@ def is_ml(model_id: str) -> bool:
 def is_global_capable(model_id: str) -> bool:
     """Models that serve a whole panel with ONE model (routing target for the ``global``
     policy); the panel's TOTAL observations count toward their min_length."""
-    return model_id in ML_IDS or model_id in NHITS_IDS or model_id in CHRONOS_IDS
+    return (model_id in ML_IDS or model_id in NHITS_IDS or model_id in PATCHTST_IDS
+            or model_id in CHRONOS_IDS)
 
 
 def always_global(model_id: str) -> bool:
     """Models that on per-series scope ALWAYS route through their global/batched path
-    regardless of the Stage 5 policy — a per-series-local network per series (nhits) or
-    per-series pipeline loads (chronos) would be absurd."""
-    return model_id in NHITS_IDS or model_id in CHRONOS_IDS
+    regardless of the Stage 5 policy — a per-series-local network per series
+    (nhits/patchtst) or per-series pipeline loads (chronos) would be absurd."""
+    return model_id in NHITS_IDS or model_id in PATCHTST_IDS or model_id in CHRONOS_IDS
 
 
 def make_forecaster(model_id: str, recipe: dict, exog_cols, sarima_max_period: int = 24,
@@ -53,6 +56,9 @@ def make_forecaster(model_id: str, recipe: dict, exog_cols, sarima_max_period: i
     if model_id in NHITS_IDS:
         from models_lib import nhits_model  # lazy: torch is a heavy import
         return nhits_model.make(recipe, transform, train_cfg)
+    if model_id in PATCHTST_IDS:
+        from models_lib import patchtst_model  # lazy: torch is a heavy import
+        return patchtst_model.make(recipe, transform, train_cfg)
     if model_id in CHRONOS_IDS:
         from models_lib import chronos_model  # lazy: transformers is a heavy import
         return chronos_model.make(recipe, transform, train_cfg)

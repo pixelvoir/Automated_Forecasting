@@ -38,6 +38,7 @@ import numpy as np
 import pandas as pd
 import yaml
 
+from pipeline import progress
 from pipeline.forecasting_eda import (
     _build_series, _f, _pandas_freq, _resolve_selections, apply_train_filter,
 )
@@ -417,6 +418,12 @@ def run(run_id: str, build_ml_matrix: bool | None = None) -> dict:
 
     if len(frame) < 5:
         raise ValueError(f"Only {len(frame)} points at {freq_label} — too short to model.")
+    # Stage 6 runs inside the train job — keep the log alive on big panels, where the
+    # frame build above and the ML matrix below are each a multi-minute silence.
+    progress.stage_update(
+        run_id, "train",
+        f"features: modeling frame ready ({len(frame):,} rows, "
+        f"{frame_report.get('n_series', 1)} series)")
 
     # Recipe is seeded from the AGGREGATE EDA stats; n_points for the caps uses the median
     # per-series length in panel mode, else the aggregate length.
@@ -432,6 +439,7 @@ def run(run_id: str, build_ml_matrix: bool | None = None) -> dict:
     ml_matrix_path = None
     feature_names: list[str] = []
     if build_ml_matrix:
+        progress.stage_update(run_id, "train", "features: materializing ML matrix")
         matrix, feature_names = _materialize_ml_matrix(frame, recipe)
         ml_matrix_path = FEATURES_DIR / f"{run_id}_features.parquet"
         matrix.to_parquet(ml_matrix_path, index=False)

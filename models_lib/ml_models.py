@@ -36,7 +36,7 @@ from models_lib.base_model import Forecaster, apply_transform, invert_transform
 from pipeline import resource_limits
 from pipeline.feature_builder import _safe, build_supervised
 
-_ML_IDS = {"lightgbm", "xgboost"}
+_ML_IDS = {"lightgbm", "xgboost", "catboost"}
 
 # n_jobs used to be -1 (all cores) — on a small box a training run pinned 100% CPU and
 # froze the desktop. Capped to resources.max_threads (default cores − 1).
@@ -51,16 +51,27 @@ _BASE_LGBM = dict(n_estimators=800, learning_rate=0.025, num_leaves=63, max_dept
 _BASE_XGB = dict(n_estimators=800, learning_rate=0.025, max_depth=7,
                  min_child_weight=5, subsample=0.8, colsample_bytree=0.75,
                  reg_alpha=0.3, reg_lambda=1.5, random_state=0, n_jobs=_N_JOBS, verbosity=0)
+# n_estimators is CatBoost's accepted alias for `iterations`, which keeps _fit_quantile's
+# generic refit-at-best-count working. allow_writing_files=False is mandatory — CatBoost
+# otherwise writes a catboost_info/ dir into the CWD on every fit (dozens across
+# CV/quantile/Optuna fits). Bernoulli bootstrap is what makes `subsample` legal.
+_BASE_CAT = dict(n_estimators=800, learning_rate=0.025, depth=7, l2_leaf_reg=3.0,
+                 subsample=0.8, bootstrap_type="Bernoulli", colsample_bylevel=0.75,
+                 random_seed=0, thread_count=_N_JOBS, verbose=0,
+                 allow_writing_files=False)
 
 _DIRECT_FEATS = ["horizon", "target_phase", "target_sindex"]
 
 
 def _default_params(model_id: str, n_rows: int) -> dict:
-    p = dict(_BASE_LGBM if model_id == "lightgbm" else _BASE_XGB)
     if model_id == "lightgbm":
+        p = dict(_BASE_LGBM)
         p["num_leaves"] = min(63, max(7, n_rows // 8))
         p["min_child_samples"] = min(15, max(3, n_rows // 30))
+    elif model_id == "catboost":
+        p = dict(_BASE_CAT)   # depth-wise growth — no leaf-count scaling needed
     else:
+        p = dict(_BASE_XGB)
         p["min_child_weight"] = min(5, max(1, n_rows // 60))
     return p
 
@@ -70,6 +81,8 @@ def _alpha_params(model_id: str, params: dict, alpha: float) -> dict:
     p = dict(params)
     if model_id == "lightgbm":
         p.update(objective="quantile", alpha=float(alpha))
+    elif model_id == "catboost":
+        p.update(loss_function=f"Quantile:alpha={float(alpha)}")
     else:
         p.update(objective="reg:quantileerror", quantile_alpha=float(alpha))
     return p
@@ -79,6 +92,9 @@ def _make_regressor(model_id: str, params: dict, early_stopping_rounds: int | No
     if model_id == "lightgbm":
         import lightgbm as lgb
         return lgb.LGBMRegressor(**params)
+    if model_id == "catboost":
+        from catboost import CatBoostRegressor
+        return CatBoostRegressor(**params)   # early stopping is a fit() arg for CatBoost
     import xgboost as xgb
     if early_stopping_rounds:
         return xgb.XGBRegressor(**params, early_stopping_rounds=int(early_stopping_rounds))
@@ -101,6 +117,11 @@ def _fit_quantile(model_id, params, alpha, X, y, Xv=None, yv=None, es_rounds=80)
               callbacks=[lgb.early_stopping(int(es_rounds), verbose=False),
                          lgb.log_evaluation(0)])
         best = int(m.best_iteration_ or p["n_estimators"])
+    elif model_id == "catboost":
+        m = _make_regressor(model_id, p)
+        m.fit(X, y, eval_set=(Xv, yv), early_stopping_rounds=int(es_rounds), verbose=False)
+        bi = m.get_best_iteration()
+        best = int(bi) + 1 if bi is not None else int(p["n_estimators"])
     else:
         m = _make_regressor(model_id, p, early_stopping_rounds=es_rounds)
         m.fit(X, y, eval_set=[(Xv, yv)], verbose=False)
@@ -358,19 +379,27 @@ def tune(model_id: str, hist: pd.DataFrame, recipe: dict, n_trials: int,
     base = _default_params(model_id, len(train_df))
 
     def objective(trial):
+        # CatBoost raises on unknown params (no reg_alpha/reg_lambda/colsample_bytree),
+        # so the search space is fully per-backend beyond the learning rate.
         p = dict(base)
-        p.update(learning_rate=trial.suggest_float("learning_rate", 0.008, 0.1, log=True),
-                 subsample=trial.suggest_float("subsample", 0.6, 1.0),
-                 colsample_bytree=trial.suggest_float("colsample_bytree", 0.5, 1.0),
-                 reg_alpha=trial.suggest_float("reg_alpha", 1e-3, 5.0, log=True),
-                 reg_lambda=trial.suggest_float("reg_lambda", 1e-2, 10.0, log=True))
-        if model_id == "lightgbm":
-            p.update(num_leaves=trial.suggest_int("num_leaves", 15, 127),
-                     max_depth=trial.suggest_int("max_depth", 4, 10),
-                     min_child_samples=trial.suggest_int("min_child_samples", 5, 40))
+        p["learning_rate"] = trial.suggest_float("learning_rate", 0.008, 0.1, log=True)
+        if model_id == "catboost":
+            p.update(subsample=trial.suggest_float("subsample", 0.6, 1.0),
+                     colsample_bylevel=trial.suggest_float("colsample_bylevel", 0.5, 1.0),
+                     depth=trial.suggest_int("depth", 4, 10),
+                     l2_leaf_reg=trial.suggest_float("l2_leaf_reg", 0.5, 10.0, log=True))
         else:
-            p.update(max_depth=trial.suggest_int("max_depth", 3, 10),
-                     min_child_weight=trial.suggest_int("min_child_weight", 1, 20))
+            p.update(subsample=trial.suggest_float("subsample", 0.6, 1.0),
+                     colsample_bytree=trial.suggest_float("colsample_bytree", 0.5, 1.0),
+                     reg_alpha=trial.suggest_float("reg_alpha", 1e-3, 5.0, log=True),
+                     reg_lambda=trial.suggest_float("reg_lambda", 1e-2, 10.0, log=True))
+            if model_id == "lightgbm":
+                p.update(num_leaves=trial.suggest_int("num_leaves", 15, 127),
+                         max_depth=trial.suggest_int("max_depth", 4, 10),
+                         min_child_samples=trial.suggest_int("min_child_samples", 5, 40))
+            else:
+                p.update(max_depth=trial.suggest_int("max_depth", 3, 10),
+                         min_child_weight=trial.suggest_int("min_child_weight", 1, 20))
         m = _make_regressor(model_id, _alpha_params(model_id, p, 0.5))
         m.fit(Xtr, ytr)
         pred = m.predict(Xva)
@@ -495,8 +524,12 @@ def run_global(frame, recipe, model_id, cfg, horizon, freq_alias, transform, par
         def objective(trial):
             p = dict(params)
             p.update(learning_rate=trial.suggest_float("learning_rate", 0.008, 0.1, log=True),
-                     subsample=trial.suggest_float("subsample", 0.6, 1.0),
-                     colsample_bytree=trial.suggest_float("colsample_bytree", 0.5, 1.0))
+                     subsample=trial.suggest_float("subsample", 0.6, 1.0))
+            if model_id == "catboost":
+                p.update(colsample_bylevel=trial.suggest_float("colsample_bylevel", 0.5, 1.0),
+                         depth=trial.suggest_int("depth", 4, 10))
+            else:
+                p["colsample_bytree"] = trial.suggest_float("colsample_bytree", 0.5, 1.0)
             if model_id == "lightgbm":
                 p["num_leaves"] = trial.suggest_int("num_leaves", 31, 255)
             m = _make_regressor(model_id, _alpha_params(model_id, p, 0.5))

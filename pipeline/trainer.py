@@ -42,7 +42,28 @@ MODELS_DIR = ROOT / "models"
 CONFIG_PATH = ROOT / "config" / "settings.yaml"
 
 BASELINE = "seasonal_naive"
-ENSEMBLE = "ensemble_top2"
+ENSEMBLE = "ensemble"   # weighted-ensemble row id (pre-2026-07-17 reports used "ensemble_top2")
+
+_ENSEMBLE_DEFAULTS = {
+    "enabled": True,
+    "max_members": 5,
+    "mase_factor": 1.5,
+    "exclude_worse_than_baseline": True,
+    "min_shared_points": 3,
+    "min_points_per_member": 3,
+    "shrink_points_per_member": 3,
+}
+
+
+def _ensemble_cfg(tcfg: dict) -> dict:
+    """Merged ensemble config: defaults ← legacy `ensemble_top2` bool ← `training.ensemble`."""
+    out = dict(_ENSEMBLE_DEFAULTS)
+    if "ensemble_top2" in tcfg:   # pre-refactor settings files can still disable it
+        out["enabled"] = bool(tcfg["ensemble_top2"])
+    block = tcfg.get("ensemble")
+    if isinstance(block, dict):
+        out.update({k: block[k] for k in _ENSEMBLE_DEFAULTS if k in block})
+    return out
 
 
 class TrainingHeavyError(Exception):
@@ -72,6 +93,7 @@ def _resolve_profile(tcfg: dict, override=None) -> dict:
     prof.setdefault("optuna_trials", 30)
     prof.setdefault("early_stopping_rounds", 80)
     prof.setdefault("nhits_max_epochs", 200)
+    prof.setdefault("patchtst_max_epochs", 150)
     prof["profile_name"] = name
     prof["max_train_rows"] = int(tcfg.get("max_train_rows", 1_500_000))
     prof["interval_levels"] = list(tcfg.get("interval_levels", [80, 95]))
@@ -119,6 +141,8 @@ _OPTUNA_TRIAL_S = 0.4           # per tuning trial on a single series
 _OPTUNA_GLOBAL_TRIAL_S = 26.0   # per tuning trial on the sampled global dataset
 _NHITS_S_PER_EPOCH_MROW = 8.0   # per effective epoch per million frame rows
 _NHITS_MIN_S = 20.0
+_PATCHTST_S_PER_EPOCH_MROW = 16.0  # attention ~2× the NHITS MLP cost per epoch-row
+_PATCHTST_MIN_S = 30.0
 _CHRONOS_LOAD_S = 20.0          # HF weights load once per process
 _CHRONOS_S_PER_KSERIES = 25.0   # one batched inference pass per 1000 series (h≈16)
 CALIBRATION_PATH = MODELS_DIR / "timing_calibration.json"
@@ -161,6 +185,12 @@ def _model_base_seconds(mid: str, route: str, n_series: int, length: int, horizo
         epochs_eff = 0.5 * int(knobs.get("nhits_max_epochs", 150))
         # ×2: truncated-data backtest model + fresh full-data final model
         return max(_NHITS_MIN_S, 2 * epochs_eff * _NHITS_S_PER_EPOCH_MROW * max(rows_m, 0.01))
+    if mid in registry.PATCHTST_IDS:
+        rows_m = (n_series if route == "global" else 1) * length / 1e6
+        epochs_eff = 0.5 * int(knobs.get("patchtst_max_epochs", 100))
+        # same two-phase scheme as nhits; attention is ~2× heavier per epoch-row
+        return max(_PATCHTST_MIN_S,
+                   2 * epochs_eff * _PATCHTST_S_PER_EPOCH_MROW * max(rows_m, 0.01))
     if registry.is_ml(mid):
         if route == "global":
             expanded = n_series * max(length - period - 12, 10) * horizon
@@ -488,47 +518,161 @@ def _target_insights(entry, hist: pd.Series, horizon: int) -> dict | None:
             "pct_change": pct, "widest_interval_95": widest}
 
 
-def _ensemble_top2(results, requested, scale, levels) -> dict | None:
-    """Leaderboard row averaging the two best REQUESTED models' forecasts (2026-07-16).
+def _solve_weights(act, P, mases, ecfg):
+    """MAE-optimal convex weights over the member prediction matrix.
 
-    A simple mean of two decorrelated forecasters is a well-known cheap win — the
-    components are already trained, so this costs nothing. Backtests are aligned on
-    the display arrays' shared timestamps (different routes can backtest different
-    windows, e.g. chronos' single holdout vs classical CV), metrics use the SAME
-    pooled MASE scale as every other row, and intervals are conformal from the
-    ensemble's own backtest residuals. Returns None when fewer than two requested
-    models produced comparable backtests."""
+    minimize mean|act − P·w|  s.t.  w ≥ 0, Σw = 1  — SLSQP (deterministic, ≤5 dims).
+    MAE is the right loss: the leaderboard ranks by MASE = MAE / scale with the pooled
+    scale constant on this window, so this minimizes the exact ranking metric.
+    Fallbacks: optimizer failure or no in-sample improvement over equal weights →
+    inverse-MASE weights → equal weights. Weights are then shrunk toward equal when the
+    shared window is small relative to the member count — a 5-member weight vector
+    fitted on a dozen points is noise, not signal."""
+    n, k = P.shape
+    equal = np.full(k, 1.0 / k)
+
+    def _mae(w):
+        return float(np.mean(np.abs(act - P @ w)))
+
+    w, method = None, None
+    try:
+        from scipy.optimize import minimize
+        res = minimize(_mae, x0=equal, method="SLSQP", bounds=[(0.0, 1.0)] * k,
+                       constraints=[{"type": "eq",
+                                     "fun": lambda w: float(np.sum(w) - 1.0)}])
+        cand = np.clip(np.asarray(res.x, dtype=float), 0.0, None)
+        if res.success and np.all(np.isfinite(cand)) and cand.sum() > 0:
+            cand = cand / cand.sum()
+            if _mae(cand) <= _mae(equal) + 1e-12:
+                w, method = cand, "slsqp"
+    except Exception:  # noqa: BLE001 — weight fitting must never kill the run
+        pass
+    if w is None:
+        inv = np.array([1.0 / m if (m and np.isfinite(m) and m > 0) else 0.0
+                        for m in mases], dtype=float)
+        if inv.sum() > 0:
+            w, method = inv / inv.sum(), "inverse_mase"
+        else:
+            w, method = equal, "equal"
+    lam = min(1.0, n / float(max(1, int(ecfg["shrink_points_per_member"]) * k)))
+    if lam < 1.0 and method != "equal":
+        w = lam * w + (1.0 - lam) * equal
+        w = w / w.sum()
+        method += "+shrunk"
+    return w, method
+
+
+def _ensemble(results, requested, scale, levels, ecfg) -> dict | None:
+    """Weighted-ensemble leaderboard row over the REQUESTED models (2026-07-17; replaces
+    the fixed top-2 mean).
+
+    Members = every requested model with a finite backtest MASE, minus low performers
+    (not beating the seasonal-naive reference; worse than mase_factor × the best member),
+    capped at max_members. Backtests are aligned on the display arrays' shared timestamps
+    (different routes backtest different windows — chronos' single holdout vs classical
+    CV), and members are pruned until the shared window supports the member count.
+    Weights come from _solve_weights (constrained optimization with fallbacks). Metrics
+    use the SAME pooled MASE scale as every other row; intervals are conformal from the
+    ensemble's own backtest residuals. Returns None — no row at all — when fewer than
+    two members or too few shared points survive."""
     cands = [e for e in results
              if e["model"] in requested and not e.get("error")
-             and (e.get("metrics") or {}).get("mase") is not None]
+             and (e.get("metrics") or {}).get("mase") is not None
+             and (e.get("backtest") or {}).get("ds")]
     cands.sort(key=lambda e: e["metrics"]["mase"])
     if len(cands) < 2:
         return None
-    a, b = cands[0], cands[1]
 
-    bt_b = {ds: pred for ds, pred in zip(b["backtest"]["ds"], b["backtest"]["predicted"])}
-    ds_c, act_c, pred_c = [], [], []
-    for ds, act, pred in zip(a["backtest"]["ds"], a["backtest"]["actual"],
-                             a["backtest"]["predicted"]):
-        other = bt_b.get(ds)
-        if pred is not None and other is not None:
-            ds_c.append(ds)
-            act_c.append(act)
-            pred_c.append((float(pred) + float(other)) / 2.0)
-    if len(ds_c) < 3:
+    excluded = {}
+    best_mase = float(cands[0]["metrics"]["mase"])
+    if ecfg["exclude_worse_than_baseline"]:
+        base = next((e for e in results if e["model"] == BASELINE), None)
+        bm = ((base or {}).get("metrics") or {}).get("mase")
+        if bm is not None and np.isfinite(bm):
+            keep = []
+            for e in cands:
+                if float(e["metrics"]["mase"]) >= float(bm) and e["model"] != BASELINE:
+                    excluded[e["model"]] = (f"MASE {e['metrics']['mase']:.3f} not better "
+                                            f"than baseline {bm:.3f}")
+                else:
+                    keep.append(e)
+            cands = keep
+    # Factor exclusion never cuts below two members — the old top-2 behavior is the
+    # floor (a mediocre second member just gets a low weight from the optimizer).
+    factor = float(ecfg["mase_factor"])
+    keep = []
+    for i, e in enumerate(cands):
+        if i >= 2 and float(e["metrics"]["mase"]) > factor * best_mase:
+            excluded[e["model"]] = (f"MASE {e['metrics']['mase']:.3f} > "
+                                    f"{factor:g}x best ({best_mase:.3f})")
+        else:
+            keep.append(e)
+    cands = keep
+    for e in cands[int(ecfg["max_members"]):]:
+        excluded[e["model"]] = "beyond max_members cap"
+    cands = cands[:int(ecfg["max_members"])]
+    if len(cands) < 2:
         return None
-    metrics = evaluator.compute_metrics(pd.Series(act_c, dtype=float),
-                                        pd.Series(pred_c, dtype=float), scale)
 
-    fc_b = dict(zip(b["forecast"]["ds"], b["forecast"]["yhat"]))
-    f_ds, f_hat = [], []
-    for ds, v in zip(a["forecast"]["ds"], a["forecast"]["yhat"]):
-        w = fc_b.get(ds)
-        if v is not None and w is not None:
-            f_ds.append(ds)
-            f_hat.append((float(v) + float(w)) / 2.0)
-    point = np.asarray(f_hat, dtype=float)
-    resid = np.asarray(act_c, dtype=float) - np.asarray(pred_c, dtype=float)
+    def _bt_map(e):
+        return {ds: p for ds, p in zip(e["backtest"]["ds"], e["backtest"]["predicted"])
+                if p is not None}
+
+    def _shared(members):
+        maps = [_bt_map(e) for e in members]
+        shared = set(maps[0])
+        for m in maps[1:]:
+            shared &= set(m)
+        return shared, maps
+
+    members = list(cands)
+    shared, maps = _shared(members)
+    min_pts = int(ecfg["min_shared_points"])
+
+    def _need(k):
+        return max(min_pts, int(ecfg["min_points_per_member"]) * k)
+
+    # Prune until the shared window supports the member count: drop the non-best member
+    # whose removal grows the intersection most (>= keeps the later, worse-MASE member
+    # as the drop on ties). Two members are always allowed min_shared_points, matching
+    # the old top-2 behavior — shrinkage handles the small-sample risk there.
+    while len(shared) < _need(len(members)) and len(members) > 2:
+        best_gain, drop_i = -1, len(members) - 1
+        for i in range(1, len(members)):
+            s, _ = _shared(members[:i] + members[i + 1:])
+            if len(s) >= best_gain:
+                best_gain, drop_i = len(s), i
+        excluded[members[drop_i]["model"]] = "insufficient shared backtest window"
+        members.pop(drop_i)
+        shared, maps = _shared(members)
+    if len(members) < 2 or len(shared) < min_pts:
+        return None
+
+    a = members[0]
+    act_map = {ds: v for ds, v in zip(a["backtest"]["ds"], a["backtest"]["actual"])
+               if v is not None}
+    ds_c = [ds for ds in sorted(shared) if ds in act_map]  # ISO strings sort chronologically
+    if len(ds_c) < min_pts:
+        return None
+    act = np.array([float(act_map[ds]) for ds in ds_c])
+    P = np.column_stack([np.array([float(m[ds]) for ds in ds_c]) for m in maps])
+    mases = [float(e["metrics"]["mase"]) for e in members]
+
+    w, method = _solve_weights(act, P, mases, ecfg)
+    pred = P @ w
+    metrics = evaluator.compute_metrics(pd.Series(act), pd.Series(pred), scale)
+
+    # Forecast: all members share the final horizon grid, so the inner join is
+    # normally the full horizon; weighted mean with the same weights.
+    fmaps = [{ds: v for ds, v in zip(e["forecast"]["ds"], e["forecast"]["yhat"])
+              if v is not None} for e in members]
+    f_shared = set(fmaps[0])
+    for m in fmaps[1:]:
+        f_shared &= set(m)
+    f_ds = sorted(f_shared)
+    point = (np.column_stack([np.array([float(m[ds]) for ds in f_ds]) for m in fmaps]) @ w
+             if f_ds else np.array([]))
+    resid = act - pred
     res_by_step = {k + 1: resid for k in range(len(point))}
     intervals = conformal_intervals(point, res_by_step, levels) if len(point) else {}
     forecast = {"ds": f_ds, "yhat": _round_list(point), "interval_method": "conformal"}
@@ -538,16 +682,22 @@ def _ensemble_top2(results, requested, scale, levels) -> dict | None:
             forecast[f"lo{lvl}"] = _round_list(lo)
             forecast[f"hi{lvl}"] = _round_list(hi)
 
+    weights = [round(float(x), 4) for x in w]
+    label_parts = [f"{w[i]:.2f}·{members[i]['label']}" for i in range(len(members))
+                   if round(float(w[i]), 2) > 0]
     return {
-        "model": ENSEMBLE, "label": f"Ensemble ({a['label']} + {b['label']})",
+        "model": ENSEMBLE, "label": f"Ensemble ({' + '.join(label_parts)})",
         "category": "ensemble", "requested": True, "is_baseline": False,
-        "is_ensemble": True, "ensemble_of": [a["model"], b["model"]],
-        "metrics": metrics, "params": {"components": [a["model"], b["model"]],
-                                       "weights": [0.5, 0.5]},
-        "tuning": None, "strategy": "mean of the two best requested forecasts",
+        "is_ensemble": True, "ensemble_of": [e["model"] for e in members],
+        "metrics": metrics,
+        "params": {"components": [e["model"] for e in members], "weights": weights,
+                   "weight_method": method, "n_shared_points": len(ds_c),
+                   "loss": "mae", "excluded": excluded},
+        "tuning": None,
+        "strategy": f"weighted mean of {len(members)} requested forecasts ({method} weights)",
         "error": None, "train_seconds": 0.0,
-        "backtest": {"ds": ds_c, "actual": _round_list(act_c),
-                     "predicted": _round_list(pred_c)},
+        "backtest": {"ds": ds_c, "actual": _round_list(act),
+                     "predicted": _round_list(pred)},
         "forecast": forecast,
     }
 
@@ -651,6 +801,11 @@ def run(run_id: str, models, confirm_heavy: bool = False, profile: str | None = 
                     res = nhits_model.run_global(frame, recipe, cfg, horizon, alias,
                                                  recipe.get("transform", "none"),
                                                  levels, profile)
+                elif mid in registry.PATCHTST_IDS:
+                    from models_lib import patchtst_model  # lazy: torch is a heavy import
+                    res = patchtst_model.run_global(frame, recipe, cfg, horizon, alias,
+                                                    recipe.get("transform", "none"),
+                                                    levels, profile)
                 elif mid in registry.CHRONOS_IDS:
                     from models_lib import chronos_model  # lazy: transformers is heavy
                     res = chronos_model.run_global(frame, recipe, cfg, horizon, alias,
@@ -708,27 +863,43 @@ def run(run_id: str, models, confirm_heavy: bool = False, profile: str | None = 
                 "forecast": {"ds": [], "yhat": []},
             })
 
-    # Top-2 ensemble row (free: components already trained). Derived exclusively from
+    # Weighted ensemble row (free: components already trained). Derived exclusively from
     # REQUESTED models, so it respects the "user's selection is ultimate" rule and is
-    # itself crownable. Configurable off via training.ensemble_top2.
-    if tcfg.get("ensemble_top2", True) and len(requested) >= 2:
-        ens = _ensemble_top2(results, requested, scale, levels)
+    # itself crownable. Config: training.ensemble (legacy ensemble_top2 bool honored).
+    ecfg = _ensemble_cfg(tcfg)
+    if ecfg["enabled"] and len(requested) >= 2:
+        ens = _ensemble(results, requested, scale, levels, ecfg)
         if ens:
             results.append(ens)
-            fitted_objs[ENSEMBLE] = {"ensemble_of": ens["ensemble_of"], "weights": [0.5, 0.5],
+            fitted_objs[ENSEMBLE] = {"ensemble_of": ens["ensemble_of"],
+                                     "weights": ens["params"]["weights"],
                                      "components": {m: fitted_objs.get(m)
                                                     for m in ens["ensemble_of"]}}
+            m_txt = ens["metrics"].get("mase")
+            progress.stage_update(run_id, "train", f"ensemble: {ens['label']}"
+                                  + (f" — MASE {m_txt}" if m_txt is not None else ""))
             if scope == "per_series" and series_frames:
-                # Per-series viewer rows: mean of the two components where both exist.
+                # Per-series viewer rows: weighted mean where ALL members cover the
+                # (unique_id, ds, kind). dropna first is load-bearing — a NaN member
+                # prediction would otherwise be skipped by the sum while n still counts
+                # the model, silently mis-weighting the point instead of dropping it.
+                wmap = dict(zip(ens["ensemble_of"], ens["params"]["weights"]))
                 sf_all = pd.concat(series_frames, ignore_index=True)
-                comp = sf_all[sf_all["model"].isin(ens["ensemble_of"])]
-                both = comp.groupby(["unique_id", "ds", "kind"], as_index=False, observed=True) \
-                    .agg(actual=("actual", "first"), predicted=("predicted", "mean"),
-                         n=("model", "nunique"))
-                both = both[both["n"] == 2].drop(columns="n")
-                both["model"] = ENSEMBLE
+                comp = sf_all[sf_all["model"].isin(wmap)].dropna(subset=["predicted"]).copy()
+                comp["_w"] = comp["model"].map(wmap).astype(float)
+                comp["_wp"] = comp["predicted"] * comp["_w"]
+                g = comp.groupby(["unique_id", "ds", "kind"], as_index=False, observed=True) \
+                    .agg(actual=("actual", "first"), _wp=("_wp", "sum"),
+                         _ws=("_w", "sum"), n=("model", "nunique"))
+                g = g[(g["n"] == len(wmap)) & (g["_ws"] > 0)].copy()
+                g["predicted"] = g["_wp"] / g["_ws"]
+                g["model"] = ENSEMBLE
                 series_frames.append(
-                    both[["model", "unique_id", "ds", "kind", "actual", "predicted"]])
+                    g[["model", "unique_id", "ds", "kind", "actual", "predicted"]])
+        else:
+            progress.stage_update(run_id, "train",
+                                  "ensemble skipped — not enough comparable backtests "
+                                  "among the requested models")
 
     # Rank by MASE (finite first), mark primary + best. The user's dropdown selection is
     # the ULTIMATE choice: only a REQUESTED model (or the ensemble derived from requested

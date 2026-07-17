@@ -146,6 +146,18 @@ models:
       panel; the rule ladder only ever picks lightgbm, but the user (or LLM) may train
       xgboost instead.
 
+  - id: catboost
+    label: "CatBoost"
+    library: catboost              # models_lib/ml_models.py (shared direct-ML backend)
+    import_check: catboost
+    categories: [ml]
+    min_length: 30
+    supports_exog: true
+    when_to_use: >-
+      Gradient-boosted trees (ordered boosting) on the same engineered lag / rolling /
+      calendar / exogenous features; often the most robust GBM on small or noisy data.
+      An alternative ML learner for long history or a many-series panel.
+
   - id: nhits
     label: "NHITS"
     library: torch                  # pure-torch backend (models_lib/nhits_model.py);
@@ -158,6 +170,19 @@ models:
       panels trained globally — for per-series scope the TOTAL observations across
       all series count toward min_length, so a 1,800-series monthly panel qualifies
       even when each series is short. Needs PyTorch installed.
+
+  - id: patchtst
+    label: "PatchTST"
+    library: torch                  # hand-rolled pure-torch (models_lib/patchtst_model.py);
+    import_check: torch             # neuralforecast is unusable here (coreforecast segfault)
+    categories: [deep_learning]
+    min_length: 200
+    supports_exog: false
+    when_to_use: >-
+      Patch-based transformer trained globally: strong on long, regular histories with
+      complex patterns, and on large panels — for per-series scope the panel's TOTAL
+      observations count toward min_length. Instance normalization makes it robust to
+      level shifts. Needs PyTorch installed.
 
   - id: chronos
     label: "Chronos (zero-shot)"

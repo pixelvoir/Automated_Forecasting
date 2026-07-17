@@ -351,6 +351,12 @@ def create_layout():
             # Auto-run state machine (phase: await_intent/train_pending/…). Session so a
             # refresh mid-auto-run can resume; every dataset switch resets it.
             dcc.Store(id="auto-run-store", storage_type="session"),
+            # Relay for the confirm-click jump to the Pipeline section. Always mounted:
+            # a clientside callback may NOT pair a dynamically-rendered Input with an
+            # allow_duplicate output directly — same-input-signature callbacks collide
+            # on the duplicate-output hash, and a second (unmounted) Input makes the
+            # renderer throw "nonexistent object used in an Input" on every dispatch.
+            dcc.Store(id="jump-pipeline-store"),
             # Polls GET /runs/{id}/progress while a chain callback is in flight — every
             # long callback enables it via running=. Drives ONLY the rail/log render.
             dcc.Interval(id="progress-interval", interval=1500, disabled=True),

@@ -68,7 +68,8 @@ def _log(prog: dict, stage: str, msg: str) -> None:
 
 
 def stage_start(run_id: str, stage: str, detail: str | None = None,
-                total: int | None = None, eta_seconds: float | None = None) -> None:
+                total: int | None = None, eta_seconds: float | None = None,
+                log_msg: str | None = None) -> None:
     def fn(prog):
         # Single-slot job manager: a new job stage starting means any OTHER stage still
         # marked "running" was killed/preempted and its stage_finish never ran — without
@@ -93,7 +94,7 @@ def stage_start(run_id: str, stage: str, detail: str | None = None,
             entry["eta_seconds"] = prev_eta
         prog["stages"][stage] = entry
         prog["active_stage"] = stage
-        _log(prog, stage, (detail or stage.replace("_", " ")) + " started")
+        _log(prog, stage, log_msg or ((detail or stage.replace("_", " ")) + " started"))
     _mutate(run_id, fn)
 
 

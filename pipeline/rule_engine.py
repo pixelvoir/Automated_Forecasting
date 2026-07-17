@@ -36,6 +36,7 @@ _DEFAULT_CFG = {
     "panel_global_min_series": 30,
     "panel_global_min_cycles": 2,
     "intermittent_veto_zero_pct": 20,
+    "llm_demote_margin": 1.5,
 }
 
 # Preference order when a rule's pick turns out ineligible (e.g. library missing).
@@ -45,8 +46,9 @@ _FALLBACK_ORDER = ["lightgbm", "auto_theta", "seasonal_naive"]
 
 # Deterministic tie-break for equal suitability scores in the ranking (nothing more —
 # scores dominate). Roughly "observed general strength" order.
-_PREF_ORDER = ["lightgbm", "xgboost", "nhits", "chronos", "auto_theta", "auto_ets",
-               "auto_arima", "mstl", "prophet", "croston", "tsb", "seasonal_naive"]
+_PREF_ORDER = ["lightgbm", "xgboost", "catboost", "nhits", "patchtst", "chronos",
+               "auto_theta", "auto_ets", "auto_arima", "mstl", "prophet", "croston",
+               "tsb", "seasonal_naive"]
 
 _RANK = {"low": 0, "medium": 1, "high": 2}
 _NAME = {0: "low", 1: "medium", 2: "high"}
@@ -275,10 +277,19 @@ def _suitability_scores(payload: dict, derived: dict, eligible: list, cfg: dict)
         add("auto_arima", -3.0, f"period {period} infeasible for SARIMA (> {cfg['sarima_max_period']})")
     elif single_seasonal:
         add("auto_arima", 2.0, "single seasonal period within SARIMA range")
-    if len(payload.get("significant_acf_lags") or []) >= 3:
-        add("auto_arima", 0.5, "rich autocorrelation structure")
+    # AR-order evidence (2026-07-17): the old "+0.5 rich autocorrelation" fired on ANY
+    # ≥3 significant ACF lags — every seasonal series has those, so ARIMA got a bonus
+    # exactly where gradient boosting wins. Real ARIMA evidence is a SHORT significant
+    # PACF (low-order AR); old payloads without the field get no bonus either way.
+    pacf_lags = payload.get("pacf_significant_lags")
+    if pacf_lags is not None and 1 <= len(pacf_lags) <= 3:
+        add("auto_arima", 0.5, "low-order AR structure (PACF cuts off after few lags)")
     if (payload.get("ndiffs") or 0) >= 1:
         add("auto_arima", 0.25, "differencing evidence (ndiffs ≥ 1)")
+    if (payload.get("nsdiffs") or 0) >= 1 and derived["sarima_feasible"]:
+        add("auto_arima", 0.25, "seasonal differencing evidence (nsdiffs ≥ 1)")
+    if payload.get("stationarity") is False and (payload.get("ndiffs") or 0) >= 2:
+        add("auto_arima", -0.5, "heavy differencing needed (ndiffs ≥ 2)")
     if length > 1000:
         add("auto_arima", -1.0, "very long series — pmdarima search is slow")
 
@@ -326,14 +337,24 @@ def _suitability_scores(payload: dict, derived: dict, eligible: list, cfg: dict)
         scores["xgboost"]["score"] = scores["lightgbm"]["score"] - 0.25
         scores["xgboost"]["reasons"] = [*scores["lightgbm"]["reasons"],
                                         "-0.25 same learner family; ladder prefers lightgbm"]
+    if "lightgbm" in scores and "catboost" in scores:
+        # -0.35 (vs xgboost's -0.25) keeps the GBM order deterministic by score alone.
+        scores["catboost"]["score"] = scores["lightgbm"]["score"] - 0.35
+        scores["catboost"]["reasons"] = [*scores["lightgbm"]["reasons"],
+                                         "-0.35 same learner family; ladder prefers lightgbm"]
 
     # deep
     if total_obs >= 2000:
         add("nhits", 1.5, f"{total_obs:,} total observations feed a neural net well")
+        add("patchtst", 1.5, f"{total_obs:,} total observations feed a transformer well")
     if is_panel:
         add("nhits", 1.0, "global training across the panel")
+        add("patchtst", 1.0, "global training across the panel")
+    if length >= 500:
+        add("patchtst", 0.5, "long single series — patch attention pays off")
     if strong_exog:
         add("nhits", -1.5, "cannot use exogenous drivers")
+        add("patchtst", -1.5, "cannot use exogenous drivers")
 
     add("chronos", 1.5, "pretrained zero-shot generalist (no training cost)")
     if sband in ("strong", "moderate"):

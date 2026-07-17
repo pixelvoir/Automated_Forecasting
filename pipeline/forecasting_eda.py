@@ -687,6 +687,15 @@ def _panel_summary(df: pd.DataFrame, ts_col: str, target: str, group_cols: list[
 
 # ── Decision payload ─────────────────────────────────────────────────────────
 
+def _pacf_significant_lags(autocorr: dict, cap: int = 5) -> list[int]:
+    """1-indexed lags whose |PACF| exceeds the confidence bound (first `cap` kept)."""
+    pacf, bound = autocorr.get("pacf") or [], autocorr.get("conf_bound")
+    if not pacf or bound is None:
+        return []
+    return [i + 1 for i, v in enumerate(pacf)
+            if v is not None and abs(v) > bound][:cap]
+
+
 def _build_payload(stats: dict, selections: dict, exog: dict,
                    fill_report: dict, panel: dict | None) -> dict:
     """The compact JSON handed to Stage 5 model selection. Statistics only."""
@@ -723,10 +732,22 @@ def _build_payload(stats: dict, selections: dict, exog: dict,
         "snr": stats["snr"],
         "cv": stats["cv"],
         "significant_acf_lags": stats["autocorrelation"]["significant_lags"][:15],
+        # AR-order hint (2026-07-17): a SHORT significant-PACF list = low-order AR
+        # structure — the actual evidence for ARIMA-family models; a long ACF list
+        # alone is just seasonality. Rules and LLM both read it.
+        "pacf_significant_lags": _pacf_significant_lags(stats["autocorrelation"]),
         "heteroskedastic": stats["heteroskedasticity"]["heteroskedastic"],
         "transform_recommendation": stats["heteroskedasticity"]["transform_recommendation"],
         "residual_ljung_box_p": stats["residual_ljung_box_p"],
         "structural_break_recent": stats["structural_breaks"]["recent_break"],
+        "structural_breaks": {
+            "n": len(stats["structural_breaks"]["break_dates"]),
+            "recent_dates": stats["structural_breaks"]["break_dates"][-2:],
+        },
+        "slope_pct_per_period": stats["trend"]["slope_pct_per_period"],
+        "recent_slope_pct_per_period": stats["trend"]["recent_slope_pct_per_period"],
+        "approx_entropy": stats["forecastability"]["approx_entropy"],
+        "dfa_alpha": stats["forecastability"]["dfa_alpha"],
         "has_exogenous": exog["has_exogenous"],
         "exog_top": exog["cross_correlation"][:5],
         "vif_max": max((r["vif"] for r in exog["vif"] if r["vif"] is not None), default=None),

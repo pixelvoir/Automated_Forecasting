@@ -36,6 +36,8 @@ _MODEL_ALIASES = {
     "autoarima": "auto_arima", "ets": "auto_ets", "autoets": "auto_ets",
     "exponential_smoothing": "auto_ets", "theta": "auto_theta", "autotheta": "auto_theta",
     "lgbm": "lightgbm", "light_gbm": "lightgbm", "gbm": "lightgbm",
+    "cat_boost": "catboost", "catboostregressor": "catboost",
+    "patch_tst": "patchtst",
     "croston_optimized": "croston", "crostonoptimized": "croston",
     "naive": "seasonal_naive", "seasonalnaive": "seasonal_naive",
     "fbprophet": "prophet", "meta_prophet": "prophet",
@@ -114,25 +116,37 @@ Model guidance (beyond each card's when_to_use):
 - prophet fits trend with automatic changepoints plus multiple seasonalities and
   calendar effects — strongest on daily/weekly data and long seasonal periods (e.g.
   yearly-365) where ARIMA is infeasible.
-- auto_arima suits rich short-lag autocorrelation with a single seasonal period <= 24
-  (monthly/quarterly); never for weekly-52 / daily-365 seasonality.
-- auto_ets suits smooth single-seasonal series; its multiplicative variants handle
-  level-dependent variance (heteroskedastic with a log recommendation).
+- auto_arima fits LOW-ORDER autoregressive structure: prefer it only when the PACF
+  cuts off after a few lags (pacf_significant_lags short), seasonality is weak to
+  moderate, and the single seasonal period is <= 24. On strongly seasonal series the
+  rule engine's gradient-boosting pick has empirically outperformed it in this
+  pipeline — many significant ACF lags alone are NOT evidence for ARIMA (every
+  seasonal series has them). Never for weekly-52 / daily-365 seasonality.
+- auto_ets suits smooth single-seasonal series with SHORT history where tree models
+  overfit; its multiplicative variants handle level-dependent variance
+  (heteroskedastic with a log recommendation). Do not promote it over a
+  high-confidence ML pick just because the series is seasonal.
 - Exogenous drivers only help if they LEAD the target (best_lag >= 1) or their future
   values are known; lag-0 correlation alone is NOT usable at forecast time. High VIF
   means the drivers are collinear — at most 1-2 of them add real signal. A best_lag
   within +-2 of the seasonal period may just echo the seasonality (seasonal_echo flag).
-  Only lightgbm/xgboost can exploit exogenous drivers.
-- lightgbm, xgboost, nhits and chronos serve many-series panels with ONE global model:
-  the panel's TOTAL observations count toward their history requirement.
+  Only the ML models (lightgbm/xgboost/catboost) can exploit exogenous drivers.
+- lightgbm, xgboost, catboost, nhits, patchtst and chronos serve many-series panels with
+  ONE global model: the panel's TOTAL observations count toward their history requirement.
 - Short history (under ~3 full seasonal cycles) favors auto_theta/auto_ets/chronos;
   lightgbm/nhits need long history or a many-series panel to beat classical models.
 - Growing variance (heteroskedastic with a log recommendation) is handled by the log
   transform, which training applies automatically from the hints.
 - A recent structural break favors models robust to level shifts; mention it in
   reason if it influenced the order.
-- Agree with the rule engine's #1 unless the evidence clearly contradicts it;
-  demoting a "high"-confidence rule pick needs strong justification.
+- When rule_suggestion.confidence is "high", KEEP its #1 at rank 1 unless a SPECIFIC
+  statistic in the payload directly contradicts the fired rule — and name that
+  statistic in `reason`. Reordering ranks 2-5 is always fine. (A demotion of a
+  high-confidence rule pick without such evidence is reverted deterministically.)
+- Extra payload signals when present: pacf_significant_lags (short list = low-order AR
+  structure), structural_breaks {n, recent_dates}, slope_pct_per_period vs
+  recent_slope_pct_per_period (trend acceleration), approx_entropy / dfa_alpha
+  (regularity / long-range persistence).
 - confidence: "high" only when the statistics point one way unambiguously.
 - Return pure JSON. No markdown, no extra text.
 """
@@ -296,6 +310,26 @@ def run(run_id: str, use_llm: bool = True) -> dict:
             if clean_entries:
                 entries = clean_entries
 
+            # High-confidence guard (2026-07-17): a VALID LLM #1 that demotes a
+            # high-confidence rule pick is either reverted (when its rule suitability
+            # is far below the rule pick's — llm_demote_margin) or kept with
+            # confidence capped at medium. Observed failures this closes: gemini
+            # promoted auto_arima/auto_ets over high-confidence R6 lightgbm picks
+            # with zero sanitizer intervention and kept "high" confidence.
+            if ("rank1" not in overrides and entries and rule["confidence"] == "high"
+                    and entries[0]["model"] != rule["model"]):
+                scores = {e["model"]: e["score"] for e in rule.get("ranking") or []}
+                margin = float(rule_engine._load_cfg().get("llm_demote_margin", 1.5))
+                llm_s, rule_s = scores.get(entries[0]["model"]), scores.get(rule["model"])
+                if llm_s is not None and rule_s is not None and llm_s < rule_s - margin:
+                    entries = [e for e in entries if e["model"] != rule["model"]]
+                    entries.insert(0, {"model": rule["model"], "reason": rule["reason"],
+                                       "source": "rule"})
+                    overrides = sorted({*overrides, "rank1",
+                                        "demoted_high_rule_pick_reverted"})
+                else:
+                    overrides = sorted({*overrides, "demoted_high_rule_pick"})
+
             # Dampen: LLM confidence capped at one level above the rule confidence;
             # a reverted rank-1 means the LLM's judgement failed -> low.
             if "rank1" in overrides:
@@ -305,6 +339,8 @@ def run(run_id: str, use_llm: bool = True) -> dict:
                 confidence = _NAME[min(_RANK[choice.confidence],
                                        _RANK[rule["confidence"]] + 1)]
                 top_reason = choice.reason
+                if "demoted_high_rule_pick" in overrides:
+                    confidence = _NAME[min(_RANK[confidence], _RANK["medium"])]
             # `source` names who actually picked the final model (drives the UI hero
             # card) — if the sanitizer reverted rank 1, the rule engine picked it.
             source = "rule_engine" if "rank1" in overrides else "llm"
