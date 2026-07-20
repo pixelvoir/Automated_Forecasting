@@ -29,7 +29,7 @@ llm:
 # than the pick-from-enums agents.
 llm_report:
   provider: "groq"
-  model: "qwen/qwen3-32b"
+  model: "openai/gpt-oss-120b"
   timeout_seconds: 120
   temperature: 0.4
   # api_key_env: "REPORT_GEMINI_API_KEY"   # uncomment to force a specific env var name

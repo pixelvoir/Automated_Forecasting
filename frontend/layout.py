@@ -359,7 +359,10 @@ def create_layout():
             dcc.Store(id="jump-pipeline-store"),
             # Polls GET /runs/{id}/progress while a chain callback is in flight — every
             # long callback enables it via running=. Drives ONLY the rail/log render.
-            dcc.Interval(id="progress-interval", interval=1500, disabled=True),
+            # 500ms, not more: a dcc.Interval fires its FIRST tick a full period after
+            # being enabled, so this period is the floor on click→first-log-line latency.
+            # Idle cost is zero — the interval is disabled outside chain callbacks.
+            dcc.Interval(id="progress-interval", interval=500, disabled=True),
             # Root-level and always mounted: the download target must never be inside a
             # re-renderable pane body (outputting to an unmounted component fails silently).
             dcc.Download(id="download-forecast"),

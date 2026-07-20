@@ -12,6 +12,17 @@ pip install --upgrade pip
 pip install torch --index-url https://download.pytorch.org/whl/cpu
 
 pip install -r requirements.txt
+if errorlevel 1 (
+    echo.
+    echo [error] pip install -r requirements.txt failed - see messages above.
+    echo         Fix the error and re-run setup_venv.bat ^(or start_app.bat, which
+    echo         retries the install automatically until it succeeds^).
+    exit /b 1
+)
+:: Snapshot marks a SUCCESSFUL install — start_app.bat compares it against
+:: requirements.txt on every launch and re-syncs the venv when they differ.
+copy /y requirements.txt ".venv\requirements.snapshot" >nul
+
 pip install -e .
 
 echo.

@@ -16,6 +16,22 @@ if not exist ".venv\Scripts\python.exe" (
     )
 )
 
+:: Sync dependencies when requirements.txt changed since the last successful install
+:: (a git pull that adds packages into an EXISTING .venv would otherwise never install
+:: them). The snapshot is written only after a successful pip run, so an aborted
+:: install retries on the next start. A missing snapshot (pre-existing venv) syncs once.
+fc /b requirements.txt ".venv\requirements.snapshot" >nul 2>&1
+if errorlevel 1 (
+    echo [setup] requirements.txt changed - syncing dependencies...
+    ".venv\Scripts\python.exe" -m pip install -r requirements.txt
+    if errorlevel 1 (
+        echo [error] Dependency install failed - see messages above.
+        pause
+        exit /b 1
+    )
+    copy /y requirements.txt ".venv\requirements.snapshot" >nul
+)
+
 echo [start] Launching Forecasting API on http://127.0.0.1:8000 ...
 start "Forecasting API" /MIN cmd /c ".venv\Scripts\python.exe -m uvicorn api.main:app --host 127.0.0.1 --port 8000"
 

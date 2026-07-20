@@ -52,6 +52,7 @@ def ingest_task(table=None, query=None, credentials=None, file_path=None) -> dic
 
 
 def eda_task(run_id: str) -> dict:
+    progress.stage_update(run_id, "pre_clean_eda", "worker booted — loading libraries")
     from pipeline import pre_clean_eda
     return _staged(run_id, "pre_clean_eda", lambda: pre_clean_eda.run(run_id),
                    detail="profiling data (pre-clean EDA)")
@@ -61,6 +62,7 @@ def clean_task(run_id: str, use_llm: bool = True, skip_cleaning: bool = False) -
     """Decide the cleaning recipe (LLM or rule-based; skip_cleaning → pass-through
     essentials-only recipe) then execute it on the parquet. Returns the merged agent +
     cleaner result (without run_id/status, which the route adds)."""
+    progress.stage_update(run_id, "clean", "worker booted — loading libraries")
     from agents import cleaning_agent
     from pipeline import cleaner
 
@@ -83,6 +85,7 @@ def clean_task(run_id: str, use_llm: bool = True, skip_cleaning: bool = False) -
 
 
 def validate_task(run_id: str) -> dict:
+    progress.stage_update(run_id, "validate", "worker booted — loading libraries")
     from pipeline import validation_gate
     return _staged(run_id, "validate", lambda: validation_gate.run(run_id),
                    detail="validation gate")
@@ -91,6 +94,7 @@ def validate_task(run_id: str) -> dict:
 def forecast_intent_task(run_id: str, use_llm: bool = True) -> dict:
     """Stage 2.5: rule-based intent detection + optional LLM refinement. Suggestion
     quality degrades gracefully — an LLM failure leaves the rule suggestions standing."""
+    progress.stage_update(run_id, "intent", "worker booted — loading libraries")
     from pipeline import forecast_intent
     from agents import forecast_intent_agent
 
@@ -104,6 +108,7 @@ def forecast_intent_task(run_id: str, use_llm: bool = True) -> dict:
 
 def forecast_eda_task(run_id: str) -> dict:
     """Stage 4: full forecasting EDA on the user-confirmed intent."""
+    progress.stage_update(run_id, "forecast_eda", "worker booted — loading libraries")
     from pipeline import forecasting_eda
     return _staged(run_id, "forecast_eda", lambda: forecasting_eda.run(run_id),
                    detail="forecast EDA")
@@ -112,6 +117,7 @@ def forecast_eda_task(run_id: str) -> dict:
 def model_select_task(run_id: str, use_llm: bool = True) -> dict:
     """Stage 5: the rule engine always decides first; the LLM (when enabled) may
     override it. An LLM failure leaves the rule-engine pick standing."""
+    progress.stage_update(run_id, "model_select", "worker booted — loading libraries")
     from agents import model_selector_agent
     return _staged(run_id, "model_select",
                    lambda: model_selector_agent.run(run_id, use_llm=use_llm),
@@ -124,6 +130,10 @@ def train_task(run_id: str, models: list, confirm_heavy: bool = False,
     ML model was selected), then train + backtest the chosen models. No LLM, no DB.
     The 'heavy' cost gate is enforced in the route before this launches, and again here
     (defense in depth). `profile` optionally overrides training.accuracy_profile."""
+    # Before the heavy import: the spawn child takes seconds (warm) to tens of seconds
+    # (cold cache) to load the scientific stack, and without this line the log sits on
+    # the route's pre-dispatch "starting worker" seed for that whole window.
+    progress.stage_update(run_id, "train", "worker booted — loading libraries")
     from pipeline import feature_builder, trainer
 
     def _run():

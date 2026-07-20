@@ -1,19 +1,34 @@
-psycopg2-binary>=2.9.0
-sqlalchemy>=2.0.0
-connectorx>=0.3.2
+# ── App-startup surface first ────────────────────────────────────────────────
+# Ordered so that if a heavy ML wheel further down fails to install (pip aborts
+# at the first failure), the web servers + core data stack are already in place
+# and the app still boots — the model catalog's runtime find_spec gate simply
+# marks the missing models unavailable. Don't move ML wheels above this block.
+fastapi>=0.103.0
+uvicorn>=0.23.2
+pydantic>=2.3.0
 dash>=2.14.0
 dash-bootstrap-components>=1.5.0
 # plotly is imported directly (fcst_eda_view / training_view), not only via dash
 plotly>=5.18.0
 requests>=2.31.0
-pandas>=2.0.0
-openpyxl>=3.1.0
+python-dotenv>=1.0.0
+# All LLM providers (ollama / openai / gemini / groq) go through the openai SDK
+# with a base_url swap (agents/llm_client.py) — no per-provider packages needed.
+openai>=1.3.0
+
+# ── Core data stack ──────────────────────────────────────────────────────────
 numpy>=1.24.0
+pandas>=2.0.0
 scipy>=1.10.0
 pyarrow>=12.0.0
 joblib>=1.3.0
 pyyaml>=6.0
-python-dotenv>=1.0.0
+openpyxl>=3.1.0
+psycopg2-binary>=2.9.0
+sqlalchemy>=2.0.0
+connectorx>=0.3.2
+
+# ── Modeling / heavy wheels ──────────────────────────────────────────────────
 statsmodels>=0.14.0
 ruptures>=1.1.8
 antropy>=0.1.6
@@ -34,16 +49,13 @@ chronos-forecasting>=2.0
 xgboost>=2.0.0
 lightgbm>=4.0.0
 catboost>=1.2.7   # first release with numpy 2.x support (verified working under numpy 2.4)
-# torch (CPU build) powers the hand-rolled NHITS backend (models_lib/nhits_model.py):
+# torch (CPU build) powers the hand-rolled NHITS + PatchTST backends
+# (models_lib/nhits_model.py, models_lib/patchtst_model.py):
 #   pip install torch --index-url https://download.pytorch.org/whl/cpu
+# (setup_venv.bat installs it from the CPU wheel index BEFORE this file, so this
+# line is normally already satisfied and pip skips it.)
 # neuralforecast is deliberately NOT used: it depends on coreforecast, the same compiled
 # kernel that segfaults (0xC0000005) under numpy 2.4.x here — same story as statsforecast
 # above. The pure-torch NHITS implementation replaces it.
 torch>=2.5.0
 optuna>=3.3.0
-fastapi>=0.103.0
-uvicorn>=0.23.2
-pydantic>=2.3.0
-# All LLM providers (ollama / openai / gemini / groq) go through the openai SDK
-# with a base_url swap (agents/llm_client.py) — no per-provider packages needed.
-openai>=1.3.0
