@@ -563,6 +563,28 @@ def _store_stage_statuses(data) -> dict:
 
 
 @callback(
+    Output("progress-interval", "disabled", allow_duplicate=True),
+    Input("job-watchdog-interval", "n_intervals"),
+    Input("results-store", "data"),
+    prevent_initial_call="initial_duplicate",
+)
+def rearm_progress_poll(_n, data):
+    """Independent of any chain callback's own running= — polls every 3s (plus
+    immediately on a run switch) and re-enables the live log/rail poller whenever the
+    server reports an active job for the loaded run, so a refresh or reopened tab
+    reattaches on its own instead of showing a frozen log until the user notices and
+    hits F5. No run loaded, or /progress unreachable → leave the interval as-is."""
+    run_id = (data or {}).get("run_id")
+    if not run_id:
+        return no_update
+    try:
+        prog = requests.get(f"{API_URL}/runs/{run_id}/progress", timeout=2).json()
+    except (requests.RequestException, ValueError):
+        return no_update
+    return not bool(prog.get("job_active"))
+
+
+@callback(
     Output("stage-rail", "children"),
     Output("pipeline-log", "children"),
     Output("stage-badge-clean", "children"),

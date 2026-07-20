@@ -48,50 +48,72 @@ FEATURES_DIR = ROOT / "data" / "features"
 _THIN_POINTS = 12      # keep first+last N points of any long array in the payload
 _TOP_SERIES = 20       # per-series summary caps (top by volume + top movers)
 
-_SYSTEM_PROMPT = """You are writing a FORECAST REPORT for a business reader with no
-data-science background. They automated their forecasting and only care about one thing:
-what the forecast says. You receive a JSON payload describing what was forecast and the
-predicted numbers.
+_SYSTEM_PROMPT = """You are a forecasting analyst writing a FORECAST BRIEFING for a
+business reader with no data-science background. They automated their forecasting and care
+about one thing: what the forecast says and what to do about it. You receive a JSON payload
+with what was forecast and every number you may cite — all arithmetic is already done for
+you in `derived`, `forecast`, `recent_history` and (when present) `per_series`.
 
-Write a plain-markdown report (no code fences, no JSON) with EXACTLY these ## sections,
-in this order:
+Write a substantial, genuinely useful plain-markdown briefing (no code fences, no JSON)
+with EXACTLY these ## sections, in this order:
 
-## Summary
+## Bottom line up front
 ## What was forecast
 ## The numbers ahead
+## How the outlook is trending
 ## Compared with recent history
 ## Best and worst case
-## Things to keep in mind
+## What could change the picture
 
-If the payload contains a `per_series` object, insert one extra section before
-"Things to keep in mind":
+If the payload contains a `per_series` object, insert this section immediately before
+"What could change the picture":
 ## Breakdown by series
 
-Rules:
-- Read the target column's name and write in its real-world units — e.g. a column named
-  `total_litre` is litres of milk, `material_quantity_kg` is kilograms of material,
-  `VISIT ID` counted per day is number of visits. Infer the business quantity from the
-  name and always phrase amounts in those terms, with the actual dates.
-- ABSOLUTELY NO technical jargon: never mention MASE, sMAPE, backtesting, cross-
-  validation, models' internal names/parameters, seasonality strength, stationarity,
-  entropy, quantiles, conformal intervals, EDA, or pipeline stages. The one allowed
-  technical fact: the forecasting method's display name, mentioned at most once.
-- "The numbers ahead": the immediate next period, the total over the whole forecast
-  window, and the highest/lowest points with their dates (all provided in `forecast`
-  and `derived` — cite ONLY numbers present in the payload, never invent or
-  extrapolate).
-- "Compared with recent history": use `derived.pct_change` and the recent-history
-  figures — say plainly whether things are expected to grow, shrink or stay level.
-- "Best and worst case": translate the uncertainty band (`lo95`/`hi95`) into plain
-  language — "could be as low as X or as high as Y" — and note the range widens the
-  further out the forecast goes.
-- "Things to keep in mind": 2-4 plain-language caveats — the forecast is based on
-  history up to the given end date; `accuracy.typical_error_pct` is roughly how far
-  off similar predictions were in testing (phrase it as "past predictions of this kind
-  were typically within about N% of what actually happened"); unusual events the data
-  can't know about (strikes, weather, policy changes) are not included.
-- Format large numbers readably (e.g. 95.8 million kg, not 95802681.4282).
-- 300-700 words. Clear, direct, confident. No filler, no marketing tone."""
+Section guidance (write 2-4 rich paragraphs or a tight bulleted list per section — this is
+a briefing, not a summary; be specific and quantitative throughout):
+- "Bottom line up front": 3-5 sentences a busy executive can read alone and know the
+  headline — the expected level over the window, the direction versus recent history, and
+  the single most important caveat. Lead with the most decision-relevant fact.
+- "What was forecast": the quantity, its real-world units, the time span and step, how far
+  ahead, and (if any) which breakdown dimension and external drivers were used.
+- "The numbers ahead": the immediate next period (with its date), the total across the
+  whole window, and the highest and lowest points with their dates. Walk the reader through
+  the shape of the path, not just endpoints.
+- "How the outlook is trending": use `forecast.trajectory_direction` /
+  `trajectory_pct_start_to_end` and the first-vs-last values to describe whether the
+  forecast rises, dips or holds across the horizon, and roughly by how much — distinct from
+  the comparison against history.
+- "Compared with recent history": use `derived.pct_change` and `recent_history` to say
+  plainly whether things are expected to grow, shrink or hold versus the recent past, and
+  put the change in concrete terms (e.g. "about X more per week than lately").
+- "Best and worst case": translate the uncertainty band (`lo95`/`hi95`, `widest_interval_95`)
+  into plain language — "could be as low as X or as high as Y" — and note the range widens
+  the further out the forecast reaches, so near-term figures are firmer than late ones.
+- "Breakdown by series" (only if `per_series`): name the biggest contributors and the
+  biggest movers by name, use `top5_share_pct` to describe how concentrated the total is
+  (e.g. "the top 5 account for X% of the total"), and call out any series expected to swing
+  sharply. Do not list every series — highlight what matters.
+- "What could change the picture": 3-5 plain-language caveats — the forecast is based only
+  on history up to the stated end date; `accuracy.typical_error_pct` is roughly how far off
+  similar predictions ran in testing (phrase it as "in testing, forecasts like this were
+  typically within about N% of what actually happened"); real-world events the data cannot
+  know about (strikes, weather, price or policy changes, one-off promotions) are not
+  included; and where relevant, that heavily concentrated totals hinge on a few series.
+
+Hard rules:
+- Read the target column's name and write in its real-world units — e.g. `total_litre` is
+  litres of milk, `material_quantity_kg` is kilograms, `VISIT ID` counted per day is number
+  of visits. Infer the business quantity from the name and phrase every amount that way,
+  with real dates.
+- Cite ONLY numbers present in the payload. Never invent, round away meaning, or
+  extrapolate beyond the provided figures. If a figure is null/absent, don't mention it.
+- ABSOLUTELY NO technical jargon: never mention MASE, sMAPE, backtesting, cross-validation,
+  model parameters, seasonality strength, stationarity, entropy, quantiles, conformal
+  intervals, EDA, or pipeline stages. The one allowed technical fact: the forecasting
+  method's display name, mentioned at most once and only in "What was forecast".
+- Format large numbers readably (e.g. 95.8 million litres, not 95802681.4282).
+- 650-1100 words. Analytical, specific, confident, decision-oriented. No filler, no
+  marketing tone, no restating the same figure across sections."""
 
 
 # ── Payload helpers ───────────────────────────────────────────────────────────
@@ -172,9 +194,16 @@ def _series_summary(run_id: str, model_id: str) -> dict | None:
     by_volume = sorted(rows, key=lambda x: -(x["forecast_total"] or 0))[:_TOP_SERIES]
     movers = sorted([x for x in rows if x["pct_change_vs_backtest"] is not None],
                     key=lambda x: -abs(x["pct_change_vs_backtest"]))[:_TOP_SERIES]
+    # Concentration: how much of the total forecast the biggest few series account for —
+    # a plain-language "the top 5 make up X%" the report can use to frame the breakdown.
+    grand_total = sum(x["forecast_total"] or 0 for x in rows)
+    top5_share = (round(sum(x["forecast_total"] or 0 for x in by_volume[:5])
+                        / grand_total * 100, 1) if grand_total else None)
     return {"n_series": int(len(rows)),
             "note": ("Per-series comparisons are mean-per-period: forecast mean vs the "
                      "backtest window's actual mean."),
+            "total_forecast_all_series": round(float(grand_total), 2),
+            "top5_share_pct": top5_share,
             "top_by_volume": by_volume, "biggest_movers": movers}
 
 
@@ -203,19 +232,33 @@ def _history_summary(run_id: str, horizon: int) -> dict | None:
 
 
 def _forecast_block(fc: dict) -> dict:
-    """The predicted numbers plus their peak/low, computed here so the LLM never has to
-    do arithmetic."""
+    """The predicted numbers plus their peak/low and trajectory shape, computed here so the
+    LLM never has to do arithmetic (it only narrates provided figures)."""
     ds, yhat = fc.get("ds") or [], fc.get("yhat") or []
     pairs = [(d, v) for d, v in zip(ds, yhat) if v is not None]
     peak = max(pairs, key=lambda p: p[1]) if pairs else None
     low = min(pairs, key=lambda p: p[1]) if pairs else None
+    first_v = float(pairs[0][1]) if pairs else None
+    last_v = float(pairs[-1][1]) if pairs else None
+    # Trajectory of the forecast itself (start → end of the window), separate from the
+    # comparison against history — lets the report say whether the outlook rises, dips or
+    # holds across the horizon.
+    trajectory_pct, direction = None, None
+    if first_v not in (None, 0) and last_v is not None:
+        trajectory_pct = round((last_v - first_v) / abs(first_v) * 100, 1)
+        direction = ("rising" if trajectory_pct > 3 else
+                     "falling" if trajectory_pct < -3 else "roughly level")
     return {
         "ds": _thin(ds),
         "yhat": _thin(yhat),
         "lo95": _thin(fc.get("lo95") or []),
         "hi95": _thin(fc.get("hi95") or []),
+        "first_period": {"ds": str(pairs[0][0]), "value": round(first_v, 2)} if pairs else None,
+        "last_period": {"ds": str(pairs[-1][0]), "value": round(last_v, 2)} if pairs else None,
         "highest_period": {"ds": str(peak[0]), "value": round(float(peak[1]), 2)} if peak else None,
         "lowest_period": {"ds": str(low[0]), "value": round(float(low[1]), 2)} if low else None,
+        "trajectory_pct_start_to_end": trajectory_pct,
+        "trajectory_direction": direction,
         "note": (f"Arrays thinned to first/last {_THIN_POINTS} points when longer; "
                  "the `derived` object carries the exact totals."),
     }

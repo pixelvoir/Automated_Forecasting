@@ -26,6 +26,9 @@ import math
 
 import numpy as np
 import pandas as pd
+import torch
+import torch.nn.functional as F
+from torch import nn
 
 from models_lib.base_model import Forecaster, apply_transform, invert_transform
 
@@ -42,57 +45,70 @@ def _quantiles(levels) -> list[float]:
 
 
 # ── Network ───────────────────────────────────────────────────────────────────
+# Module-level classes (not nested in _build_net) so a fitted model is picklable:
+# pickle resolves a class by module + qualname, and a class defined inside a
+# function has a "<locals>" qualname that can never be found on unpickle — this
+# silently truncated best_model.pkl to 2 bytes the first time a network model
+# was ever crowned (2026-07-20, patchtst on the Favorita panel). Per-call shape
+# (patch/pool sizes, horizon, quantile count) moves from closed-over locals to
+# explicit constructor args instead.
+
+class _Block(nn.Module):
+    def __init__(self, pool: int, knots: int, input_size: int, hidden: int, n_q: int, h: int):
+        super().__init__()
+        self.pool = nn.MaxPool1d(pool, stride=pool, ceil_mode=True) if pool > 1 else None
+        in_dim = math.ceil(input_size / pool)
+        self.mlp = nn.Sequential(nn.Linear(in_dim, hidden), nn.ReLU(),
+                                 nn.Linear(hidden, hidden), nn.ReLU())
+        self.back = nn.Linear(hidden, input_size)
+        self.fore = nn.Linear(hidden, knots * n_q)
+        self.knots, self.n_q, self.h = knots, n_q, h
+
+    def forward(self, x):
+        z = x if self.pool is None else self.pool(x.unsqueeze(1)).squeeze(1)
+        z = self.mlp(z)
+        b = self.back(z)
+        f = self.fore(z).view(-1, self.n_q, self.knots)
+        if self.knots == 1:
+            f = f.expand(-1, -1, self.h)
+        elif self.knots != self.h:
+            f = F.interpolate(f, size=self.h, mode="linear", align_corners=True)
+        return b, f
+
+
+class _NHITSNet(nn.Module):
+    def __init__(self, input_size: int, h: int, n_q: int, hidden: int):
+        super().__init__()
+        pools = [max(min(input_size // 4, 8), 1), max(min(input_size // 8, 4), 1), 1]
+        knots = [max(h // 4, 1), max(h // 2, 1), h]
+        self.blocks = nn.ModuleList([_Block(p, k, input_size, hidden, n_q, h)
+                                     for p, k in zip(pools, knots)])
+
+    def forward(self, x):
+        residual, out = x, None
+        for blk in self.blocks:
+            b, f = blk(residual)
+            residual = residual - b
+            out = f if out is None else out + f
+        return out  # (B, n_q, h)
+
 
 def _build_net(input_size: int, h: int, n_q: int, hidden: int):
+    return _NHITSNet(input_size, h, n_q, hidden)
+
+
+def _train_net(net, X, Y, val_mask, quantiles, epochs, lr=1e-3, batch=256, seed=0,
+               phase=None):
+    """``phase`` (e.g. "backtest" / "final") turns on throttled per-epoch heartbeats to
+    the live progress log via the trainer's ambient context — only the long global torch
+    runs pass it, so the fast single-series path stays silent and can't flood the log."""
     import torch
-    from torch import nn
-    import torch.nn.functional as F
-
-    class _Block(nn.Module):
-        def __init__(self, pool: int, knots: int):
-            super().__init__()
-            self.pool = nn.MaxPool1d(pool, stride=pool, ceil_mode=True) if pool > 1 else None
-            in_dim = math.ceil(input_size / pool)
-            self.mlp = nn.Sequential(nn.Linear(in_dim, hidden), nn.ReLU(),
-                                     nn.Linear(hidden, hidden), nn.ReLU())
-            self.back = nn.Linear(hidden, input_size)
-            self.fore = nn.Linear(hidden, knots * n_q)
-            self.knots = knots
-
-        def forward(self, x):
-            z = x if self.pool is None else self.pool(x.unsqueeze(1)).squeeze(1)
-            z = self.mlp(z)
-            b = self.back(z)
-            f = self.fore(z).view(-1, n_q, self.knots)
-            if self.knots == 1:
-                f = f.expand(-1, -1, h)
-            elif self.knots != h:
-                f = F.interpolate(f, size=h, mode="linear", align_corners=True)
-            return b, f
-
-    class _NHITSNet(nn.Module):
-        def __init__(self):
-            super().__init__()
-            pools = [max(min(input_size // 4, 8), 1), max(min(input_size // 8, 4), 1), 1]
-            knots = [max(h // 4, 1), max(h // 2, 1), h]
-            self.blocks = nn.ModuleList([_Block(p, k) for p, k in zip(pools, knots)])
-
-        def forward(self, x):
-            residual, out = x, None
-            for blk in self.blocks:
-                b, f = blk(residual)
-                residual = residual - b
-                out = f if out is None else out + f
-            return out  # (B, n_q, h)
-
-    return _NHITSNet()
-
-
-def _train_net(net, X, Y, val_mask, quantiles, epochs, lr=1e-3, batch=256, seed=0):
-    import torch
-    from pipeline import resource_limits
+    from pipeline import progress, resource_limits
     torch.set_num_threads(resource_limits.thread_cap())  # keep a core free for the OS
     torch.manual_seed(seed)
+    # Log ~10 epoch lines per net regardless of the epoch budget (early stopping shortens
+    # it further) — enough to see life, few enough to keep the 200-line ring readable.
+    log_every = max(1, int(epochs) // 10)
     q = torch.tensor(quantiles, dtype=torch.float32).view(1, -1, 1)
 
     def pinball(pred, target):
@@ -124,7 +140,13 @@ def _train_net(net, X, Y, val_mask, quantiles, epochs, lr=1e-3, batch=256, seed=
             else:
                 bad += 1
                 if bad >= patience:
+                    if phase:
+                        progress.heartbeat(f"{phase} net: early-stopped at epoch "
+                                           f"{ep + 1}/{epochs} (val {best_val:.4f})")
                     break
+        if phase and (ep == 0 or (ep + 1) % log_every == 0):
+            vtxt = f", val {best_val:.4f}" if best_val < float("inf") else ""
+            progress.heartbeat(f"{phase} net: epoch {ep + 1}/{epochs}{vtxt}")
     if best_state is not None:
         net.load_state_dict(best_state)
     net.eval()
@@ -266,7 +288,8 @@ def run_global(frame, recipe, cfg, horizon, freq_alias, transform, levels=(80, 9
         X, Y, vm = X[keep], Y[keep], vm[keep]
 
     hidden = min(512, max(128, 8 * L))
-    net_cv, _ = _train_net(_build_net(L, h, len(qs), hidden), X, Y, vm, qs, epochs)
+    net_cv, _ = _train_net(_build_net(L, h, len(qs), hidden), X, Y, vm, qs, epochs,
+                           phase="backtest")
 
     # Holdout backtest: predict each series' last h periods from the pre-holdout window.
     import torch
@@ -293,7 +316,8 @@ def run_global(frame, recipe, cfg, horizon, freq_alias, transform, levels=(80, 9
         keep = np.random.RandomState(0).permutation(len(Xf))[:_MAX_WINDOWS]
         keep = np.union1d(keep, np.where(vmf)[0])
         Xf, Yf, vmf = Xf[keep], Yf[keep], vmf[keep]
-    net, _ = _train_net(_build_net(L, h, len(qs), hidden), Xf, Yf, vmf, qs, epochs)
+    net, _ = _train_net(_build_net(L, h, len(qs), hidden), Xf, Yf, vmf, qs, epochs,
+                        phase="final")
 
     fc_parts = []
     with torch.no_grad():

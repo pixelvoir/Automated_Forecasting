@@ -363,6 +363,13 @@ def create_layout():
             # being enabled, so this period is the floor on click→first-log-line latency.
             # Idle cost is zero — the interval is disabled outside chain callbacks.
             dcc.Interval(id="progress-interval", interval=500, disabled=True),
+            # Always-on, cheap (one small JSON read per tick): re-arms progress-interval
+            # whenever the server says a job is active for the loaded run, independent of
+            # whether THIS browser tab has an in-flight chain callback. The running= specs
+            # above only cover a poll started by this tab's own request — a page refresh or
+            # reopened tab loses that in-flight callback while the job keeps running
+            # server-side, so nothing was left to notice it finished (2026-07-20).
+            dcc.Interval(id="job-watchdog-interval", interval=3000, disabled=False),
             # Root-level and always mounted: the download target must never be inside a
             # re-renderable pane body (outputting to an unmounted component fails silently).
             dcc.Download(id="download-forecast"),

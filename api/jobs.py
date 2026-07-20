@@ -9,6 +9,7 @@ million-row jobs from exhausting memory and freezing the box.
 from __future__ import annotations
 
 import multiprocessing as mp
+import os
 import queue as _queue
 import threading
 from typing import Any, Callable
@@ -32,8 +33,32 @@ class JobError(Exception):
     """The job process reported an exception; the message carries the original error text."""
 
 
+def _start_parent_watchdog():
+    """Abort this child the instant the API parent dies, however it dies.
+
+    The child is a daemon, but daemon cleanup only runs when the parent exits *normally* —
+    a force-kill (taskkill/Stop-Process without a tree, a crash) skips it and strands the
+    worker, which keeps burning CPU and, worse, can finish and silently overwrite a run's
+    artifacts long after the app that started it is gone (observed 2026-07-20: a preempted
+    training job outlived a hard server restart and clobbered a finished run's report).
+
+    ``multiprocessing.parent_process().join()`` blocks on the parent's sentinel and returns
+    the moment the parent terminates for ANY reason — so a daemon thread waiting on it can
+    hard-exit the child. No polling, cross-platform, works under force-kill."""
+    parent = mp.parent_process()
+    if parent is None:  # not a spawned child (shouldn't happen here) — nothing to watch
+        return
+
+    def _watch():
+        parent.join()          # unblocks the instant the parent process is gone
+        os._exit(1)            # skip atexit/flush — just stop, don't let the orphan finish
+
+    threading.Thread(target=_watch, daemon=True, name="parent-watchdog").start()
+
+
 def _entry(func, args, kwargs, q):
     """Child-process entry point: run the task and report result/error back through the queue."""
+    _start_parent_watchdog()
     # Below-normal priority: the OS keeps the desktop/editor responsive even when the
     # job saturates its thread budget (see pipeline/resource_limits.py).
     resource_limits.lower_priority()

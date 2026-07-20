@@ -29,6 +29,8 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+import torch
+from torch import nn
 
 from models_lib.base_model import apply_transform, invert_transform
 from models_lib.nhits_model import (
@@ -41,38 +43,40 @@ _MAX_WINDOWS = 250_000
 _MIN_INPUT = 8  # patching needs >= 2 patches of >= 4 points
 
 
+# Module-level (not nested in _build_net) so a fitted model is picklable — see the
+# matching note in nhits_model.py._Block; same bug, same fix. Per-call shape (patch
+# length/stride/count, horizon, quantile count) moves to explicit constructor args.
+class _PatchTSTNet(nn.Module):
+    def __init__(self, patch_len: int, stride: int, n_patches: int, d_model: int,
+                n_heads: int, n_layers: int, h: int, n_q: int):
+        super().__init__()
+        self.patch_len, self.stride, self.h, self.n_q = patch_len, stride, h, n_q
+        self.embed = nn.Linear(patch_len, d_model)
+        self.pos = nn.Parameter(torch.zeros(n_patches, d_model))
+        layer = nn.TransformerEncoderLayer(
+            d_model, n_heads, dim_feedforward=2 * d_model, dropout=0.1,
+            batch_first=True, norm_first=True)
+        self.encoder = nn.TransformerEncoder(layer, num_layers=n_layers,
+                                             enable_nested_tensor=False)
+        self.head = nn.Linear(n_patches * d_model, h * n_q)
+
+    def forward(self, x):                          # x: (B, L), per-series-scaled
+        mu = x.mean(dim=1, keepdim=True)
+        sd = x.std(dim=1, keepdim=True).clamp_min(1e-4)
+        z = (x - mu) / sd                          # RevIN-lite instance normalization
+        p = z.unfold(1, self.patch_len, self.stride)  # (B, n_patches, patch_len)
+        enc = self.encoder(self.embed(p) + self.pos)
+        out = self.head(enc.flatten(1)).view(-1, self.n_q, self.h)
+        return out * sd.unsqueeze(1) + mu.unsqueeze(1)
+
+
 def _build_net(input_size: int, h: int, n_q: int, d_model: int = 64,
                n_layers: int = 2, n_heads: int = 4):
-    import torch
-    from torch import nn
-
     patch_len = int(min(16, max(4, input_size // 4)))
     patch_len = min(patch_len, input_size)
     stride = max(patch_len // 2, 1)
     n_patches = (input_size - patch_len) // stride + 1
-
-    class _PatchTSTNet(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.embed = nn.Linear(patch_len, d_model)
-            self.pos = nn.Parameter(torch.zeros(n_patches, d_model))
-            layer = nn.TransformerEncoderLayer(
-                d_model, n_heads, dim_feedforward=2 * d_model, dropout=0.1,
-                batch_first=True, norm_first=True)
-            self.encoder = nn.TransformerEncoder(layer, num_layers=n_layers,
-                                                 enable_nested_tensor=False)
-            self.head = nn.Linear(n_patches * d_model, h * n_q)
-
-        def forward(self, x):                     # x: (B, L), per-series-scaled
-            mu = x.mean(dim=1, keepdim=True)
-            sd = x.std(dim=1, keepdim=True).clamp_min(1e-4)
-            z = (x - mu) / sd                     # RevIN-lite instance normalization
-            p = z.unfold(1, patch_len, stride)    # (B, n_patches, patch_len)
-            enc = self.encoder(self.embed(p) + self.pos)
-            out = self.head(enc.flatten(1)).view(-1, n_q, h)
-            return out * sd.unsqueeze(1) + mu.unsqueeze(1)
-
-    return _PatchTSTNet()
+    return _PatchTSTNet(patch_len, stride, n_patches, d_model, n_heads, n_layers, h, n_q)
 
 
 # ── Single-series forecaster ──────────────────────────────────────────────────
@@ -168,7 +172,8 @@ def run_global(frame, recipe, cfg, horizon, freq_alias, transform, levels=(80, 9
         X, Y, vm = X[keep], Y[keep], vm[keep]
 
     d_model = 128
-    net_cv, _ = _train_net(_build_net(L, h, len(qs), d_model), X, Y, vm, qs, epochs)
+    net_cv, _ = _train_net(_build_net(L, h, len(qs), d_model), X, Y, vm, qs, epochs,
+                           phase="backtest")
 
     import torch
     q50 = qs.index(0.5)
@@ -194,7 +199,8 @@ def run_global(frame, recipe, cfg, horizon, freq_alias, transform, levels=(80, 9
         keep = np.random.RandomState(0).permutation(len(Xf))[:_MAX_WINDOWS]
         keep = np.union1d(keep, np.where(vmf)[0])
         Xf, Yf, vmf = Xf[keep], Yf[keep], vmf[keep]
-    net, _ = _train_net(_build_net(L, h, len(qs), d_model), Xf, Yf, vmf, qs, epochs)
+    net, _ = _train_net(_build_net(L, h, len(qs), d_model), Xf, Yf, vmf, qs, epochs,
+                        phase="final")
 
     fc_parts = []
     with torch.no_grad():

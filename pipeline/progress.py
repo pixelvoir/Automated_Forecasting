@@ -67,6 +67,34 @@ def _log(prog: dict, stage: str, msg: str) -> None:
     prog.setdefault("log", []).append({"t": _now(), "stage": stage, "msg": msg})
 
 
+# ── Ambient training context (for deep sub-loop heartbeats) ────────────────────
+# The torch epoch loop (nhits/patchtst) lives several call layers below the trainer and
+# doesn't receive run_id. Rather than thread run_id through every model signature, the
+# trainer sets an ambient context around each model and the loop calls heartbeat() — safe
+# because the whole pipeline runs single-threaded in one job subprocess.
+_TRAIN_CTX = {"run_id": None, "stage": "train", "label": ""}
+
+
+def set_train_context(run_id: str | None, stage: str = "train", label: str = "") -> None:
+    _TRAIN_CTX.update(run_id=run_id, stage=stage, label=label)
+
+
+def clear_train_context() -> None:
+    _TRAIN_CTX["run_id"] = None
+
+
+def heartbeat(msg: str) -> None:
+    """Sub-step log from inside a model's own training loop (e.g. torch epochs). Uses the
+    ambient context the trainer set around the current model; a no-op when unset. The
+    CALLER throttles (epoch loops call this only every Nth epoch) so the log ring — capped
+    at _LOG_CAP — isn't flooded and the model-completion lines survive."""
+    rid = _TRAIN_CTX["run_id"]
+    if not rid:
+        return
+    label = _TRAIN_CTX["label"]
+    stage_update(rid, _TRAIN_CTX["stage"], f"{label + ' ' if label else ''}{msg}")
+
+
 def stage_start(run_id: str, stage: str, detail: str | None = None,
                 total: int | None = None, eta_seconds: float | None = None,
                 log_msg: str | None = None) -> None:

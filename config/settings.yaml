@@ -12,7 +12,7 @@
 # Column names ARE included in the payload (unavoidable for recipe keying).
 llm:
   provider: "gemini"
-  model: "gemini-2.5-flash"
+  model: "gemini-3.5-flash"
   base_url: "http://localhost:11434/v1"   # only used for ollama (custom endpoint)
   timeout_seconds: 60
   max_retries: 2
@@ -40,7 +40,7 @@ confidence_threshold: 0.85
 # CPU throttling (pipeline/resource_limits.py) — keeps heavy stages from freezing the
 # machine. Jobs run slightly slower but the desktop stays responsive.
 resources:
-  job_priority: below_normal   # below_normal | normal — OS priority of the job subprocess.
+  job_priority: normal   # below_normal | normal — OS priority of the job subprocess.
                                # below_normal keeps a small machine usable during heavy
                                # stages, but on hybrid P/E-core CPUs (12th-gen+ Intel
                                # laptops) Windows tends to park below-normal work on the

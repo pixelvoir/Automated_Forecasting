@@ -562,19 +562,29 @@ def _solve_weights(act, P, mases, ecfg):
     return w, method
 
 
-def _ensemble(results, requested, scale, levels, ecfg) -> dict | None:
+def _ensemble(results, requested, scale, levels, ecfg, scope=None, series_frames=None) -> dict | None:
     """Weighted-ensemble leaderboard row over the REQUESTED models (2026-07-17; replaces
     the fixed top-2 mean).
 
     Members = every requested model with a finite backtest MASE, minus low performers
     (not beating the seasonal-naive reference; worse than mase_factor × the best member),
-    capped at max_members. Backtests are aligned on the display arrays' shared timestamps
-    (different routes backtest different windows — chronos' single holdout vs classical
-    CV), and members are pruned until the shared window supports the member count.
-    Weights come from _solve_weights (constrained optimization with fallbacks). Metrics
-    use the SAME pooled MASE scale as every other row; intervals are conformal from the
-    ensemble's own backtest residuals. Returns None — no row at all — when fewer than
-    two members or too few shared points survive."""
+    capped at max_members. Backtests are aligned on shared points, and members are pruned
+    until the shared window supports the member count. Weights come from _solve_weights
+    (constrained optimization with fallbacks). Metrics use the SAME pooled MASE scale as
+    every other row; intervals are conformal from the ensemble's own backtest residuals.
+    Returns None — no row at all — when fewer than two members or too few shared points
+    survive.
+
+    On per_series scope, alignment/weight-fitting/metrics use the FULL per-series backtest
+    rows from `series_frames` (unique_id, ds) — not the per-model `backtest` field on
+    `results`, which is already panel-summed-by-ds for chart display (~16 dates) via
+    _display_backtest. Fitting weights against 16 aggregate points and then scoring them
+    with the per-series-calibrated `scale` is a level mismatch (aggregate-level errors,
+    per-series-level scale) that inflated MASE by ~700x on a real panel (2026-07-20 bug).
+    Every other row's `metrics` is computed from the full-resolution cv_df before it gets
+    downsampled for display — this makes the ensemble consistent with that. The chart
+    `backtest` field is still panel-summed-by-ds afterward, matching every other row's
+    display convention."""
     cands = [e for e in results
              if e["model"] in requested and not e.get("error")
              and (e.get("metrics") or {}).get("mase") is not None
@@ -614,7 +624,23 @@ def _ensemble(results, requested, scale, levels, ecfg) -> dict | None:
     if len(cands) < 2:
         return None
 
+    # Per-series backtest lookup: model -> {(unique_id, ds): (actual, predicted)}, built
+    # from the full-resolution rows (same source as series_forecasts.parquet), not the
+    # panel-summed display arrays. Only meaningful on a per_series run.
+    per_series_bt = None
+    if scope == "per_series" and series_frames:
+        bt_all = pd.concat(series_frames, ignore_index=True)
+        bt_all = bt_all[bt_all["kind"] == "backtest"]
+        per_series_bt = {
+            mid: {(uid, ds): (a, p) for uid, ds, a, p
+                  in zip(g["unique_id"], g["ds"], g["actual"], g["predicted"])
+                  if pd.notna(p)}
+            for mid, g in bt_all.groupby("model", observed=True)
+        }
+
     def _bt_map(e):
+        if per_series_bt is not None and e["model"] in per_series_bt:
+            return {k: v[1] for k, v in per_series_bt[e["model"]].items()}
         return {ds: p for ds, p in zip(e["backtest"]["ds"], e["backtest"]["predicted"])
                 if p is not None}
 
@@ -649,13 +675,19 @@ def _ensemble(results, requested, scale, levels, ecfg) -> dict | None:
         return None
 
     a = members[0]
-    act_map = {ds: v for ds, v in zip(a["backtest"]["ds"], a["backtest"]["actual"])
-               if v is not None}
-    ds_c = [ds for ds in sorted(shared) if ds in act_map]  # ISO strings sort chronologically
+    if per_series_bt is not None and a["model"] in per_series_bt:
+        act_map = {k: v[0] for k, v in per_series_bt[a["model"]].items() if pd.notna(v[0])}
+    else:
+        act_map = {ds: v for ds, v in zip(a["backtest"]["ds"], a["backtest"]["actual"])
+                   if v is not None}
+    # Tuple keys (per-series) sort by unique_id then ds — fine, order only needs to be
+    # consistent between act/P, not chronological (MAE is order-invariant). Plain ISO
+    # date-string keys (aggregate) sort chronologically as before.
+    ds_c = [k for k in sorted(shared) if k in act_map]
     if len(ds_c) < min_pts:
         return None
-    act = np.array([float(act_map[ds]) for ds in ds_c])
-    P = np.column_stack([np.array([float(m[ds]) for ds in ds_c]) for m in maps])
+    act = np.array([float(act_map[k]) for k in ds_c])
+    P = np.column_stack([np.array([float(m[k]) for k in ds_c]) for m in maps])
     mases = [float(e["metrics"]["mase"]) for e in members]
 
     w, method = _solve_weights(act, P, mases, ecfg)
@@ -685,6 +717,18 @@ def _ensemble(results, requested, scale, levels, ecfg) -> dict | None:
     weights = [round(float(x), 4) for x in w]
     label_parts = [f"{w[i]:.2f}·{members[i]['label']}" for i in range(len(members))
                    if round(float(w[i]), 2) > 0]
+
+    # Chart display: panel-sum the matched per-series points by ds, matching every other
+    # row's `backtest` field convention (_display_backtest's per_series branch). Metrics
+    # above stayed at native per-series resolution; only this display curve is aggregated.
+    if per_series_bt is not None:
+        disp = pd.DataFrame({"ds": [k[1] for k in ds_c], "actual": act, "predicted": pred})
+        g = disp.groupby("ds", as_index=False)[["actual", "predicted"]].sum().sort_values("ds")
+        backtest_out = {"ds": [str(d) for d in g["ds"]], "actual": _round_list(g["actual"]),
+                        "predicted": _round_list(g["predicted"])}
+    else:
+        backtest_out = {"ds": ds_c, "actual": _round_list(act), "predicted": _round_list(pred)}
+
     return {
         "model": ENSEMBLE, "label": f"Ensemble ({' + '.join(label_parts)})",
         "category": "ensemble", "requested": True, "is_baseline": False,
@@ -696,8 +740,7 @@ def _ensemble(results, requested, scale, levels, ecfg) -> dict | None:
         "tuning": None,
         "strategy": f"weighted mean of {len(members)} requested forecasts ({method} weights)",
         "error": None, "train_seconds": 0.0,
-        "backtest": {"ds": ds_c, "actual": _round_list(act),
-                     "predicted": _round_list(pred)},
+        "backtest": backtest_out,
         "forecast": forecast,
     }
 
@@ -784,10 +827,51 @@ def run(run_id: str, models, confirm_heavy: bool = False, profile: str | None = 
     # Per-model progress for the UI rail (estimate gives each model's ETA up front).
     eta_by_model = {p["model"]: p["seconds"] for p in estimate.get("per_model") or []}
 
+    def _write_checkpoint():
+        """Best-effort interim training_report.json after each model — if the worker dies
+        partway through the loop (a bad wheel, a native crash, a preemption), every model
+        that already finished keeps its full metrics/backtest/forecast instead of vanishing
+        with the run (2026-07-20: a laptop prophet DLL crash lost an already-finished
+        patchtst result because only the end-of-loop write existed). Never raises."""
+        try:
+            partial = {
+                "run_id": run_id, "scope": scope, "policy": policy, "frequency": freq_label,
+                "horizon": horizon, "season_length": period,
+                "transform": recipe.get("transform", "none"), "metric": "MASE",
+                "n_series": n_series, "series_trained": len(series_ids),
+                "reduced_from": reduced_from, "baseline": BASELINE,
+                "requested_models": requested, "suggested_model": suggested,
+                "accuracy_profile": profile.get("profile_name"),
+                "cost": estimate, "cv": cv_plan, "results": results,
+                "warnings": warnings_list, "status": "training",
+                "total_seconds": round(time.perf_counter() - run_t0, 2),
+                "trained_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            }
+            (run_dir / "training_report.json").write_text(json.dumps(partial, default=str))
+        except Exception:  # noqa: BLE001 — a checkpoint write must never fail training
+            pass
+
+    def _backup_model(mid, fitted):
+        """Best-effort per-model artifact backup the moment a model finishes — independent
+        of which model eventually wins the crown, so a later model's failure (or a later
+        step in run()) can't take an already-trained model's weights down with it."""
+        if fitted is None:
+            return
+        try:
+            out_dir = MODELS_DIR / run_id / "checkpoints"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            joblib.dump(fitted, out_dir / f"{mid}.pkl")
+            joblib.dump(recipe, out_dir / "preprocessor.pkl")
+        except Exception:  # noqa: BLE001 — a checkpoint backup must never fail training
+            pass
+
     results, fitted_objs, series_frames = [], {}, []
     for model_i, mid in enumerate(run_ids, start=1):
         progress.model_event(run_id, mid, model_i, len(run_ids), "running",
                              eta_seconds=eta_by_model.get(mid))
+        # Ambient context for deep sub-loop heartbeats (torch epoch progress) — the label
+        # prefixes each heartbeat with the model id in the live log.
+        progress.set_train_context(run_id, "train", label=mid)
         model_t0 = time.perf_counter()
         try:
             params, tuning, native_iv = None, None, None
@@ -836,6 +920,7 @@ def run(run_id: str, models, confirm_heavy: bool = False, profile: str | None = 
                        else {"mae": None, "rmse": None, "mape": None, "smape": None,
                              "mase": None, "r2": None, "n": 0})
             fitted_objs[mid] = fitted
+            _backup_model(mid, fitted)
             if scope == "per_series":
                 _collect_series_frames(series_frames, mid, cv_df, fc_df)
             results.append({
@@ -850,6 +935,7 @@ def run(run_id: str, models, confirm_heavy: bool = False, profile: str | None = 
             progress.model_event(run_id, mid, model_i, len(run_ids), "done",
                                  seconds=time.perf_counter() - model_t0,
                                  mase=metrics.get("mase"))
+            _write_checkpoint()
         except Exception as exc:  # noqa: BLE001 — isolate per-model failure
             progress.model_event(run_id, mid, model_i, len(run_ids), "failed",
                                  seconds=time.perf_counter() - model_t0)
@@ -862,13 +948,17 @@ def run(run_id: str, models, confirm_heavy: bool = False, profile: str | None = 
                 "backtest": {"ds": [], "actual": [], "predicted": []},
                 "forecast": {"ds": [], "yhat": []},
             })
+            _write_checkpoint()
+
+    progress.clear_train_context()  # heartbeats off — the model loop is done
 
     # Weighted ensemble row (free: components already trained). Derived exclusively from
     # REQUESTED models, so it respects the "user's selection is ultimate" rule and is
     # itself crownable. Config: training.ensemble (legacy ensemble_top2 bool honored).
     ecfg = _ensemble_cfg(tcfg)
     if ecfg["enabled"] and len(requested) >= 2:
-        ens = _ensemble(results, requested, scale, levels, ecfg)
+        ens = _ensemble(results, requested, scale, levels, ecfg,
+                        scope=scope, series_frames=series_frames)
         if ens:
             results.append(ens)
             fitted_objs[ENSEMBLE] = {"ensemble_of": ens["ensemble_of"],
@@ -953,7 +1043,7 @@ def run(run_id: str, models, confirm_heavy: bool = False, profile: str | None = 
         "suggested_model": suggested, "requested_models": requested,
         "accuracy_profile": profile.get("profile_name"),
         "has_series_forecasts": has_series_fc, "series_ids": series_ids_out,
-        "cost": estimate, "cv": cv_plan, "results": results,
+        "cost": estimate, "cv": cv_plan, "results": results, "status": "done",
         "serialized": serialized, "warnings": warnings_list,
         "total_seconds": round(time.perf_counter() - run_t0, 2),
         "trained_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
